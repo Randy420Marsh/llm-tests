@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Kaleidoscope — Generative</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #04050d; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="k"></canvas>
+<script>
+(() => {
+"use strict";
+
+const TAU = Math.PI * 2;
+const canvas = document.getElementById("k");
+const ctx = canvas.getContext("2d");
+
+/* ---------- viewport ---------- */
+let W, H, CX, CY, MAXR, vignette;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  CX = W / 2; CY = H / 2;
+  MAXR = Math.min(W, H) * 0.58;
+
+  // soft vignette to settle the edges
+  vignette = ctx.createRadialGradient(CX, CY, Math.min(W, H) * 0.42, CX, CY, Math.max(W, H) * 0.72);
+  vignette.addColorStop(0, "rgba(3,4,12,0)");
+  vignette.addColorStop(1, "rgba(3,4,12,0.55)");
+
+  ctx.fillStyle = "#04050d";
+  ctx.fillRect(0, 0, W, H);
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ---------- helpers ---------- */
+const rand  = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+// smooth pseudo-noise (sum of sines): returns roughly [-1, 1], fully periodic/organic
+function noise1(t, seed) {
+  return Math.sin(t * 0.11  + seed * 1.7) * 0.5
+       + Math.sin(t * 0.043 + seed * 4.3) * 0.35
+       + Math.sin(t * 0.187 + seed * 9.1) * 0.15;
+}
+
+/* ---------- kaleidoscope geometry ---------- */
+const SEGMENTS = 8;                    // mirror wedges around the circle
+const WEDGE    = TAU / (SEGMENTS * 2); // half-sector each pass fills
+
+/* ---------- particles ("motes") ---------- */
+const MAX_MOTES = 56, MIN_MOTES = 14;
+const motes = [];
+for (let i = 0; i < MAX_MOTES; i++) {
+  const kind = i % 4; // strand | orb | petal | arc fragment
+  motes.push({
+    kind,
+    t0:    WEDGE * rand(0.10, 0.90),  // base angle inside the half-sector
+    wAmp:  rand(0.02, 0.09) * WEDGE,  // angular wobble
+    wSp:   rand(0.05, 0.22),
+    wPh:   rand(0, TAU),
+    r0:    rand(0.14, 0.92),          // base radius (fraction of MAXR)
+    rAmp:  rand(0.05, 0.28),         // radial oscillation amplitude
+    rSp:   rand(0.05, 0.30),
+    rPh:   rand(0, TAU),
+    hOff:  rand(-50, 50),            // personal hue offset
+    spSp:  rand(0.2, 0.9),           // pulse speed
+    spPh:  rand(0, TAU),
+    sat:   rand(70, 100),
+    light: rand(52, 68),
+    seed:  Math.random() * 100,
+  });
+}
+
+// one drifting motif point — bounded oscillations only, so everything loops endlessly
+function motifPoint(m, t) {
+  const theta = m.t0 + m.wAmp * Math.sin(t * m.wSp + m.wPh);
+  const rr    = clamp(m.r0 + m.rAmp * Math.sin(t * m.rSp + m.rPh), 0.05, 1.04);
+  const r     = rr * MAXR;
+  return [r * Math.cos(theta), r * Math.sin(theta)];
+}
+
+/* ---------- main loop ---------- */
+let rotation = 0;
+let last = performance.now();
+const ROT_SPEED = 0.06; // rad/s — slow, constant spin
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  const t = now * 0.001;
+  rotation = (rotation + ROT_SPEED * dt) % TAU;
+
+  /* ---- evolving global state ---- */
+  const baseHue = (t * 9 + 60 * Math.sin(t * 0.07)) % 360;  // slow colour drift
+  const spread  = 40 + 120 * (0.5 + 0.5 * noise1(t, 3));    // palette width breathes
+  const cplx    = clamp(0.5 + 0.5 * noise1(t, 11), 0, 1);  // complexity breathes
+  const breathe = 1 + 0.12 * Math.sin(t * 0.09);            // whole pattern swells
+
+  const active = Math.round(MIN_MOTES + (MAX_MOTES - MIN_MOTES) * cplx);
+  const detail = 0.35 + 0.65 * cplx;
+
+  /* ---- fade the previous frame (motion-blur trail) ---- */
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "hsla(" + ((baseHue + 215) % 360) + ", 65%, 4%, 0.16)";
+  ctx.fillRect(0, 0, W, H);
+
+  /* ---- draw the motif once, stamp it into every mirror wedge ---- */
+  ctx.globalCompositeOperation = "lighter"; // additive glow
+  for (let i = 0; i < SEGMENTS * 2; i++) {
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(rotation + i * WEDGE);
+    if (i & 1) ctx.scale(1, -1); // odd passes are the mirrored copy
+    ctx.scale(breathe, breathe);
+
+    for (let n = 0; n < active; n++) {
+      const m = motes[n];
+      const [x, y] = motifPoint(m, t);
+      const hue   = (((baseHue + m.hOff + spread * noise1(t, m.seed)) % 360) + 360) % 360;
+      const pulse = 0.55 + 0.45 * Math.sin(t * m.spSp + m.spPh);
+
+      if (m.kind === 0) { // flowing strand, curving with the flow
+        const [x2, y2] = motifPoint(m, t - 0.35 / (0.4 + m.rSp));
+        const dx = x - x2, dy = y - y2;
+        const len = Math.hypot(dx, dy);
+        if (len < 1) continue;
+        const nx = -dy / len, ny = dx / len;
+        const bow = (6 + 26 * detail) * Math.sin(t * m.wSp * 0.7 + m.seed);
+        ctx.strokeStyle = "hsla(" + hue + "," + m.sat + "%," + m.light + "%," + (0.14 + 0.30 * pulse).toFixed(3) + ")";
+        ctx.lineWidth = (1 + 3.5 * detail) * (0.6 + 0.8 * pulse);
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(x2, y2);
+        ctx.quadraticCurveTo((x + x2) / 2 + nx * bow, (y + y2) / 2 + ny * bow, x, y);
+        ctx.stroke();
+
+      } else if (m.kind === 1) { // glowing orb
+        const r = (3 + 16 * detail) * (0.5 + pulse);
+        ctx.fillStyle = "hsla(" + hue + "," + m.sat + "%," + m.light + "%,0.05)";
+        ctx.beginPath(); ctx.arc(x, y, r * 3, 0, TAU); ctx.fill();
+        ctx.fillStyle = "hsla(" + hue + "," + m.sat + "%," + Math.min(85, m.light + 12) + "%,0.10)";
+        ctx.beginPath(); ctx.arc(x, y, r * 1.8, 0, TAU); ctx.fill();
+        ctx.fillStyle = "hsla(" + hue + ",40%,92%," + (0.25 + 0.35 * pulse).toFixed(3) + ")";
+        ctx.beginPath(); ctx.arc(x, y, r * 0.7, 0, TAU); ctx.fill();
+
+      } else if (m.kind === 2) { // petal / teardrop aligned to its drift
+        const [x2, y2] = motifPoint(m, t + 0.25 / (0.4 + m.rSp));
+        const ang = Math.atan2(y - y2, x - x2);
+        const L = (8 + 34 * detail) * (0.5 + pulse), Q = L * 0.32;
+        ctx.save();
+        ctx.translate(x, y); ctx.rotate(ang);
+        ctx.fillStyle = "hsla(" + hue + "," + m.sat + "%," + m.light + "%," + (0.10 + 0.18 * pulse).toFixed(3) + ")";
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.quadraticCurveTo(L * 0.55,  Q, L, 0);
+        ctx.quadraticCurveTo(L * 0.55, -Q, 0, 0);
+        ctx.fill();
+        ctx.restore();
+
+      } else { // shimmering arc fragment
+        const theta = m.t0 + m.wAmp * Math.sin(t * m.wSp + m.wPh);
+        const rr    = (m.r0 + m.rAmp * Math.sin(t * m.rSp + m.rPh)) * MAXR;
+        const span  = WEDGE * (0.35 + 0.4 * pulse);
+        ctx.strokeStyle = "hsla(" + hue + "," + m.sat + "%," + Math.min(80, m.light + 10) + "%," + (0.08 + 0.22 * pulse).toFixed(3) + ")";
+        ctx.lineWidth = 1 + 2.5 * detail;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.arc(0, 0, rr, theta - span / 2, theta + span / 2);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  /* ---- breathing core glow ---- */
+  const coreR = MAXR * (0.10 + 0.05 * Math.sin(t * 0.35));
+  const core = ctx.createRadialGradient(CX, CY, 0, CX, CY, coreR);
+  core.addColorStop(0, "hsla(" + ((baseHue + 180) % 360) + ",90%,70%,0.28)");
+  core.addColorStop(1, "hsla(" + ((baseHue + 180) % 360) + ",90%,60%,0)");
+  ctx.fillStyle = core;
+  ctx.beginPath(); ctx.arc(CX, CY, coreR, 0, TAU); ctx.fill();
+
+  /* ---- vignette settle ---- */
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 0.35;
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 1;
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
