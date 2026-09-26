@@ -1,0 +1,314 @@
+<!--
+Write HTML/CSS/JS code that creates a generative kaleidoscope. Colorful shapes and lines
+should flow and morph in a mirrored symmetrical pattern that rotates slowly and constantly
+changes colour and complexity. It should loop endlessly on its own with no controls.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Kaleidoscope — Generative</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #04050d; overscroll-behavior: none; }
+  canvas {
+    display: block; width: 100vw; height: 100vh;
+    touch-action: none;               /* we own pinch + flick gestures */
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+</style>
+</head>
+<body>
+<canvas id="k"></canvas>
+<script>
+(() => {
+"use strict";
+
+const TAU = Math.PI * 2;
+const canvas = document.getElementById("k");
+const ctx = canvas.getContext("2d");
+
+/* ---------- viewport ---------- */
+let W, H, CX, CY, MAXR, vignette;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  CX = W / 2; CY = H / 2;
+  MAXR = Math.min(W, H) * 0.58;
+
+  // soft vignette to settle the edges (screen-space: does NOT zoom with the scene)
+  vignette = ctx.createRadialGradient(CX, CY, Math.min(W, H) * 0.42, CX, CY, Math.max(W, H) * 0.72);
+  vignette.addColorStop(0, "rgba(3,4,12,0)");
+  vignette.addColorStop(1, "rgba(3,4,12,0.55)");
+
+  ctx.fillStyle = "#04050d";
+  ctx.fillRect(0, 0, W, H);
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ---------- helpers ---------- */
+const rand  = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+function wrapAngle(a) { return a - TAU * Math.round(a / TAU); }
+
+// smooth pseudo-noise (sum of sines): returns roughly [-1, 1], fully periodic/organic
+function noise1(t, seed) {
+  return Math.sin(t * 0.11  + seed * 1.7) * 0.5
+       + Math.sin(t * 0.043 + seed * 4.3) * 0.35
+       + Math.sin(t * 0.187 + seed * 9.1) * 0.15;
+}
+
+/* ---------- kaleidoscope geometry ---------- */
+const SEGMENTS = 8;                    // mirror wedges around the circle
+const WEDGE    = TAU / (SEGMENTS * 2); // half-sector each pass fills
+
+/* ---------- zoom state ---------- */
+const ZMIN = 0.6, ZMAX = 3;
+let zoom = 1, zoomTarget = 1;
+
+/* ---------- gesture input: pinch zoom + one-finger flick rotation w/ momentum ---------- */
+const pointers = new Map();          // pointerId -> {x, y, a (angle about screen centre), t}
+let pinch   = null;                 // { d0, z0 } — active two-pointer pinch
+let dragging = null;                // { id, lastT, v } — one-finger drag
+let spinVel  = 0;                   // user angular velocity (rad/s) fed to the flick momentum
+
+function ptAngle(x, y) { return Math.atan2(y - CY, x - CX); }
+
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  const p = { x: e.clientX, y: e.clientY, a: ptAngle(e.clientX, e.clientY), t: e.timeStamp };
+  pointers.set(e.pointerId, p);
+
+  if (pointers.size === 2) {                          // two fingers → zoom; pause rotation control
+    const [a, b] = [...pointers.values()];
+    pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y), z0: zoomTarget };
+    dragging = null;                                  // momentum keeps spinning underneath the pinch
+  } else if (pointers.size === 1) {                   // one finger → rotation control
+    dragging = { id: e.pointerId, v: 0 };
+  }
+});
+
+canvas.addEventListener("pointermove", e => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;                                     // not tracking this pointer
+  p.x = e.clientX; p.y = e.clientY;
+
+  if (pointers.size >= 2 && pinch && pinch.d0 > 0) {  // pinch: set the zoom target from finger spread
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (d > 0) zoomTarget = clamp(pinch.z0 * d / pinch.d0, ZMIN, ZMAX);
+  } else if (dragging && dragging.id === e.pointerId) { // one finger: 1:1 rotation about the centre
+    const aNow  = ptAngle(p.x, p.y);
+    const dist  = Math.hypot(p.x - CX, p.y - CY);
+    // authority drops inside ~25% of the small screen dimension (angle is unstable right at the hub)
+    const w     = clamp(dist / (Math.min(W, H) * 0.25), 0.15, 1);
+    const dAng  = wrapAngle(aNow - p.a);
+    if (dAng !== 0) {
+      userRot   += dAng * w;
+      const dtMs = Math.max(6, e.timeStamp - p.t);    // per-sample speed of the flick
+      dragging.v = dragging.v * 0.5 + (dAng * 1000 / dtMs) * 0.5;   // ~4-event smoothing
+      dragging.id2 = e.pointerId;
+    }
+    p.a = aNow; p.t = e.timeStamp;
+  }
+});
+
+function endPointer(e) {
+  const wasTracked = pointers.has(e.pointerId);
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (dragging && dragging.id === e.pointerId) {
+    if (wasTracked && pointers.size === 0) {
+      // flick release → momentum based on how fast the finger was moving when it let go
+      spinVel = clamp(dragging.v, -8, 8);
+      if (Math.abs(spinVel) < 0.25) spinVel = 0;      // gentle nips stop instead of crawling
+    }
+    dragging = null;
+  } else if (dragging && pointers.size === 1) {
+    const rest = [...pointers.entries()][0];
+    if (rest && rest[1].a !== undefined) dragging.id = rest[0];  // surviving finger re-arms drag
+  }
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+
+// desktop parity: trackpad pinch / mouse wheel still drive zoom (wheel handler from before)
+window.addEventListener("wheel", e => {
+  const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.012 : 0.003));
+  zoomTarget = clamp(zoomTarget * factor, ZMIN, ZMAX);
+  if (e.ctrlKey) e.preventDefault();
+}, { passive: false });
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+/* ---------- particles ("motes") ---------- */
+const MAX_MOTES = 56, MIN_MOTES = 14;
+const motes = [];
+for (let i = 0; i < MAX_MOTES; i++) {
+  const kind = i % 4; // strand | orb | petal | arc fragment
+  motes.push({
+    kind,
+    t0:    WEDGE * rand(0.10, 0.90),
+    wAmp:  rand(0.02, 0.09) * WEDGE,
+    wSp:   rand(0.05, 0.22),
+    wPh:   rand(0, TAU),
+    r0:    rand(0.14, 0.92),
+    rAmp:  rand(0.05, 0.28),
+    rSp:   rand(0.05, 0.30),
+    rPh:   rand(0, TAU),
+    hOff:  rand(-50, 50),
+    spSp:  rand(0.2, 0.9),
+    spPh:  rand(0, TAU),
+    sat:   rand(70, 100),
+    light: rand(52, 68),
+    seed:  Math.random() * 100,
+  });
+}
+
+// one drifting motif point — bounded oscillations only, so everything loops endlessly
+function motifPoint(m, t) {
+  const theta = m.t0 + m.wAmp * Math.sin(t * m.wSp + m.wPh);
+  const rr    = clamp(m.r0 + m.rAmp * Math.sin(t * m.rSp + m.rPh), 0.05, 1.04);
+  const r     = rr * MAXR;
+  return [r * Math.cos(theta), r * Math.sin(theta)];
+}
+
+/* ---------- main loop ---------- */
+let rotation = 0;      // slow constant auto-spin
+let userRot  = 0;      // angle added by the user's flick
+let last = performance.now();
+const ROT_SPEED = 0.06; // rad/s
+
+function frame(now) {
+  requestAnimationFrame(frame); // schedule FIRST: one bad/exceptional frame can never kill the loop
+
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  const t = now * 0.001;
+  rotation = (rotation + ROT_SPEED * dt) % TAU;
+
+  // camera: smooth zoom toward the pinch/wheel target…
+  zoom += (zoomTarget - zoom) * Math.min(1, 8 * dt);
+  if (Math.abs(zoomTarget - zoom) < 0.0004) zoom = zoomTarget;
+  // …and decay flick momentum exponentially (~1s to settle), then fold into the view angle
+  userRot = wrapAngle(userRot + spinVel * dt);
+  spinVel *= Math.exp(-dt / 0.9);
+  if (Math.abs(spinVel) < 0.02) spinVel = 0;
+  const viewAng = rotation + userRot;
+
+  /* ---- evolving global state ---- */
+  const baseHue = (t * 9 + 60 * Math.sin(t * 0.07)) % 360;
+  const spread  = 40 + 120 * (0.5 + 0.5 * noise1(t, 3));
+  const cplx    = clamp(0.5 + 0.5 * noise1(t, 11), 0, 1);
+  const breathe = 1 + 0.12 * Math.sin(t * 0.09);
+  const g       = 0.45 + 0.55 * (0.5 + 0.5 * noise1(t, 5)); // brightness breath 45%–100%
+  const zb      = breathe * zoom;
+
+  const active = Math.round(MIN_MOTES + (MAX_MOTES - MIN_MOTES) * cplx);
+  const detail = 0.35 + 0.65 * cplx;
+  // exposure compensation: fewer alphas at full density so the pattern never saturates flat
+  const ex     = Math.min(1, 34 / (active + 4));
+
+  /* ---- fade the previous frame; tighter fade keeps total exposure low ---- */
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "hsla(" + ((baseHue + 215) % 360) + ", 65%, 4%, 0.18)";
+  ctx.fillRect(0, 0, W, H);
+
+  /* ---- draw the motif once, stamp it into every mirror wedge (zoom-aware) ---- */
+  ctx.globalCompositeOperation = "lighter";
+  for (let i = 0; i < SEGMENTS * 2; i++) {
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.rotate(viewAng + i * WEDGE);
+    if (i & 1) ctx.scale(1, -1); // odd passes are the mirrored copy
+    ctx.scale(zb, zb);          // camera zoom + breathing
+
+    for (let n = 0; n < active; n++) {
+      const m = motes[n];
+      const [x, y] = motifPoint(m, t);
+      const hue   = (((baseHue + m.hOff + spread * noise1(t, m.seed)) % 360) + 360) % 360;
+      const pulse = 0.55 + 0.45 * Math.sin(t * m.spSp + m.spPh);
+      const a     = g * ex;     // shared exposure for this frame
+
+      if (m.kind === 0) { // flowing strand, curving with the flow
+        const [x2, y2] = motifPoint(m, t - 0.35 / (0.4 + m.rSp));
+        const dx = x - x2, dy = y - y2;
+        const len = Math.hypot(dx, dy);
+        if (len < 1) continue;
+        const nx = -dy / len, ny = dx / len;
+        const bow = (6 + 26 * detail) * Math.sin(t * m.wSp * 0.7 + m.seed);
+        ctx.strokeStyle = "hsla(" + hue + "," + m.sat + "%," + m.light + "%," + ((0.10 + 0.22 * pulse) * a).toFixed(3) + ")";
+        ctx.lineWidth = (1 + 3.5 * detail) * (0.6 + 0.8 * pulse);
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(x2, y2);
+        ctx.quadraticCurveTo((x + x2) / 2 + nx * bow, (y + y2) / 2 + ny * bow, x, y);
+        ctx.stroke();
+
+      } else if (m.kind === 1) { // glowing orb (dim halo → soft bright heart)
+        const r = (3 + 16 * detail) * (0.5 + pulse);
+        ctx.fillStyle = "hsla(" + hue + "," + m.sat + "%," + m.light + "%," + (0.035 * a).toFixed(3) + ")";
+        ctx.beginPath(); ctx.arc(x, y, r * 3, 0, TAU); ctx.fill();
+        ctx.fillStyle = "hsla(" + hue + "," + m.sat + "%," + Math.min(85, m.light + 12) + "%," + (0.06 * a).toFixed(3) + ")";
+        ctx.beginPath(); ctx.arc(x, y, r * 1.8, 0, TAU); ctx.fill();
+        ctx.fillStyle = "hsla(" + hue + ",40%,92%," + ((0.15 + 0.22 * pulse) * a).toFixed(3) + ")";
+        ctx.beginPath(); ctx.arc(x, y, r * 0.7, 0, TAU); ctx.fill();
+
+      } else if (m.kind === 2) { // petal / teardrop aligned to its drift
+        const [x2, y2] = motifPoint(m, t + 0.25 / (0.4 + m.rSp));
+        const ang = Math.atan2(y - y2, x - x2);
+        const L = (8 + 34 * detail) * (0.5 + pulse), Q = L * 0.32;
+        ctx.save();
+        ctx.translate(x, y); ctx.rotate(ang);
+        ctx.fillStyle = "hsla(" + hue + "," + m.sat + "%," + m.light + "%," + ((0.07 + 0.12 * pulse) * a).toFixed(3) + ")";
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.quadraticCurveTo(L * 0.55,  Q, L, 0);
+        ctx.quadraticCurveTo(L * 0.55, -Q, 0, 0);
+        ctx.fill();
+        ctx.restore();
+
+      } else { // shimmering arc fragment
+        const theta = m.t0 + m.wAmp * Math.sin(t * m.wSp + m.wPh);
+        const rr    = (m.r0 + m.rAmp * Math.sin(t * m.rSp + m.rPh)) * MAXR;
+        const span  = WEDGE * (0.35 + 0.4 * pulse);
+        ctx.strokeStyle = "hsla(" + hue + "," + m.sat + "%," + Math.min(80, m.light + 10) + "%," + ((0.05 + 0.14 * pulse) * a).toFixed(3) + ")";
+        ctx.lineWidth = 1 + 2.5 * detail;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.arc(0, 0, rr, theta - span / 2, theta + span / 2);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  /* ---- breathing core glow (zooms with the scene) ---- */
+  const coreR = MAXR * (0.10 + 0.05 * Math.sin(t * 0.35));
+  ctx.save();
+  ctx.translate(CX, CY);
+  ctx.scale(zb, zb);
+  const core = ctx.createRadialGradient(0, 0, 0, 0, 0, coreR);
+  core.addColorStop(0, "hsla(" + ((baseHue + 180) % 360) + ",90%,70%," + (0.20 * g * ex).toFixed(3) + ")");
+  core.addColorStop(1, "hsla(" + ((baseHue + 180) % 360) + ",90%,60%,0)");
+  ctx.fillStyle = core;
+  ctx.beginPath(); ctx.arc(0, 0, coreR, 0, TAU); ctx.fill();
+  ctx.restore();
+
+  /* ---- vignette settle (screen-space) ---- */
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 0.35;
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 1;
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
