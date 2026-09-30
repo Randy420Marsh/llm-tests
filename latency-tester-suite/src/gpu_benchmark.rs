@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use crate::timer::HighResTimer;
 
+/// ALU steps (one multiply + one add each) executed by every shader invocation
+const SHADER_ALU_STEPS: u32 = 32;
+const SHADER_LOCAL_SIZE: u32 = 64;
+const LCG_MUL: u32 = 1_664_525;
+const LCG_ADD: u32 = 1_013_904_223;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuBenchmarkConfig {
     pub workload_sizes: Vec<u64>,
@@ -32,6 +38,9 @@ pub struct GpuBenchmarkResult {
     pub min_latency_ms: f64,
     pub max_latency_ms: f64,
     pub std_dev_ms: f64,
+    pub percentile_50_ms: f64,
+    pub percentile_95_ms: f64,
+    pub percentile_99_ms: f64,
     pub throughput_geops: f64,
 }
 
@@ -56,93 +65,213 @@ pub struct VulkanInfo {
 
 pub struct GpuBenchmark {
     config: GpuBenchmarkConfig,
-    entry: Entry,
+    _entry: Entry,
     instance: Instance,
     device: Device,
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
+    queue_family_index: u32,
     timer: HighResTimer,
+}
+
+impl Drop for GpuBenchmark {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+/// Vulkan objects for one compute workload; everything is released on drop
+struct Resources {
+    device: Device,
+    shader: vk::ShaderModule,
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    desc_pool: vk::DescriptorPool,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    cmd_pool: vk::CommandPool,
+    fence: vk::Fence,
+    cmd: vk::CommandBuffer,
+    elements: u64,
+}
+
+impl Drop for Resources {
+    fn drop(&mut self) {
+        // Destroying VK_NULL_HANDLE objects is a no-op, so partially built sets are fine
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_fence(self.fence, None);
+            self.device.destroy_command_pool(self.cmd_pool, None);
+            self.device.destroy_descriptor_pool(self.desc_pool, None);
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(self.set_layout, None);
+            self.device.destroy_shader_module(self.shader, None);
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Build the compute shader: every invocation runs a chain of LCG steps seeded with its
+/// linear index and stores the result to `data[index]`. Returns SPIR-V words.
+fn build_shader(row_stride: u32) -> Result<Vec<u32>> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::{Builder, Operand};
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let fn_ty = b.type_function(void, vec![]);
+    let uint = b.type_int(32, 0);
+    let uvec3 = b.type_vector(uint, 3);
+    let rt_array = b.type_runtime_array(uint);
+    b.decorate(rt_array, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+    let block = b.type_struct(vec![rt_array]);
+    b.decorate(block, Decoration::Block, []);
+    b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+
+    let ptr_block = b.type_pointer(None, StorageClass::StorageBuffer, block);
+    let data = b.variable(ptr_block, None, StorageClass::StorageBuffer, None);
+    b.decorate(data, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+    b.decorate(data, Decoration::Binding, [Operand::LiteralBit32(0)]);
+
+    let ptr_in = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+
+    let c0 = b.constant_bit32(uint, 0);
+    let c_stride = b.constant_bit32(uint, row_stride);
+    let c_mul = b.constant_bit32(uint, LCG_MUL);
+    let c_add = b.constant_bit32(uint, LCG_ADD);
+    let ptr_elem = b.type_pointer(None, StorageClass::StorageBuffer, uint);
+
+    let main_fn = b.begin_function(void, None, FunctionControl::NONE, fn_ty)?;
+    b.begin_block(None)?;
+    let gid = b.load(uvec3, None, gid_var, None, [])?;
+    let x = b.composite_extract(uint, None, gid, [0])?;
+    let y = b.composite_extract(uint, None, gid, [1])?;
+    let row = b.i_mul(uint, None, y, c_stride)?;
+    let index = b.i_add(uint, None, row, x)?;
+    let mut acc = index;
+    for _ in 0..SHADER_ALU_STEPS {
+        let m = b.i_mul(uint, None, acc, c_mul)?;
+        acc = b.i_add(uint, None, m, c_add)?;
+    }
+    let dst = b.access_chain(ptr_elem, None, data, [c0, index])?;
+    b.store(dst, acc, None, [])?;
+    b.ret()?;
+    b.end_function()?;
+
+    b.entry_point(ExecutionModel::GLCompute, main_fn, "main", vec![gid_var]);
+    b.execution_mode(main_fn, ExecutionMode::LocalSize, [SHADER_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
+}
+
+/// CPU reference for the shader's per-element result
+fn reference_value(index: u32) -> u32 {
+    let mut acc = index;
+    for _ in 0..SHADER_ALU_STEPS {
+        acc = acc.wrapping_mul(LCG_MUL).wrapping_add(LCG_ADD);
+    }
+    acc
+}
+
+fn device_type_name(t: vk::PhysicalDeviceType) -> &'static str {
+    match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "DiscreteGpu",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "IntegratedGpu",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "VirtualGpu",
+        vk::PhysicalDeviceType::CPU => "Cpu",
+        _ => "Other",
+    }
 }
 
 impl GpuBenchmark {
     pub fn new(config: GpuBenchmarkConfig) -> Result<Self> {
         let entry = unsafe { Entry::load() }
-            .map_err(|e| anyhow!("Failed to load Vulkan entry: {}", e))?;
+            .map_err(|e| anyhow!("Failed to load Vulkan library: {}", e))?;
         let instance = Self::create_instance(&entry)?;
-        let (physical_device, queue_family_index) = Self::pick_physical_device(&instance)?;
-        let (device, queue) = Self::create_device(&instance, physical_device, queue_family_index)?;
+        let picked = Self::pick_physical_device(&instance).and_then(|(pd, qf)| {
+            Self::create_device(&instance, pd, qf).map(|(d, q)| (pd, qf, d, q))
+        });
+        let (physical_device, queue_family_index, device, queue) = match picked {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { instance.destroy_instance(None) };
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             config,
-            entry,
+            _entry: entry,
             instance,
             device,
             physical_device,
             queue,
+            queue_family_index,
             timer: HighResTimer::new(),
         })
     }
 
     fn create_instance(entry: &Entry) -> Result<Instance> {
-        let app_name = CString::new("Latency Tester Suite").unwrap();
-        let engine_name = CString::new("LatencyTester").unwrap();
+        let app_name = CString::new("Latency Tester Suite")?;
+        let engine_name = CString::new("LatencyTester")?;
 
-        let app_info = vk::ApplicationInfo {
-            s_type: vk::StructureType::APPLICATION_INFO,
-            p_next: std::ptr::null(),
-            p_application_name: app_name.as_ptr(),
-            application_version: vk::make_api_version(0, 1, 0, 0),
-            p_engine_name: engine_name.as_ptr(),
-            engine_version: vk::make_api_version(0, 1, 0, 0),
-            api_version: vk::API_VERSION_1_3,
-        };
+        let app_info = vk::ApplicationInfo::builder()
+            .application_name(&app_name)
+            .application_version(vk::make_api_version(0, 1, 0, 0))
+            .engine_name(&engine_name)
+            .engine_version(vk::make_api_version(0, 1, 0, 0))
+            .api_version(vk::API_VERSION_1_1); // SPIR-V 1.3 + StorageBuffer class
 
-        let create_info = vk::InstanceCreateInfo {
-            s_type: vk::StructureType::INSTANCE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: vk::InstanceCreateFlags::empty(),
-            p_application_info: &app_info,
-            enabled_layer_count: 0,
-            pp_enabled_layer_names: std::ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: std::ptr::null(),
-        };
-
-        let instance = unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|e| anyhow!("Failed to create Vulkan instance: {}", e))?;
-        Ok(instance)
+        let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+        unsafe { entry.create_instance(&create_info, None) }
+            .map_err(|e| anyhow!("Failed to create Vulkan instance: {}", e))
     }
 
     fn pick_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u32)> {
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| anyhow!("Failed to enumerate physical devices: {}", e))?;
 
-        for device in &devices {
-            let props = unsafe { instance.get_physical_device_properties(*device) };
-            if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
-                if let Some(queue_family) = Self::find_compute_queue_family(instance, *device) {
-                    return Ok((*device, queue_family));
-                }
+        // Prefer discrete GPUs, then integrated, then anything with a compute queue
+        let rank = |d: vk::PhysicalDevice| {
+            match unsafe { instance.get_physical_device_properties(d) }.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+                _ => 2,
             }
-        }
-
-        for device in &devices {
-            if let Some(queue_family) = Self::find_compute_queue_family(instance, *device) {
-                return Ok((*device, queue_family));
-            }
-        }
-
-        Err(anyhow!("No suitable GPU found"))
+        };
+        let mut candidates: Vec<_> = devices
+            .iter()
+            .filter_map(|&d| Self::find_compute_queue_family(instance, d).map(|q| (rank(d), d, q)))
+            .collect();
+        candidates.sort_by_key(|c| c.0);
+        candidates
+            .first()
+            .map(|&(_, d, q)| (d, q))
+            .ok_or_else(|| anyhow!("No Vulkan device with a compute queue found"))
     }
 
     fn find_compute_queue_family(instance: &Instance, device: vk::PhysicalDevice) -> Option<u32> {
-        let queue_families = unsafe { instance.get_physical_device_queue_family_properties(device) };
-        for (i, family) in queue_families.iter().enumerate() {
-            if family.queue_flags.contains(vk::QueueFlags::COMPUTE) {
-                return Some(i as u32);
-            }
-        }
-        None
+        let families = unsafe { instance.get_physical_device_queue_family_properties(device) };
+        families
+            .iter()
+            .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .map(|i| i as u32)
     }
 
     fn create_device(
@@ -150,31 +279,16 @@ impl GpuBenchmark {
         physical_device: vk::PhysicalDevice,
         queue_family_index: u32,
     ) -> Result<(Device, vk::Queue)> {
-        let queue_priorities = [1.0];
-        let queue_create_info = vk::DeviceQueueCreateInfo {
-            s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: vk::DeviceQueueCreateFlags::empty(),
-            queue_family_index,
-            queue_count: 1,
-            p_queue_priorities: queue_priorities.as_ptr(),
-        };
-
-        let create_info = vk::DeviceCreateInfo {
-            s_type: vk::StructureType::DEVICE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: vk::DeviceCreateFlags::empty(),
-            queue_create_info_count: 1,
-            p_queue_create_infos: std::slice::from_ref(&queue_create_info).as_ptr(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: std::ptr::null(),
-            p_enabled_features: &vk::PhysicalDeviceFeatures::default(),
-        };
+        let priorities = [1.0f32];
+        let queue_infos = [vk::DeviceQueueCreateInfo::builder()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&priorities)
+            .build()];
+        let create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_infos);
 
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }
             .map_err(|e| anyhow!("Failed to create logical device: {}", e))?;
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-
         Ok((device, queue))
     }
 
@@ -184,8 +298,7 @@ impl GpuBenchmark {
         let mut results = Vec::new();
 
         for &size in &self.config.workload_sizes {
-            let result = self.run_compute_workload(size)?;
-            results.push(result);
+            results.push(self.run_compute_workload(size)?);
         }
 
         Ok(GpuBenchmarkSummary {
@@ -197,188 +310,359 @@ impl GpuBenchmark {
         })
     }
 
+    fn find_memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
+        let props = unsafe { self.instance.get_physical_device_memory_properties(self.physical_device) };
+        (0..props.memory_type_count).find(|&i| {
+            type_bits & (1 << i) != 0
+                && props.memory_types[i as usize].property_flags.contains(flags)
+        })
+    }
+
+    /// Create pipeline, buffer and a pre-recorded command buffer for `size` invocations.
+    /// Returns the resources and the actual number of elements the dispatch covers.
+    fn create_resources(&self, size: u64, host_visible: bool) -> Result<Resources> {
+        let d = &self.device;
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical_device) }.limits;
+
+        // Split the dispatch over X and Y so it stays under maxComputeWorkGroupCount
+        let groups = size.div_ceil(SHADER_LOCAL_SIZE as u64).max(1);
+        let gx = groups.min(limits.max_compute_work_group_count[0] as u64).min(65535);
+        let gy = groups.div_ceil(gx);
+        if gy > limits.max_compute_work_group_count[1] as u64 {
+            return Err(anyhow!("Workload of {} elements exceeds device dispatch limits", size));
+        }
+        let elements = gx * gy * SHADER_LOCAL_SIZE as u64;
+        let row_stride = (gx * SHADER_LOCAL_SIZE as u64) as u32;
+        let bytes = elements * 4;
+        if bytes > limits.max_storage_buffer_range as u64 {
+            return Err(anyhow!("Workload of {} elements exceeds max storage buffer range", size));
+        }
+
+        let mut r = Resources {
+            device: d.clone(),
+            shader: vk::ShaderModule::null(),
+            set_layout: vk::DescriptorSetLayout::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            desc_pool: vk::DescriptorPool::null(),
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            cmd_pool: vk::CommandPool::null(),
+            fence: vk::Fence::null(),
+            cmd: vk::CommandBuffer::null(),
+            elements,
+        };
+        let err = |what: &'static str| move |e: vk::Result| anyhow!("Failed to {}: {}", what, e);
+
+        unsafe {
+            let code = build_shader(row_stride)?;
+            r.shader = d
+                .create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&code), None)
+                .map_err(err("create shader module"))?;
+
+            let bindings = [vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .build()];
+            r.set_layout = d
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings),
+                    None,
+                )
+                .map_err(err("create descriptor set layout"))?;
+            let set_layouts = [r.set_layout];
+            r.pipeline_layout = d
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::builder().set_layouts(&set_layouts),
+                    None,
+                )
+                .map_err(err("create pipeline layout"))?;
+
+            let entry_name = CString::new("main")?;
+            let stage = vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(r.shader)
+                .name(&entry_name)
+                .build();
+            let pipeline_info = [vk::ComputePipelineCreateInfo::builder()
+                .stage(stage)
+                .layout(r.pipeline_layout)
+                .build()];
+            r.pipeline = d
+                .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+                .map_err(|(_, e)| anyhow!("Failed to create compute pipeline: {}", e))?[0];
+
+            // Buffer + memory
+            r.buffer = d
+                .create_buffer(
+                    &vk::BufferCreateInfo::builder()
+                        .size(bytes)
+                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .map_err(err("create buffer"))?;
+            let reqs = d.get_buffer_memory_requirements(r.buffer);
+            let wanted = if host_visible {
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+            } else {
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+            };
+            let mem_type = self
+                .find_memory_type(reqs.memory_type_bits, wanted)
+                .or_else(|| self.find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+                .ok_or_else(|| anyhow!("No suitable memory type"))?;
+            r.memory = d
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::builder()
+                        .allocation_size(reqs.size)
+                        .memory_type_index(mem_type),
+                    None,
+                )
+                .map_err(err("allocate buffer memory"))?;
+            d.bind_buffer_memory(r.buffer, r.memory, 0).map_err(err("bind buffer memory"))?;
+
+            // Descriptor set
+            let pool_sizes = [vk::DescriptorPoolSize::builder()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .build()];
+            r.desc_pool = d
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&pool_sizes),
+                    None,
+                )
+                .map_err(err("create descriptor pool"))?;
+            let set = d
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::builder()
+                        .descriptor_pool(r.desc_pool)
+                        .set_layouts(&set_layouts),
+                )
+                .map_err(err("allocate descriptor set"))?[0];
+            let buffer_info = [vk::DescriptorBufferInfo::builder()
+                .buffer(r.buffer)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)
+                .build()];
+            d.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::builder()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buffer_info)
+                    .build()],
+                &[],
+            );
+
+            // Command buffer, recorded once and resubmitted every iteration
+            r.cmd_pool = d
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::builder().queue_family_index(self.queue_family_index),
+                    None,
+                )
+                .map_err(err("create command pool"))?;
+            r.cmd = d
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::builder()
+                        .command_pool(r.cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .map_err(err("allocate command buffer"))?[0];
+            d.begin_command_buffer(r.cmd, &vk::CommandBufferBeginInfo::builder())
+                .map_err(err("begin command buffer"))?;
+            d.cmd_bind_pipeline(r.cmd, vk::PipelineBindPoint::COMPUTE, r.pipeline);
+            d.cmd_bind_descriptor_sets(
+                r.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                r.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            d.cmd_dispatch(r.cmd, gx as u32, gy as u32, 1);
+            d.end_command_buffer(r.cmd).map_err(err("end command buffer"))?;
+
+            r.fence = d
+                .create_fence(&vk::FenceCreateInfo::builder(), None)
+                .map_err(err("create fence"))?;
+        }
+        Ok(r)
+    }
+
+    /// Submit the recorded command buffer and block until the GPU finished
+    fn submit_and_wait(&self, r: &Resources) -> Result<()> {
+        let cmds = [r.cmd];
+        let submit = [vk::SubmitInfo::builder().command_buffers(&cmds).build()];
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit, r.fence)
+                .map_err(|e| anyhow!("Queue submit failed: {}", e))?;
+            self.device
+                .wait_for_fences(&[r.fence], true, u64::MAX)
+                .map_err(|e| anyhow!("Waiting for fence failed: {}", e))?;
+            self.device
+                .reset_fences(&[r.fence])
+                .map_err(|e| anyhow!("Resetting fence failed: {}", e))?;
+        }
+        Ok(())
+    }
+
     fn run_compute_workload(&self, size: u64) -> Result<GpuBenchmarkResult> {
-        // Simple compute shader SPIR-V (Void main() { })
-        let shader_code: &[u32] = &[
-            0x07230203, 0x00010000, 0x00000001, 0x00000000,
-            0x00020011, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000, 0x00000000, 0x00000000, 0x00000000,
-        ];
+        let res = self.create_resources(size, false)?;
 
-        let shader_module = unsafe {
-            let create_info = vk::ShaderModuleCreateInfo {
-                s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: vk::ShaderModuleCreateFlags::empty(),
-                code_size: (shader_code.len() * 4) as usize,
-                p_code: bytemuck::cast_slice(shader_code).as_ptr(),
-            };
-            self.device.create_shader_module(&create_info, None)
-                .map_err(|e| anyhow!("Failed to create shader module: {}", e))?
-        };
-
-        let pipeline_layout = unsafe {
-            let layout_info = vk::PipelineLayoutCreateInfo::default();
-            self.device.create_pipeline_layout(&layout_info, None)
-                .map_err(|e| anyhow!("Failed to create pipeline layout: {}", e))?
-        };
-
-        let pipeline = unsafe {
-            let stage_info = vk::PipelineShaderStageCreateInfo {
-                s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: vk::PipelineShaderStageCreateFlags::empty(),
-                stage: vk::ShaderStageFlags::COMPUTE,
-                module: shader_module,
-                p_name: std::ptr::null(),
-                p_specialization_info: std::ptr::null(),
-            };
-            let pipeline_info = vk::ComputePipelineCreateInfo {
-                s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: vk::PipelineCreateFlags::empty(),
-                stage: &stage_info,
-                layout: pipeline_layout,
-                base_pipeline_handle: vk::Pipeline::null(),
-                base_pipeline_index: -1,
-            };
-
-            self.device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-                .map_err(|e| anyhow!("Failed to create compute pipeline: {}", e))?[0]
-        };
-
-        let command_pool = unsafe {
-            let pool_info = vk::CommandPoolCreateInfo {
-                s_type: vk::StructureType::COMMAND_POOL_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: vk::CommandPoolCreateFlags::empty(),
-                queue_family_index: self.queue_family_index,
-            };
-            self.device.create_command_pool(&pool_info, None)
-                .map_err(|e| anyhow!("Failed to create command pool: {}", e))?
-        };
-
-        let command_buffer = unsafe {
-            let alloc_info = vk::CommandBufferAllocateInfo {
-                s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
-                p_next: std::ptr::null(),
-                command_pool,
-                level: vk::CommandBufferLevel::PRIMARY,
-                command_buffer_count: 1,
-            };
-            self.device.allocate_command_buffers(&alloc_info)
-                .map_err(|e| anyhow!("Failed to allocate command buffer: {}", e))?[0]
-        };
-
-        unsafe {
-            let begin_info = vk::CommandBufferBeginInfo {
-                s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
-                p_next: std::ptr::null(),
-                flags: vk::CommandBufferBeginFlags::empty(), // Note: Check if this exists in ash 0.37, might be vk::CommandBufferBeginFlags::empty() or similar
-                p_inheritance_info: std::ptr::null(),
-            };
-            self.device.begin_command_buffer(command_buffer, &begin_info)
-                .map_err(|e| anyhow!("Failed to begin command buffer: {}", e))?;
-            self.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-            self.device.cmd_dispatch(command_buffer, (size as u32 / 64).max(1), 1, 1);
-            self.device.end_command_buffer(command_buffer)
-                .map_err(|e| anyhow!("Failed to end command buffer: {}", e))?;
-        }
-
-        let submit_info = vk::SubmitInfo {
-            s_type: vk::StructureType::SUBMIT_INFO,
-            p_next: std::ptr::null(),
-            command_buffer_count: 1,
-            p_command_buffers: std::slice::from_ref(&command_buffer).as_ptr(),
-            signal_semaphore_count: 0,
-            p_signal_semaphores: std::ptr::null(),
-            wait_semaphore_count: 0,
-            p_wait_semaphores: std::ptr::null(),
-            p_wait_dst_stage_mask: std::ptr::null(),
-        };
-
-        let mut frame_times = Vec::with_capacity(self.config.iterations as usize);
-        let timer = HighResTimer::new();
-
-        // Warmup
         for _ in 0..self.config.warmup_iterations {
-            unsafe {
-                self.device.queue_submit(self.queue, &[submit_info], vk::Fence::null())
-                    .map_err(|e| anyhow!("Warmup submit failed: {}", e))?;
-                self.device.queue_wait_idle().map_err(|e| anyhow!("Warmup wait failed: {}", e))?;
-            }
+            self.submit_and_wait(&res)?;
         }
 
-        // Benchmark
-        for _ in 0..self.config.iterations {
-            let start = timer.now();
-            unsafe {
-                self.device.queue_submit(self.queue, &[submit_info], vk::Fence::null())
-                    .map_err(|e| anyhow!("Submit failed: {}", e))?;
-                self.device.queue_wait_idle().map_err(|e| anyhow!("Wait idle failed: {}", e))?;
-            }
-            let end = timer.now();
-            frame_times.push(end.duration_since(start).as_secs_f64() * 1000.0);
+        let iterations = self.config.iterations.max(1);
+        let mut times = Vec::with_capacity(iterations as usize);
+        for _ in 0..iterations {
+            let start = self.timer.now_ticks();
+            self.submit_and_wait(&res)?;
+            let end = self.timer.now_ticks();
+            times.push(self.timer.ticks_to_ms_f64(end - start));
         }
 
-        // Cleanup
-        unsafe {
-            self.device.destroy_pipeline(pipeline, None);
-            self.device.destroy_pipeline_layout(pipeline_layout, None);
-            self.device.destroy_shader_module(shader_module, None);
-            self.device.destroy_command_pool(command_pool, None);
-        }
-
-        frame_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let sum: f64 = frame_times.iter().sum();
-        let avg = sum / frame_times.len() as f64;
-        let min = frame_times[0];
-        let max = frame_times[frame_times.len() - 1];
-        let variance: f64 = frame_times.iter().map(|&x| (x - avg).powi(2)).sum::<f64>() / frame_times.len() as f64;
-        let std_dev = variance.sqrt();
+        times.sort_by(|a, b| a.total_cmp(b));
+        let n = times.len();
+        let avg = times.iter().sum::<f64>() / n as f64;
+        let variance = times.iter().map(|&x| (x - avg).powi(2)).sum::<f64>() / n as f64;
+        let pct = |p: f64| times[((n as f64 * p) as usize).min(n - 1)];
+        let ops = res.elements as f64 * SHADER_ALU_STEPS as f64 * 2.0; // mul + add per step
 
         Ok(GpuBenchmarkResult {
             workload_size: size,
             avg_latency_ms: avg,
-            min_latency_ms: min,
-            max_latency_ms: max,
-            std_dev_ms: std_dev,
-            throughput_geops: (size as f64 / (avg / 1000.0)) / 1e9,
+            min_latency_ms: times[0],
+            max_latency_ms: times[n - 1],
+            std_dev_ms: variance.sqrt(),
+            percentile_50_ms: pct(0.50),
+            percentile_95_ms: pct(0.95),
+            percentile_99_ms: pct(0.99),
+            throughput_geops: if avg > 0.0 { ops / (avg / 1000.0) / 1e9 } else { 0.0 },
         })
+    }
+
+    /// Run the shader once on `size` elements and check every output against the CPU
+    pub fn verify_shader(&self, size: u64) -> Result<()> {
+        let res = self.create_resources(size, true)?;
+        let bytes = res.elements * 4;
+        let mapped = unsafe {
+            self.device
+                .map_memory(res.memory, 0, bytes, vk::MemoryMapFlags::empty())
+                .map_err(|e| anyhow!("Failed to map memory: {}", e))?
+        } as *mut u32;
+        // Poison the buffer so an unwritten element cannot pass by accident
+        unsafe { std::slice::from_raw_parts_mut(mapped, res.elements as usize).fill(0xDEAD_BEEF) };
+
+        self.submit_and_wait(&res)?;
+
+        let out = unsafe { std::slice::from_raw_parts(mapped, res.elements as usize) };
+        let bad = out
+            .iter()
+            .enumerate()
+            .find(|&(i, &v)| v != reference_value(i as u32));
+        unsafe { self.device.unmap_memory(res.memory) };
+        match bad {
+            None => Ok(()),
+            Some((i, &v)) => Err(anyhow!(
+                "GPU result mismatch at element {}: got {:#x}, expected {:#x}",
+                i,
+                v,
+                reference_value(i as u32)
+            )),
+        }
     }
 
     fn get_vulkan_info(&self) -> Result<VulkanInfo> {
         let props = unsafe { self.instance.get_physical_device_properties(self.physical_device) };
         Ok(VulkanInfo {
-            api_version: format!("{}.{}.{}", 
+            api_version: format!(
+                "{}.{}.{}",
                 vk::api_version_major(props.api_version),
                 vk::api_version_minor(props.api_version),
                 vk::api_version_patch(props.api_version)
             ),
             driver_version: format!("{}", props.driver_version),
             device_name: unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) }
-                .to_string_lossy().to_string(),
-            device_type: format!("{:?}", props.device_type),
+                .to_string_lossy()
+                .to_string(),
+            device_type: device_type_name(props.device_type).to_string(),
             vendor_id: props.vendor_id,
             device_id: props.device_id,
         })
     }
 }
 
+#[allow(dead_code)]
 pub fn quick_gpu_test() -> Result<f64> {
-    let config = GpuBenchmarkConfig::default();
+    let config = GpuBenchmarkConfig {
+        workload_sizes: vec![1 << 20],
+        iterations: 20,
+        warmup_iterations: 3,
+    };
     let mut benchmark = GpuBenchmark::new(config)?;
     let summary = benchmark.run()?;
-    Ok(summary.results[0].avg_latency_ms)
+    summary
+        .results
+        .first()
+        .map(|r| r.avg_latency_ms)
+        .ok_or_else(|| anyhow!("GPU benchmark produced no results"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reference_value_is_lcg() {
+        assert_eq!(reference_value(0), {
+            let mut a = 0u32;
+            for _ in 0..SHADER_ALU_STEPS {
+                a = a.wrapping_mul(LCG_MUL).wrapping_add(LCG_ADD);
+            }
+            a
+        });
+    }
+
+    #[test]
+    fn test_shader_is_valid_spirv_header() {
+        let words = build_shader(4096).unwrap();
+        assert_eq!(words[0], 0x0723_0203);
+        assert!(words.len() > 20);
+    }
+
+    /// Needs a Vulkan device (e.g. lavapipe); skipped when none is available
+    #[test]
+    fn test_gpu_shader_matches_cpu() {
+        let bench = match GpuBenchmark::new(GpuBenchmarkConfig::default()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        // Odd size exercises the X/Y dispatch rounding
+        bench.verify_shader(100_000).unwrap();
+        bench.verify_shader(1).unwrap();
+    }
+
+    #[test]
+    fn test_gpu_run_small() {
+        let mut bench = match GpuBenchmark::new(GpuBenchmarkConfig {
+            workload_sizes: vec![1 << 16],
+            iterations: 5,
+            warmup_iterations: 1,
+        }) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let s = bench.run().unwrap();
+        assert_eq!(s.results.len(), 1);
+        assert!(s.results[0].avg_latency_ms > 0.0);
+    }
 }

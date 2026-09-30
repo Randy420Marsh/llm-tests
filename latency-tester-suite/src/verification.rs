@@ -1,3 +1,4 @@
+#![allow(dead_code)] // public helper API; not every function is wired into the GUI/CLI
 //! Verification utilities for result validation and hash checking
 
 use anyhow::Result;
@@ -25,24 +26,13 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     Ok(hex::encode(hash))
 }
 
-/// Verify a result file against its embedded signature
-pub fn verify_result_file(path: &Path, public_key: &[u8]) -> Result<crate::result_logger::VerificationResult> {
-    use crate::result_logger::{VerifiedResult, ResultLogger};
-    
-    let mut file = std::fs::File::open(path)?;
-    let mut contents = String::new();
-    std::io::Read::read_to_string(&mut file, &mut contents)?;
-    
+/// Verify a result file's signature against a trusted Ed25519 public key
+pub fn verify_result_file(path: &Path, public_key: &[u8; 32]) -> Result<crate::result_logger::VerificationResult> {
+    use crate::result_logger::{ResultLogger, VerifiedResult};
+
+    let contents = std::fs::read_to_string(path)?;
     let result: VerifiedResult = serde_json::from_str(&contents)?;
-    
-    // Create a temporary logger with the provided public key for verification
-    let logger = ResultLogger::new_with_key(
-        result.header.app_version.clone(),
-        ".".to_string(),
-        public_key.try_into().map_err(|_| anyhow::anyhow!("Invalid public key length"))?,
-    )?;
-    
-    Ok(logger.verify_result(&result))
+    Ok(ResultLogger::verify_with_public_key(&result, public_key))
 }
 
 /// Generate a hash for the current application binary
@@ -57,7 +47,7 @@ pub fn create_signed_package(
     output_path: &Path,
     private_key: &[u8; 32],
 ) -> Result<()> {
-    use crate::result_logger::{ResultLogger, VerifiedResult};
+    use crate::result_logger::ResultLogger;
     use std::fs::File;
     use std::io::Write;
     
@@ -87,22 +77,15 @@ pub fn create_signed_package(
     
     // Write each result
     for result in results {
-        let result_bytes = bincode::serialize(&result)?;
+        let result_bytes = serde_json::to_vec(&result)?;
         package.extend_from_slice(&(result_bytes.len() as u32).to_le_bytes());
         package.extend_from_slice(&result_bytes);
     }
     
-    // Sign the entire package
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-    
-    let mut mac = HmacSha256::new_from_slice(private_key)?;
-    mac.update(&package);
-    let signature = mac.finalize().into_bytes();
-    
-    // Write signature at the end
-    package.extend_from_slice(&signature);
+    // Sign the entire package (Ed25519, 64-byte signature appended)
+    use ed25519_dalek::{Signer, SigningKey};
+    let signature = SigningKey::from_bytes(private_key).sign(&package);
+    package.extend_from_slice(&signature.to_bytes());
     
     // Write to file
     let mut file = File::create(output_path)?;
@@ -116,15 +99,13 @@ pub fn verify_signed_package(
     package_path: &Path,
     public_key: &[u8; 32],
 ) -> Result<PackageVerificationResult> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-    
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
     let mut file = std::fs::File::open(package_path)?;
     let mut package = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut package)?;
     
-    if package.len() < 32 {
+    if package.len() < 64 {
         return Ok(PackageVerificationResult {
             valid: false,
             message: "Package too small".to_string(),
@@ -134,14 +115,13 @@ pub fn verify_signed_package(
     }
     
     // Split package and signature
-    let (package_data, signature) = package.split_at(package.len() - 32);
-    
-    // Verify signature
-    let mut mac = HmacSha256::new_from_slice(public_key)?;
-    mac.update(package_data);
-    let expected_signature = mac.finalize().into_bytes();
-    
-    if !constant_time_eq(signature, &expected_signature) {
+    let (package_data, signature) = package.split_at(package.len() - 64);
+    let sig_bytes: [u8; 64] = signature.try_into()?;
+
+    // Verify signature against the trusted public key
+    let key = VerifyingKey::from_bytes(public_key)
+        .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
+    if key.verify(package_data, &Signature::from_bytes(&sig_bytes)).is_err() {
         return Ok(PackageVerificationResult {
             valid: false,
             message: "Package signature verification failed".to_string(),
@@ -149,7 +129,7 @@ pub fn verify_signed_package(
             results: Vec::new(),
         });
     }
-    
+
     // Parse package
     let mut offset = 0;
     
@@ -185,7 +165,7 @@ pub fn verify_signed_package(
         let result_bytes = &package_data[offset..offset+result_len];
         offset += result_len;
         
-        let result: crate::result_logger::VerifiedResult = bincode::deserialize(result_bytes)?;
+        let result: crate::result_logger::VerifiedResult = serde_json::from_slice(result_bytes)?;
         results.push(result);
     }
     
@@ -243,5 +223,67 @@ mod tests {
         let hash = generate_app_hash();
         assert!(hash.is_ok());
         assert_eq!(hash.unwrap().len(), 64); // SHA256 hex = 64 chars
+    }
+
+    fn signed_results(dir: &Path, key: &[u8; 32]) -> ResultLoggerFixture {
+        use crate::result_logger::ResultLogger;
+        let logger = ResultLogger::new_with_key("1.0.0".into(), dir.to_string_lossy().into(), key).unwrap();
+        let info = crate::system_info::collect_system_info().unwrap();
+        let v = serde_json::json!({"x": 1.25});
+        logger.log_result("cpu", &info, &v, &v, Default::default()).unwrap();
+        logger.log_result("gpu", &info, &v, &v, Default::default()).unwrap();
+        ResultLoggerFixture
+    }
+    struct ResultLoggerFixture;
+
+    #[test]
+    fn test_signed_package_round_trip_and_tamper() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        signed_results(dir.path(), &key);
+        let pkg = dir.path().join("package.bin");
+        create_signed_package(dir.path(), &pkg, &key).unwrap();
+
+        let public = ed25519_dalek::SigningKey::from_bytes(&key).verifying_key().to_bytes();
+        let other_public = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
+        let ok = verify_signed_package(&pkg, &public).unwrap();
+        assert!(ok.valid, "{}", ok.message);
+        assert_eq!(ok.results.len(), 2);
+        assert_eq!(ok.manifest.unwrap()["result_count"], 2);
+
+        // wrong key
+        assert!(!verify_signed_package(&pkg, &other_public).unwrap().valid);
+
+        // flipped byte
+        let mut bytes = std::fs::read(&pkg).unwrap();
+        bytes[10] ^= 0xFF;
+        let bad = dir.path().join("bad.bin");
+        std::fs::write(&bad, bytes).unwrap();
+        assert!(!verify_signed_package(&bad, &public).unwrap().valid);
+
+        // truncated
+        let short = dir.path().join("short.bin");
+        std::fs::write(&short, [0u8; 8]).unwrap();
+        assert!(!verify_signed_package(&short, &key).unwrap().valid);
+    }
+
+    #[test]
+    fn test_file_hash_matches_known_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("abc");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(
+            compute_file_hash(&f).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(verify_app_integrity(&generate_app_hash().unwrap()).unwrap());
+        assert!(!verify_app_integrity("deadbeef").unwrap());
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

@@ -5,8 +5,7 @@ use anyhow::Result;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use crate::timer::{HighResTimer, IntervalTimer};
+use crate::timer::HighResTimer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBenchmarkConfig {
@@ -112,6 +111,29 @@ pub struct MemoryBenchmark {
     rng: StdRng,
 }
 
+/// Split `buf` into `tc` contiguous, disjoint, mutable chunks (remainder spread over the first chunks)
+fn split_mut(mut buf: &mut [u8], tc: usize) -> Vec<&mut [u8]> {
+    let tc = tc.max(1);
+    let base = buf.len() / tc;
+    let rem = buf.len() % tc;
+    let mut out = Vec::with_capacity(tc);
+    for i in 0..tc {
+        let len = base + usize::from(i < rem);
+        let (head, tail) = buf.split_at_mut(len);
+        out.push(head);
+        buf = tail;
+    }
+    out
+}
+
+/// Range of items owned by worker `i` when `n` items are shared between `tc` workers
+fn share(n: usize, tc: usize, i: usize) -> std::ops::Range<usize> {
+    let base = n / tc;
+    let rem = n % tc;
+    let start = i * base + i.min(rem);
+    start..start + base + usize::from(i < rem)
+}
+
 impl MemoryBenchmark {
     pub fn new(config: MemoryBenchmarkConfig) -> Self {
         Self {
@@ -125,17 +147,19 @@ impl MemoryBenchmark {
         let system_info = crate::system_info::collect_system_info()?;
         let mut results = Vec::new();
 
-        for &size in &self.config.sizes {
+        for size in self.config.sizes.clone() {
             // Allocate once per size and reuse across all patterns and thread counts
-            let buffer = self.allocate_buffer(size)?;
-            
-            for &pattern in &self.config.patterns {
-                for &thread_count in &self.config.thread_counts {
+            let mut data = self.allocate_buffer(size)?;
+            let mut aux = self.allocate_buffer(size)?;
+
+            for pattern in self.config.patterns.clone() {
+                for &thread_count in &self.config.thread_counts.clone() {
                     if thread_count > num_cpus::get() {
                         continue; // Skip thread counts higher than available CPUs
                     }
-                    
-                    let result = self.run_single_test(&buffer, size, pattern, thread_count)?;
+
+                    let result =
+                        self.run_single_test(&mut data, &mut aux, size, pattern, thread_count)?;
                     results.push(result);
                 }
             }
@@ -151,34 +175,36 @@ impl MemoryBenchmark {
 
     fn run_single_test(
         &mut self,
-        buffer: &Arc<Vec<u8>>,
+        data: &mut [u8],
+        aux: &mut [u8],
         size: usize,
         pattern: AccessPattern,
         thread_count: usize,
     ) -> Result<MemoryBenchmarkResult> {
         // Warmup
         for _ in 0..self.config.warmup_iterations {
-            self.run_pattern(buffer, size, pattern, 1)?;
+            self.run_pattern(data, aux, size, pattern, 1)?;
         }
 
         // Actual benchmark
-        let mut latencies = Vec::with_capacity(self.config.iterations as usize);
+        let iterations = self.config.iterations.max(1);
+        let mut latencies = Vec::with_capacity(iterations as usize);
         let mut total_bytes = 0u64;
 
-        for _ in 0..self.config.iterations {
-            let (latency_ns, bytes) = self.run_pattern(buffer, size, pattern, thread_count)?;
+        for _ in 0..iterations {
+            let (latency_ns, bytes) = self.run_pattern(data, aux, size, pattern, thread_count)?;
             latencies.push(latency_ns);
             total_bytes += bytes;
         }
 
         // Calculate statistics
-        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        
+        latencies.sort_by(|a, b| a.total_cmp(b));
+
         let sum: f64 = latencies.iter().sum();
         let avg = sum / latencies.len() as f64;
         let min = latencies[0];
         let max = latencies[latencies.len() - 1];
-        
+
         let variance: f64 = latencies.iter()
             .map(|&x| (x - avg).powi(2))
             .sum::<f64>() / latencies.len() as f64;
@@ -189,10 +215,9 @@ impl MemoryBenchmark {
         let p95 = latencies[p_idx(0.95)];
         let p99 = latencies[p_idx(0.99)];
         let p999 = latencies[p_idx(0.999)];
-        
+
         // Calculate bandwidth (bytes/ns == GB/s)
-        let total_time_ns: f64 = latencies.iter().sum();
-        let bandwidth_gb_s = total_bytes as f64 / total_time_ns; // GB/s
+        let bandwidth_gb_s = if sum > 0.0 { total_bytes as f64 / sum } else { 0.0 };
 
         Ok(MemoryBenchmarkResult {
             size,
@@ -200,7 +225,7 @@ impl MemoryBenchmark {
             thread_count,
             latency_ns: avg,
             bandwidth_gb_s,
-            iterations: self.config.iterations,
+            iterations,
             min_latency_ns: min,
             max_latency_ns: max,
             std_dev_ns: std_dev,
@@ -211,483 +236,284 @@ impl MemoryBenchmark {
         })
     }
 
-    fn allocate_buffer(&mut self, size: usize) -> Result<Arc<Vec<u8>>> {
-        // Use aligned allocation for better performance
-        let align = 4096; // Page aligned
-        let layout = std::alloc::Layout::from_size_align(size, align)?;
-        let ptr = unsafe { std::alloc::alloc(layout) };
-        
-        if ptr.is_null() {
-            return Err(anyhow::anyhow!("Failed to allocate {} bytes", size));
-        }
-
-        // Initialize with random data
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
-        self.rng.fill(slice);
-
-        Ok(Arc::new(unsafe { Vec::from_raw_parts(ptr, size, size) }))
+    /// Allocate a buffer filled with pseudo-random data
+    fn allocate_buffer(&mut self, size: usize) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate {} bytes: {}", size, e))?;
+        buf.resize(size, 0);
+        self.rng.fill(&mut buf[..]);
+        Ok(buf)
     }
 
+    /// Run `worker(i)` on `tc` scoped threads, timing only the parallel phase.
+    /// Returns (total bytes reported by workers, elapsed nanoseconds).
+    fn run_parallel<F>(&self, tc: usize, worker: F) -> (u64, f64)
+    where
+        F: Fn(usize) -> usize + Sync,
+    {
+        let start = self.timer.now_ticks();
+        let total: usize = std::thread::scope(|s| {
+            let worker = &worker;
+            let handles: Vec<_> = (0..tc).map(|i| s.spawn(move || worker(i))).collect();
+            handles.into_iter().map(|h| h.join().expect("benchmark worker panicked")).sum()
+        });
+        let elapsed = self.timer.now_ticks() - start;
+        (total as u64, self.timer.ticks_to_ns(elapsed).max(1) as f64)
+    }
+
+    /// Like `run_parallel` but each worker gets exclusive access to one chunk of `buf`
+    fn run_parallel_mut<F>(&self, buf: &mut [u8], tc: usize, worker: F) -> (u64, f64)
+    where
+        F: Fn(usize, &mut [u8]) -> usize + Sync,
+    {
+        let chunks = split_mut(buf, tc);
+        let start = self.timer.now_ticks();
+        let total: usize = std::thread::scope(|s| {
+            let worker = &worker;
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .enumerate()
+                .map(|(i, chunk)| s.spawn(move || worker(i, chunk)))
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("benchmark worker panicked")).sum()
+        });
+        let elapsed = self.timer.now_ticks() - start;
+        (total as u64, self.timer.ticks_to_ns(elapsed).max(1) as f64)
+    }
+
+    /// Returns (elapsed_ns, bytes_accessed)
     fn run_pattern(
         &mut self,
-        buffer: &Arc<Vec<u8>>,
+        data: &mut [u8],
+        aux: &mut [u8],
         size: usize,
         pattern: AccessPattern,
         thread_count: usize,
     ) -> Result<(f64, u64)> {
-        let mut interval = IntervalTimer::new();
-        
-        let bytes_accessed = match pattern {
-            AccessPattern::SequentialRead => self.sequential_read(buffer, size, thread_count)?,
-            AccessPattern::SequentialWrite => self.sequential_write(buffer, size, thread_count)?,
-            AccessPattern::SequentialReadWrite => self.sequential_read_write(buffer, size, thread_count)?,
-            AccessPattern::RandomRead => self.random_read(buffer, size, thread_count)?,
-            AccessPattern::RandomWrite => self.random_write(buffer, size, thread_count)?,
-            AccessPattern::StridedRead { stride } => self.strided_read(buffer, size, stride, thread_count)?,
-            AccessPattern::PointerChase => self.pointer_chase(buffer, size, thread_count)?,
-            AccessPattern::DependentRead => self.dependent_read(buffer, size, thread_count)?,
-            AccessPattern::IndependentRead => self.independent_read(buffer, size, thread_count)?,
-            AccessPattern::StreamCopy => self.stream_copy(buffer, size, thread_count)?,
-            AccessPattern::StreamScale => self.stream_scale(buffer, size, thread_count)?,
-            AccessPattern::StreamAdd => self.stream_add(buffer, size, thread_count)?,
-            AccessPattern::StreamTriad => self.stream_triad(buffer, size, thread_count)?,
+        let tc = thread_count.max(1);
+        let (bytes, ns) = match pattern {
+            AccessPattern::SequentialRead => self.sequential_read(data, tc),
+            AccessPattern::SequentialWrite => self.sequential_write(data, tc),
+            AccessPattern::SequentialReadWrite => self.sequential_read_write(data, tc),
+            AccessPattern::RandomRead => self.random_read(data, tc),
+            AccessPattern::RandomWrite => self.random_write(data, tc),
+            AccessPattern::StridedRead { stride } => self.strided_read(data, stride, tc),
+            AccessPattern::PointerChase => self.pointer_chase(size, tc),
+            AccessPattern::DependentRead => self.dependent_read(size, tc),
+            AccessPattern::IndependentRead => self.independent_read(data, tc),
+            AccessPattern::StreamCopy => self.stream_copy(data, aux, tc),
+            AccessPattern::StreamScale => self.stream_scale(data, tc),
+            AccessPattern::StreamAdd => self.stream_add(data, aux, tc),
+            AccessPattern::StreamTriad => self.stream_triad(data, aux, tc),
         };
-
-        let elapsed_ns = interval.lap_ns() as f64;
-        Ok((elapsed_ns, bytes_accessed))
+        Ok((ns, bytes))
     }
 
     // Sequential read - measures memory read bandwidth
-    fn sequential_read(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let chunk_size = size / thread_count.max(1);
-        let mut handles = Vec::new();
-        
-        for i in 0..thread_count {
-            let buf = buffer.clone();
-            let start = i * chunk_size;
-            let end = if i == thread_count - 1 { size } else { (i + 1) * chunk_size };
-            
-            let handle = std::thread::spawn(move || {
-                let mut sum = 0u64;
-                let slice = &buf[start..end];
-                for &val in slice {
-                    sum = sum.wrapping_add(val as u64);
-                }
-                std::hint::black_box(sum);
-                end - start
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    fn sequential_read(&self, buffer: &[u8], tc: usize) -> (u64, f64) {
+        self.run_parallel(tc, |i| {
+            let r = share(buffer.len(), tc, i);
+            let mut sum = 0u64;
+            for &val in &buffer[r.clone()] {
+                sum = sum.wrapping_add(val as u64);
+            }
+            std::hint::black_box(sum);
+            r.len()
+        })
     }
 
     // Sequential write - measures memory write bandwidth
-    fn sequential_write(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        // Need mutable access - use a copy for benchmarking
-        let mut buf = buffer.to_vec();
-        let tc = thread_count.max(1);
-        let base = size / tc;
-        let rem = size % tc;
-        let mut offset = 0;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let len = base + if i < rem { 1 } else { 0 };
-            let start = offset;
-            let chunk = &mut buf[offset..offset + len];
-            offset += len;
-            
-            let handle = std::thread::spawn(move || {
-                for (j, byte) in chunk.iter_mut().enumerate() {
-                    *byte = ((start + j) & 0xFF) as u8;
-                }
-                len
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    fn sequential_write(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
+        let base = buffer.len() / tc;
+        let rem = buffer.len() % tc;
+        self.run_parallel_mut(buffer, tc, |i, chunk| {
+            let start = i * base + i.min(rem);
+            for (j, byte) in chunk.iter_mut().enumerate() {
+                *byte = ((start + j) & 0xFF) as u8;
+            }
+            chunk.len()
+        })
     }
 
     // Sequential read-write
-    fn sequential_read_write(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let mut buf = buffer.to_vec();
-        let tc = thread_count.max(1);
-        let base = size / tc;
-        let rem = size % tc;
-        let mut offset = 0;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let len = base + if i < rem { 1 } else { 0 };
-            let chunk = &mut buf[offset..offset + len];
-            offset += len;
-            
-            let handle = std::thread::spawn(move || {
-                for byte in chunk.iter_mut() {
-                    let val = *byte;
-                    *byte = val.wrapping_add(1);
-                }
-                len * 2 // Read + write
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    fn sequential_read_write(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
+        self.run_parallel_mut(buffer, tc, |_, chunk| {
+            for byte in chunk.iter_mut() {
+                *byte = byte.wrapping_add(1);
+            }
+            chunk.len() * 2 // Read + write
+        })
     }
 
     // Random read - measures random access latency
-    fn random_read(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let indices: Vec<usize> = (0..size).step_by(64).collect(); // Cache line aligned
-        let mut rng = StdRng::seed_from_u64(0xFEEDFACE);
-        let mut shuffled = indices.clone();
+    fn random_read(&self, buffer: &[u8], tc: usize) -> (u64, f64) {
         use rand::seq::SliceRandom;
-        shuffled.shuffle(&mut rng);
-        
-        let tc = thread_count.max(1);
-        let base = shuffled.len() / tc;
-        let rem = shuffled.len() % tc;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let buf = buffer.clone();
-            let start = i * base + i.min(rem);
-            let end = start + base + if i < rem { 1 } else { 0 };
-            let indices = shuffled[start..end].to_vec();
-            
-            let handle = std::thread::spawn(move || {
-                let mut sum = 0u64;
-                for &idx in &indices {
-                    sum = sum.wrapping_add(buf[idx] as u64);
-                }
-                std::hint::black_box(sum);
-                indices.len() * 64
-            });
-            handles.push(handle);
-        }
+        let mut shuffled: Vec<usize> = (0..buffer.len()).step_by(64).collect(); // Cache line aligned
+        shuffled.shuffle(&mut StdRng::seed_from_u64(0xFEEDFACE));
+        let shuffled = &shuffled;
 
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+        self.run_parallel(tc, |i| {
+            let idxs = &shuffled[share(shuffled.len(), tc, i)];
+            let mut sum = 0u64;
+            for &idx in idxs {
+                sum = sum.wrapping_add(buffer[idx] as u64);
+            }
+            std::hint::black_box(sum);
+            idxs.len() * 64
+        })
     }
 
     // Random write
-    fn random_write(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let mut buf = buffer.to_vec();
-        let tc = thread_count.max(1);
-        let base = size / tc;
-        let rem = size % tc;
-        let mut offset = 0;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let len = base + if i < rem { 1 } else { 0 };
-            // Random cache-line-aligned offsets within this thread's private region
-            let indices: Vec<usize> = (0..len).step_by(64).collect();
-            let mut rng = rand::rngs::StdRng::seed_from_u64(0xFEEDFACEu64.wrapping_add(i as u64));
-            let mut shuffled = indices;
-            use rand::seq::SliceRandom;
-            shuffled.shuffle(&mut rng);
-            
-            let chunk = &mut buf[offset..offset + len];
-            offset += len;
-            
-            let handle = std::thread::spawn(move || {
-                for &idx in &shuffled {
-                    chunk[idx] = (idx & 0xFF) as u8;
-                }
-                shuffled.len() * 64
-            });
-            handles.push(handle);
-        }
+    fn random_write(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
+        use rand::seq::SliceRandom;
+        // Random cache-line-aligned offsets within each thread's private region
+        let per_thread: Vec<Vec<usize>> = (0..tc)
+            .map(|i| {
+                let len = share(buffer.len(), tc, i).len();
+                let mut idxs: Vec<usize> = (0..len).step_by(64).collect();
+                idxs.shuffle(&mut StdRng::seed_from_u64(0xFEEDFACEu64.wrapping_add(i as u64)));
+                idxs
+            })
+            .collect();
+        let per_thread = &per_thread;
 
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+        self.run_parallel_mut(buffer, tc, |i, chunk| {
+            for &idx in &per_thread[i] {
+                chunk[idx] = (idx & 0xFF) as u8;
+            }
+            per_thread[i].len() * 64
+        })
     }
 
     // Strided read - measures cache behavior with specific stride
-    fn strided_read(&self, buffer: &[u8], size: usize, stride: usize, thread_count: usize) -> Result<u64> {
-        let chunk_size = size / thread_count.max(1);
-        let mut handles = Vec::new();
-        
-        for i in 0..thread_count {
-            let buf = buffer.clone();
-            let start = i * chunk_size;
-            let end = if i == thread_count - 1 { size } else { (i + 1) * chunk_size };
-            
-            let handle = std::thread::spawn(move || {
-                let mut sum = 0u64;
-                let mut idx = start;
-                while idx < end {
-                    sum = sum.wrapping_add(buf[idx] as u64);
-                    idx += stride;
-                }
-                std::hint::black_box(sum);
-                ((end - start) / stride) * 64
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    fn strided_read(&self, buffer: &[u8], stride: usize, tc: usize) -> (u64, f64) {
+        let stride = stride.max(1);
+        self.run_parallel(tc, |i| {
+            let r = share(buffer.len(), tc, i);
+            let mut sum = 0u64;
+            let mut count = 0usize;
+            let mut idx = r.start;
+            while idx < r.end {
+                sum = sum.wrapping_add(buffer[idx] as u64);
+                idx += stride;
+                count += 1;
+            }
+            std::hint::black_box(sum);
+            count * 64
+        })
     }
 
     // Pointer chasing - measures pointer dereference latency
-    fn pointer_chase(&self, _buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        // Build a random permutation cycle over 8-byte nodes (a single long chain)
-        let num_nodes = (size / 8).max(thread_count.max(1));
-        let mut buf: Vec<usize> = vec![0usize; num_nodes];
-        let mut perm: Vec<usize> = (0..num_nodes).collect();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xBADF00D);
+    fn pointer_chase(&self, size: usize, tc: usize) -> (u64, f64) {
         use rand::seq::SliceRandom;
-        perm.shuffle(&mut rng);
-        
-        // Node perm[i] points to perm[i+1]; last wraps to first (circular)
+        // Random permutation cycle over 8-byte nodes (a single long chain)
+        let num_nodes = (size / 8).max(tc);
+        let mut perm: Vec<usize> = (0..num_nodes).collect();
+        perm.shuffle(&mut StdRng::seed_from_u64(0xBADF00D));
+        let mut chain = vec![0usize; num_nodes];
         for i in 0..num_nodes {
-            buf[perm[i]] = perm[(i + 1) % num_nodes];
+            chain[perm[i]] = perm[(i + 1) % num_nodes];
         }
-        
-        let tc = thread_count.max(1);
-        let steps: usize = 512; // Chase depth per thread (latency-bound)
-        let base_ptr = buf.as_ptr() as usize;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            // Disjoint start nodes so threads do not share hot cache lines
-            let start = perm[i % num_nodes];
-            
-            let handle = std::thread::spawn(move || {
-                let mut current = start;
-                let ptr = base_ptr as *const usize;
-                for _ in 0..steps {
-                    current = unsafe { *ptr.add(current) };
-                }
-                std::hint::black_box(current);
-                steps * 8
-            });
-            handles.push(handle);
-        }
+        let (chain, perm) = (&chain, &perm);
+        let steps: usize = 1 << 16; // Chase depth per thread (latency-bound)
 
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+        self.run_parallel(tc, |i| {
+            // Disjoint start nodes so threads do not share hot cache lines
+            let mut current = perm[i % num_nodes];
+            for _ in 0..steps {
+                current = chain[current];
+            }
+            std::hint::black_box(current);
+            steps * 8
+        })
     }
 
     // Dependent read - each read address depends on previous read value
-    fn dependent_read(&self, _buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
+    fn dependent_read(&self, size: usize, tc: usize) -> (u64, f64) {
         // Sequential chain: node i -> node i+1, last wraps to 0
-        let num_nodes = (size / 8).max(thread_count.max(1));
-        let buf: Vec<usize> = (0..num_nodes).map(|i| (i + 1) % num_nodes).collect();
-        
-        let tc = thread_count.max(1);
-        let steps: usize = 512;
-        let base_ptr = buf.as_ptr() as usize;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            // Disjoint sequential start positions
-            let start = ((i * num_nodes) / tc).min(num_nodes - 1);
-            
-            let handle = std::thread::spawn(move || {
-                let mut current = start;
-                let ptr = base_ptr as *const usize;
-                for _ in 0..steps {
-                    current = unsafe { *ptr.add(current) };
-                }
-                std::hint::black_box(current);
-                steps * 8
-            });
-            handles.push(handle);
-        }
+        let num_nodes = (size / 8).max(tc);
+        let chain: Vec<usize> = (0..num_nodes).map(|i| (i + 1) % num_nodes).collect();
+        let chain = &chain;
+        let steps: usize = 1 << 16;
 
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+        self.run_parallel(tc, |i| {
+            let mut current = (i * num_nodes) / tc;
+            for _ in 0..steps {
+                current = chain[current];
+            }
+            std::hint::black_box(current);
+            steps * 8
+        })
     }
 
     // Independent reads - multiple independent memory accesses (bandwidth bound)
-    fn independent_read(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let indices: Vec<usize> = (0..size).step_by(64).collect();
-        let tc = thread_count.max(1);
-        let base = indices.len() / tc;
-        let rem = indices.len() % tc;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let buf = buffer.clone();
-            let start = i * base + i.min(rem);
-            let end = start + base + if i < rem { 1 } else { 0 };
-            let indices = indices[start..end].to_vec();
-            
-            let handle = std::thread::spawn(move || {
-                let mut sums = [0u64; 4]; // 4 independent accumulators
-                for (j, &idx) in indices.iter().enumerate() {
-                    sums[j % 4] = sums[j % 4].wrapping_add(buf[idx] as u64);
-                }
-                for s in sums {
-                    std::hint::black_box(s);
-                }
-                indices.len() * 64
-            });
-            handles.push(handle);
-        }
+    fn independent_read(&self, buffer: &[u8], tc: usize) -> (u64, f64) {
+        let indices: Vec<usize> = (0..buffer.len()).step_by(64).collect();
+        let indices = &indices;
 
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+        self.run_parallel(tc, |i| {
+            let idxs = &indices[share(indices.len(), tc, i)];
+            let mut sums = [0u64; 4]; // 4 independent accumulators
+            for (j, &idx) in idxs.iter().enumerate() {
+                sums[j % 4] = sums[j % 4].wrapping_add(buffer[idx] as u64);
+            }
+            for s in sums {
+                std::hint::black_box(s);
+            }
+            idxs.len() * 64
+        })
     }
 
-    // Stream copy - memcpy pattern
-    fn stream_copy(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let tc = thread_count.max(1);
-        let base = size / tc;
-        let rem = size % tc;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let start = i * base + i.min(rem);
-            let len = base + if i < rem { 1 } else { 0 };
-            let src = buffer.clone();
-            
-            let handle = std::thread::spawn(move || {
-                let mut dst = vec![0u8; len];
-                dst.copy_from_slice(&src[start..start + len]);
-                len * 2 // Read + write
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    // Stream copy - memcpy pattern (src -> dst)
+    fn stream_copy(&self, src: &[u8], dst: &mut [u8], tc: usize) -> (u64, f64) {
+        self.run_parallel_mut(dst, tc, |i, chunk| {
+            let start = share(src.len(), tc, i).start;
+            chunk.copy_from_slice(&src[start..start + chunk.len()]);
+            std::hint::black_box(&*chunk);
+            chunk.len() * 2 // Read + write
+        })
     }
 
     // Stream scale - a = b * scalar
-    fn stream_scale(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let mut buf = buffer.to_vec();
-        let tc = thread_count.max(1);
-        let base = size / tc;
-        let rem = size % tc;
-        let mut offset = 0;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let len = base + if i < rem { 1 } else { 0 };
-            let chunk = &mut buf[offset..offset + len];
-            offset += len;
-            
-            let handle = std::thread::spawn(move || {
-                for byte in chunk.iter_mut() {
-                    *byte = byte.wrapping_mul(3);
-                }
-                len * 2 // Read + write
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    fn stream_scale(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
+        self.run_parallel_mut(buffer, tc, |_, chunk| {
+            for byte in chunk.iter_mut() {
+                *byte = byte.wrapping_mul(3);
+            }
+            chunk.len() * 2 // Read + write
+        })
     }
 
-    // Stream add - a = b + c
-    fn stream_add(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let mut buf = buffer.to_vec();
-        let shared = buffer.to_vec(); // Read-only neighbor access (cross-region reads)
-        let tc = thread_count.max(1);
-        let base = size / tc;
-        let rem = size % tc;
-        let mut offset = 0;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let len = base + if i < rem { 1 } else { 0 };
-            let start = offset;
-            let chunk = &mut buf[offset..offset + len];
-            offset += len;
-            
-            let handle = std::thread::spawn(move || {
-                for (j, byte) in chunk.iter_mut().enumerate() {
-                    let a = shared[start + j];
-                    let b = shared[(start + j + 1) % size];
-                    *byte = a.wrapping_add(b);
-                }
-                len * 3 // 2 reads + 1 write
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    // Stream add - a = b + c (reads `src`, writes `dst`)
+    fn stream_add(&self, src: &[u8], dst: &mut [u8], tc: usize) -> (u64, f64) {
+        let n = src.len();
+        self.run_parallel_mut(dst, tc, |i, chunk| {
+            let start = share(n, tc, i).start;
+            for (j, byte) in chunk.iter_mut().enumerate() {
+                let i = start + j;
+                let a = src[i];
+                let b = src[if i + 1 == n { 0 } else { i + 1 }];
+                *byte = a.wrapping_add(b);
+            }
+            chunk.len() * 3 // 2 reads + 1 write
+        })
     }
 
-    // Stream triad - a = b + c * d
-    fn stream_triad(&self, buffer: &[u8], size: usize, thread_count: usize) -> Result<u64> {
-        let mut buf = buffer.to_vec();
-        let shared = buffer.to_vec(); // Read-only neighbor access (cross-region reads)
-        let tc = thread_count.max(1);
-        let base = size / tc;
-        let rem = size % tc;
-        let mut offset = 0;
-        let mut handles = Vec::new();
-        
-        for i in 0..tc {
-            let len = base + if i < rem { 1 } else { 0 };
-            let start = offset;
-            let chunk = &mut buf[offset..offset + len];
-            offset += len;
-            
-            let handle = std::thread::spawn(move || {
-                for (j, byte) in chunk.iter_mut().enumerate() {
-                    let b = shared[start + j];
-                    let c = shared[(start + j + 1) % size];
-                    let d = shared[(start + j + 2) % size];
-                    *byte = b.wrapping_add(c.wrapping_mul(d));
-                }
-                len * 4 // 3 reads + 1 write
-            });
-            handles.push(handle);
-        }
-
-        let mut total = 0;
-        for handle in handles {
-            total += handle.join().unwrap();
-        }
-        Ok(total as u64)
+    // Stream triad - a = b + c * d (reads `src`, writes `dst`)
+    fn stream_triad(&self, src: &[u8], dst: &mut [u8], tc: usize) -> (u64, f64) {
+        let n = src.len();
+        self.run_parallel_mut(dst, tc, |i, chunk| {
+            let start = share(n, tc, i).start;
+            for (j, byte) in chunk.iter_mut().enumerate() {
+                let i = start + j;
+                let b = src[i];
+                let c = src[if i + 1 >= n { i + 1 - n } else { i + 1 }];
+                let d = src[if i + 2 >= n { i + 2 - n } else { i + 2 }];
+                *byte = b.wrapping_add(c.wrapping_mul(d));
+            }
+            chunk.len() * 4 // 3 reads + 1 write
+        })
     }
 }
 
@@ -701,12 +527,12 @@ pub fn quick_memory_latency_test(size: usize, iterations: u32) -> Result<f64> {
         thread_counts: vec![1],
         use_huge_pages: false,
     });
-    
+
     let summary = bench.run()?;
     let avg_latency = summary.results.iter()
         .map(|r| r.latency_ns)
-        .sum::<f64>() / summary.results.len() as f64;
-    
+        .sum::<f64>() / summary.results.len().max(1) as f64;
+
     Ok(avg_latency)
 }
 
@@ -714,21 +540,83 @@ pub fn quick_memory_latency_test(size: usize, iterations: u32) -> Result<f64> {
 mod tests {
     use super::*;
 
+    fn bench() -> MemoryBenchmark {
+        MemoryBenchmark::new(MemoryBenchmarkConfig::default())
+    }
+
     #[test]
     fn test_sequential_read() {
-        let config = MemoryBenchmarkConfig::default();
-        let mut bench = MemoryBenchmark::new(config);
-        let buffer = bench.allocate_buffer(1024 * 1024).unwrap();
-        let bytes = bench.sequential_read(&buffer, 1024 * 1024, 1).unwrap();
+        let mut b = bench();
+        let buf = b.allocate_buffer(1024 * 1024).unwrap();
+        let (bytes, ns) = b.sequential_read(&buf, 1);
         assert_eq!(bytes, 1024 * 1024);
+        assert!(ns > 0.0);
+    }
+
+    #[test]
+    fn test_sequential_read_multithread_uneven() {
+        let mut b = bench();
+        let buf = b.allocate_buffer(1000).unwrap();
+        assert_eq!(b.sequential_read(&buf, 3).0, 1000);
     }
 
     #[test]
     fn test_pointer_chase() {
-        let config = MemoryBenchmarkConfig::default();
-        let mut bench = MemoryBenchmark::new(config);
-        let buffer = bench.allocate_buffer(1024 * 1024).unwrap();
-        let bytes = bench.pointer_chase(&buffer, 1024 * 1024, 1).unwrap();
-        assert!(bytes > 0);
+        let b = bench();
+        let (bytes, _) = b.pointer_chase(1024 * 1024, 2);
+        assert_eq!(bytes, 2 * (1 << 16) * 8);
+    }
+
+    #[test]
+    fn test_all_patterns_run() {
+        let mut b = bench();
+        let mut data = b.allocate_buffer(64 * 1024 + 7).unwrap();
+        let mut aux = b.allocate_buffer(64 * 1024 + 7).unwrap();
+        let size = data.len();
+        let patterns = [
+            AccessPattern::SequentialRead,
+            AccessPattern::SequentialWrite,
+            AccessPattern::SequentialReadWrite,
+            AccessPattern::RandomRead,
+            AccessPattern::RandomWrite,
+            AccessPattern::StridedRead { stride: 64 },
+            AccessPattern::PointerChase,
+            AccessPattern::DependentRead,
+            AccessPattern::IndependentRead,
+            AccessPattern::StreamCopy,
+            AccessPattern::StreamScale,
+            AccessPattern::StreamAdd,
+            AccessPattern::StreamTriad,
+        ];
+        for p in patterns {
+            for tc in [1, 3] {
+                let (ns, bytes) = b.run_pattern(&mut data, &mut aux, size, p, tc).unwrap();
+                assert!(ns > 0.0 && bytes > 0, "{:?} tc={}", p, tc);
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_copy_copies() {
+        let mut b = bench();
+        let src = b.allocate_buffer(1001).unwrap();
+        let mut dst = vec![0u8; 1001];
+        b.stream_copy(&src, &mut dst, 4);
+        assert_eq!(src, dst);
+    }
+
+    #[test]
+    fn test_small_run() {
+        let mut b = MemoryBenchmark::new(MemoryBenchmarkConfig {
+            sizes: vec![16 * 1024],
+            iterations: 3,
+            warmup_iterations: 1,
+            patterns: vec![AccessPattern::SequentialRead, AccessPattern::PointerChase],
+            thread_counts: vec![1],
+            use_huge_pages: false,
+        });
+        let s = b.run().unwrap();
+        assert_eq!(s.results.len(), 2);
+        assert!(s.results.iter().all(|r| r.latency_ns > 0.0 && r.bandwidth_gb_s > 0.0));
     }
 }

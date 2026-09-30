@@ -1,3 +1,4 @@
+#![allow(dead_code)] // public helper API; not every function is wired into the GUI/CLI
 //! Cross-platform high-resolution timer abstraction
 //! Uses QueryPerformanceCounter on Windows and clock_gettime on Linux
 
@@ -57,7 +58,6 @@ impl HighResTimer {
 
         #[cfg(target_os = "linux")]
         {
-            use std::time::{SystemTime, UNIX_EPOCH};
             // Use CLOCK_MONOTONIC_RAW via libc
             let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
             unsafe {
@@ -155,17 +155,17 @@ impl IntervalTimer {
 
     /// Get elapsed nanoseconds since last call
     pub fn lap_ns(&mut self) -> u64 {
-        self.timer.ticks_to_ns(self.lap_ticks())
+        { let t = self.lap_ticks(); self.timer.ticks_to_ns(t) }
     }
 
     /// Get elapsed microseconds since last call
     pub fn lap_us(&mut self) -> u64 {
-        self.timer.ticks_to_us(self.lap_ticks())
+        { let t = self.lap_ticks(); self.timer.ticks_to_us(t) }
     }
 
     /// Get elapsed milliseconds since last call (f64)
     pub fn lap_ms(&mut self) -> f64 {
-        self.timer.ticks_to_ms_f64(self.lap_ticks())
+        { let t = self.lap_ticks(); self.timer.ticks_to_ms_f64(t) }
     }
 
     /// Reset the timer

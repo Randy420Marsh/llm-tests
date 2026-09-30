@@ -2,8 +2,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use sysinfo::{System, CpuRefreshKind, MemoryRefreshKind};
+use sysinfo::System;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
@@ -158,7 +157,7 @@ impl SystemInfoCollector {
         let cpu = &cpus[0]; // First CPU for general info
         
         let mut current_frequencies = Vec::new();
-        let mut temperatures = Vec::new();
+        let temperatures = Vec::new();
         
         for cpu in cpus {
             current_frequencies.push(cpu.frequency());

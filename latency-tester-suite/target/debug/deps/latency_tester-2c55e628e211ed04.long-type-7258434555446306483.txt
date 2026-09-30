@@ -1,5 +1,0 @@
-gpu_benchmark::_::<impl system_info::_::_serde::Deserialize<'de> for GpuBenchmarkConfig>::deserialize::__Field
-gpu_benchmark::_::<impl system_info::_::_serde::Deserialize<'de> for GpuBenchmarkResult>::deserialize::__Field
-gpu_benchmark::_::<impl system_info::_::_serde::Deserialize<'de> for GpuBenchmarkSummary>::deserialize::__Field
-gpu_benchmark::_::<impl system_info::_::_serde::Deserialize<'de> for TestScene>::deserialize::__Field
-gpu_benchmark::_::<impl system_info::_::_serde::Deserialize<'de> for VulkanInfo>::deserialize::__Field
