@@ -146,12 +146,12 @@ impl LatencyTesterApp {
         ui.label(RichText::new("Interval vs time (µs): a steady mouse is a flat band at the set rate").strong());
         Plot::new("poll_intervals").height(220.0).x_axis_label("s").y_axis_label("µs").allow_scroll(false).include_y(0.0).show(ui, |p| {
             p.line(Line::new(PlotPoints::from(vec![[iv.first().map_or(0.0, |q| q[0]), nominal], [iv.last().map_or(1.0, |q| q[0]), nominal]])).color(Color32::from_gray(110)).name("set rate"));
-            p.points(Points::new(PlotPoints::from(iv)).radius(1.5).color(Color32::from_rgb(86, 180, 233)).name("interval"));
+            p.points(Points::new(PlotPoints::from(iv)).radius(1.5_f32).color(Color32::from_rgb(86, 180, 233)).name("interval"));
         });
         let xc: Vec<[f64; 2]> = r.x_counts.iter().map(|p| [p.0, p.1 as f64]).collect();
         ui.label(RichText::new("X counts vs time: smooth curves mean smooth tracking").strong());
         Plot::new("poll_xcounts").height(180.0).x_axis_label("s").y_axis_label("counts").allow_scroll(false).show(ui, |p| {
-            p.points(Points::new(PlotPoints::from(xc)).radius(1.5).color(Color32::from_rgb(230, 159, 0)).name("x counts"));
+            p.points(Points::new(PlotPoints::from(xc)).radius(1.5_f32).color(Color32::from_rgb(230, 159, 0)).name("x counts"));
         });
         if self.polling.results.len() > 1 {
             ui.label(RichText::new("All runs").strong());

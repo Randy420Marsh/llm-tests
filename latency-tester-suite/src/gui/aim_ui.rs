@@ -143,7 +143,7 @@ impl LatencyTesterApp {
             for t in &g.targets {
                 let c = rect.min + egui::vec2(t.x, t.y);
                 painter.circle_filled(c, r, Color32::from_rgb(220, 50, 50));
-                painter.circle_stroke(c, r, egui::Stroke::new(2.0, Color32::from_rgb(255, 140, 140)));
+                painter.circle_stroke(c, r, egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 140, 140)));
                 painter.circle_filled(c, (r * 0.18).max(2.0), Color32::from_rgb(255, 210, 210));
             }
             let now = self.aim.clock.now_ns() as f64 / 1e6;
@@ -190,7 +190,7 @@ impl LatencyTesterApp {
         let pts: Vec<[f64; 2]> = r.times_ms.iter().enumerate().map(|(i, t)| [(i + 1) as f64, *t]).collect();
         Plot::new("aim_times").height(200.0).x_axis_label("circle").y_axis_label("ms").allow_scroll(false).include_y(0.0).show(ui, |p| {
             p.line(Line::new(PlotPoints::from(pts.clone())).color(Color32::from_rgb(220, 80, 80)).name("time"));
-            p.points(Points::new(PlotPoints::from(pts)).radius(2.5).color(Color32::from_rgb(255, 140, 140)));
+            p.points(Points::new(PlotPoints::from(pts)).radius(2.5_f32).color(Color32::from_rgb(255, 140, 140)));
         });
         if self.aim.results.len() > 1 {
             ui.label(RichText::new("All games").strong());

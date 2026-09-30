@@ -1055,7 +1055,7 @@ impl LatencyTesterApp {
                 plot_ui.line(Line::new(PlotPoints::from(pts.clone())).name(s).color(color));
                 let ringed: Vec<[f64; 2]> = pts.iter().copied().filter(|p| marks.iter().any(|m| m.0 == *s && (m.1 - p[0]).abs() < 1e-9)).collect();
                 if !ringed.is_empty() {
-                    plot_ui.points(Points::new(PlotPoints::from(ringed)).color(Color32::from_rgb(255, 93, 93)).radius(8.0).filled(false).shape(egui_plot::MarkerShape::Circle));
+                    plot_ui.points(Points::new(PlotPoints::from(ringed)).color(Color32::from_rgb(255, 93, 93)).radius(8.0_f32).filled(false).shape(egui_plot::MarkerShape::Circle));
                 }
                 if show_points {
                     plot_ui.points(Points::new(PlotPoints::from(pts)).name(s).color(color).radius(3.5_f32));
