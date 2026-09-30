@@ -52,18 +52,20 @@ impl Dataset {
 }
 
 /// One measured point: which line it belongs to, where on the x axis, and every value
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct Row {
     pub series: String,
     pub x: f64,
     pub x_label: String,
     pub values: BTreeMap<&'static str, f64>,
+    /// Other programs that were busy during this test ("chrome.exe 12 % CPU")
+    pub others: String,
 }
 
 /// (key, label, unit) for every metric a dataset can hold
 pub(super) type Metric = (&'static str, &'static str, &'static str);
 
-const TELEMETRY_METRICS: [Metric; 14] = [
+const TELEMETRY_METRICS: [Metric; 16] = [
     ("cpu_temp_max", "CPU temp (max)", "°C"),
     ("cpu_temp_avg", "CPU temp (avg)", "°C"),
     ("hottest_core", "Hottest core", "°C"),
@@ -78,6 +80,8 @@ const TELEMETRY_METRICS: [Metric; 14] = [
     ("gpu_power", "GPU power (max)", "W"),
     ("vram_used", "VRAM used (max)", "MB"),
     ("vram_total", "VRAM total", "MB"),
+    ("others_cpu", "Other programs: CPU (avg)", "%"),
+    ("others_gpu", "Other programs: GPU (avg)", "%"),
 ];
 
 const MEMORY_METRICS: [Metric; 6] = [
@@ -166,6 +170,8 @@ fn telemetry_values(t: &Telemetry, values: &mut BTreeMap<&'static str, f64>) {
     put(values, "gpu_power", t.gpu_power_max_w);
     put(values, "vram_used", t.vram_used_max_mb);
     put(values, "vram_total", t.vram_total_mb);
+    put(values, "others_cpu", t.others_cpu_avg_pct);
+    put(values, "others_gpu", t.others_gpu_avg_pct);
 }
 
 pub(super) fn memory_rows(results: &[MemoryBenchmarkResult]) -> Vec<Row> {
@@ -186,6 +192,7 @@ pub(super) fn memory_rows(results: &[MemoryBenchmarkResult]) -> Vec<Row> {
                 x: (r.size as f64).log2(),
                 x_label: human_size(r.size),
                 values: v,
+                others: r.telemetry.others_text(),
             }
         })
         .collect()
@@ -203,7 +210,7 @@ pub(super) fn manual_rows(runs: &[RunRecord]) -> Vec<Row> {
             if s.robot {
                 v.insert("trial_corrected_ms", r.corrected(*ms).minus_robot_and_display_ms);
             }
-            rows.push(Row { series: series.clone(), x: (i + 1) as f64, x_label: format!("trial {}", i + 1), values: v });
+            rows.push(Row { series: series.clone(), x: (i + 1) as f64, x_label: format!("trial {}", i + 1), values: v, ..Default::default() });
         }
     }
     rows
@@ -258,7 +265,7 @@ pub(super) fn cpu_rows(results: &[CpuBenchmarkResult], kinds: Option<&[CoreKind]
                     (format!("{:?} · {}T {}", r.workload, threads, place), -2.0 - k as f64, format!("{}T {}", threads, place))
                 }
             };
-            Row { series, x, x_label, values: v }
+            Row { series, x, x_label, values: v, others: r.telemetry.others_text() }
         })
         .collect()
 }
@@ -279,6 +286,7 @@ pub(super) fn gpu_rows(results: &[GpuBenchmarkResult]) -> Vec<Row> {
                 x: (r.workload_size as f64).log2(),
                 x_label: format!("{} elements", r.workload_size),
                 values: v,
+                others: r.telemetry.others_text(),
             }
         })
         .collect()
@@ -302,7 +310,7 @@ pub(super) fn gpu3d_rows(results: &[crate::bench3d::Bench3dResult]) -> Vec<Row> 
             }
             telemetry_values(&r.telemetry, &mut v);
             let detail = r.detail.split(" (").next().unwrap_or(&r.detail);
-            Row { series: format!("{} · MSAA {}×", detail, r.msaa), x: r.height as f64, x_label: r.name.clone(), values: v }
+            Row { series: format!("{} · MSAA {}×", detail, r.msaa), x: r.height as f64, x_label: r.name.clone(), values: v, others: r.telemetry.others_text() }
         })
         .collect()
 }
@@ -328,6 +336,7 @@ pub(super) fn input_rows(results: &[InputLatencyResult]) -> Vec<Row> {
                 x,
                 x_label: r.core.map(|c| format!("core {}", c)).unwrap_or_else(|| "OS scheduled".into()),
                 values: v,
+                others: r.telemetry.others_text(),
             }
         })
         .collect()
@@ -437,6 +446,13 @@ pub(super) fn find_anomalies(d: Dataset, rows: &[Row]) -> Vec<Anomaly> {
     }
     for r in rows {
         let v = |k: &str| r.values.get(k).copied().unwrap_or(0.0);
+        // another program was busy: the result may be lower than the machine can do
+        let (oc, og) = (v("others_cpu"), v("others_gpu"));
+        if oc >= 8.0 || og >= 8.0 {
+            let what = if og > oc { format!("{:.0} % of the GPU", og) } else { format!("{:.0} % of the CPU", oc) };
+            let who = if r.others.is_empty() { String::new() } else { format!(": {}", r.others) };
+            add(r, format!("other programs used {} during this test{}", what, who), oc >= 25.0 || og >= 25.0);
+        }
         match d {
             Dataset::Cpu if v("run_spread") > 5.0 => {
                 add(r, format!("runs vary ±{:.1}% (something else used the core, or the clock changed)", v("run_spread")), v("run_spread") > 15.0)
@@ -1213,6 +1229,8 @@ pub(super) fn sensor_lines(tl: &[Snapshot], group: SensorGroup) -> Vec<(String, 
             SensorGroup::Power => &[SensorKind::Power],
             SensorGroup::Fans => &[SensorKind::Fan],
             SensorGroup::Voltages => &[SensorKind::Voltage, SensorKind::Current],
+            // other programs' CPU / GPU share
+            SensorGroup::Load => &[SensorKind::Load],
             _ => &[],
         };
         for r in s.sensors.iter().filter(|r| kinds.contains(&r.kind)) {
@@ -1308,7 +1326,7 @@ mod tests {
             v.insert("ns_per_access", ns);
             v.insert("min_run", 100.0);
             v.insert("p99_run", p99);
-            Row { series: "StridedRead(4096 B) · 1T".into(), x, x_label: format!("{} KB", x), values: v }
+            Row { series: "StridedRead(4096 B) · 1T".into(), x, x_label: format!("{} KB", x), values: v, ..Default::default() }
         };
         // a cache step (1 -> 5 ns) is fine; the 128 KB spike and the unstable last point are not
         let rows = vec![mem(12.0, 1.0, 110.0), mem(13.0, 1.1, 110.0), mem(14.0, 1.0, 110.0), mem(15.0, 9.0, 110.0), mem(16.0, 1.0, 110.0), mem(17.0, 5.0, 110.0), mem(18.0, 5.2, 110.0), mem(19.0, 5.1, 500.0)];
@@ -1407,7 +1425,7 @@ mod tests {
         assert!(rows.is_empty());
         let mut v = BTreeMap::new();
         v.insert("bandwidth", 2.0);
-        let row = Row { series: "a".into(), x: 1.0, x_label: "1 MB".into(), values: v };
+        let row = Row { series: "a".into(), x: 1.0, x_label: "1 MB".into(), values: v, ..Default::default() };
         let csv = to_csv(&[&row], &[MEMORY_METRICS[0], MEMORY_METRICS[1]]);
         assert_eq!(csv.lines().next().unwrap(), "series,x,Latency / access (ns),Bandwidth (GB/s)");
         assert_eq!(csv.lines().nth(1).unwrap(), "\"a\",\"1 MB\",,2");
@@ -1465,6 +1483,7 @@ mod tests {
             ram_total_mb: 1000.0,
             gpu: Some(GpuSensors { temp_c: Some(40.0), vram_used_mb: Some(512.0), ..Default::default() }),
             sensors: Vec::new(),
+            ..Default::default()
         };
         let tl = vec![snap(0, Some(50.0), &[(0, 50.0), (1, 60.0)]), snap(1000, Some(55.0), &[(0, 58.0), (1, 52.0)])];
         let temps = sensor_lines(&tl, SensorGroup::Temperatures);

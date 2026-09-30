@@ -168,6 +168,21 @@ whole run. The app's **Results & Graphs** tab shows the same bands and sensor gr
 ran); its legend sits under the chart, and *Reset view* returns to the whole chart after zooming. `sensors.csv` holds every
 sample with one column per sensor, and `phases.csv` lists each test's start and end.
 
+## Other programs during the tests
+
+With every sensor sample the app also notes which other programs used the CPU and, on Windows, the GPU
+(Task Manager's figure: the busiest GPU engine of each process, from the *GPU Engine* performance counters).
+Processes with the same name are added up (a browser is dozens of processes); the app itself and its sensor helper
+are left out. CPU is a share of the whole CPU (100 % = every core busy).
+
+- Every result row carries *Other programs: CPU / GPU (avg)* for its own test, and a test where they used 8 % or
+  more is listed under *unusual values* with the programs by name, because its result may be lower than the
+  machine can do.
+- The busiest programs are also sensor lines (*Load* group in the app, `%` in the report), so they can be drawn on
+  the timeline next to clocks and temperatures.
+- When the tests finish, the log says which programs were busy on average (and their peak), and the report has an
+  *Other programs while the tests ran* table.
+
 ## Keeping the app out of the measurement
 
 - **Reserved core.** While a test runs, the app's own threads (the window, the sensor sampler and the Windows

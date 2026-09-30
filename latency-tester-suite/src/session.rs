@@ -207,6 +207,10 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
                 "samples_recorded": data.timeline.len(),
                 "duration_s": data.timeline.last().map(|s| s.t_ms as f64 / 1000.0),
                 "core_peak_temps_c": core_peaks(data.timeline),
+                // other programs over the whole run, busiest first
+                "programs": crate::sensors::program_usage(data.timeline).map(|v| v.into_iter().take(20).map(|p| json!({
+                    "name": p.0, "cpu_avg_pct": p.1, "cpu_max_pct": p.2, "gpu_avg_pct": p.3, "gpu_max_pct": p.4,
+                })).collect::<Vec<_>>()),
                 "sensor_kinds": sensor_kinds(data.timeline),
                 "phases": data.phases.iter().map(|p| json!({
                     "kind": p.kind,
@@ -424,6 +428,7 @@ mod tests {
             ram_total_mb: 64000.0,
             gpu: Some(GpuSensors { name: "g".into(), temp_c: Some(40.0), vram_used_mb: Some(500.0), ..Default::default() }),
             sensors: vec![crate::sensors::SensorReading { name: "nct6798: VRM MOS".into(), kind: crate::sensors::SensorKind::Temp, value: 61.5 }, crate::sensors::SensorReading { name: "RAPL: package-0".into(), kind: crate::sensors::SensorKind::Power, value: 88.0 }],
+            ..Default::default()
         }
     }
 

@@ -115,6 +115,7 @@ const TELEMETRY = [
   ['cpu_freq','CPU clock (avg)','MHz'],['cpu_usage','CPU load (avg)','%'],['ram_used','RAM used (max)','MB'],
   ['gpu_temp','GPU temp (max)','°C'],['gpu_util','GPU load (avg)','%'],['gpu_clock','GPU clock (avg)','MHz'],
   ['gpu_power','GPU power (max)','W'],['vram_used','VRAM used (max)','MB'],['vram_total','VRAM total','MB'],
+  ['others_cpu','Other programs: CPU (avg)','%'],['others_gpu','Other programs: GPU (avg)','%'],
 ];
 function telemetryValues(t) {
   const v = {};
@@ -129,6 +130,9 @@ function telemetryValues(t) {
   put('cpu_freq', t.cpu_freq_avg_mhz); put('cpu_usage', t.cpu_usage_avg_pct); put('ram_used', t.ram_used_max_mb);
   put('gpu_temp', t.gpu_temp_max_c); put('gpu_util', t.gpu_util_avg_pct); put('gpu_clock', t.gpu_clock_avg_mhz);
   put('gpu_power', t.gpu_power_max_w); put('vram_used', t.vram_used_max_mb); put('vram_total', t.vram_total_mb);
+  put('others_cpu', t.others_cpu_avg_pct); put('others_gpu', t.others_gpu_avg_pct);
+  // not a chart value: which programs they were ("chrome.exe 12 % CPU")
+  if (t.others_top && t.others_top.length) v.__others = t.others_top.filter(o => o[1] >= 0.5 || o[2] >= 0.5).map(o => `${o[0]} ${[o[1] >= 0.5 ? fmt(o[1]) + ' % CPU' : '', o[2] >= 0.5 ? fmt(o[2]) + ' % GPU' : ''].filter(Boolean).join(' / ')}`).join(', ');
   return v;
 }
 // the timing-suite modes time the app's own wake-ups; their old names suggested device input
@@ -792,6 +796,11 @@ function findAnomalies(kindKey, rows) {
   }
   rows.forEach(r => {
     const v = r.values;
+    // another program was busy: the result may be lower than the machine can do
+    if ((v.others_cpu || 0) >= 8 || (v.others_gpu || 0) >= 8) {
+      const what = (v.others_gpu || 0) > (v.others_cpu || 0) ? `${fmt(v.others_gpu)} % of the GPU` : `${fmt(v.others_cpu)} % of the CPU`;
+      add(r, `other programs used ${what} during this test${v.__others ? ': ' + v.__others : ''}`, (v.others_cpu || 0) >= 25 || (v.others_gpu || 0) >= 25);
+    }
     if (kindKey === 'memory' && v.p99_run > 0 && v.min_run > 0 && v.p99_run / v.min_run > 2) add(r, `unstable: slowest run ${(v.p99_run / v.min_run).toFixed(1)}× the best`, v.p99_run / v.min_run > 4);
     if (kindKey === 'gpu' && v.p99_ms > 0 && v.avg_ms > 0 && v.p99_ms / v.avg_ms > 2) add(r, `p99 dispatch ${(v.p99_ms / v.avg_ms).toFixed(1)}× the average`, v.p99_ms / v.avg_ms > 4);
     if (kindKey === 'gpu3d' && v.ft_p99 > 0 && v.ft_avg > 0 && v.ft_p99 / v.ft_avg > 2) add(r, `stutter: p99 frame ${(v.ft_p99 / v.ft_avg).toFixed(1)}× the average frame`, v.ft_p99 / v.ft_avg > 4);
@@ -986,6 +995,14 @@ function sensorsSection(entries) {
   const cid = 'chart_sensors';
   pendingSpecs.set(cid, { id: cid, lines, axes, bands, legend: sel.length > 1 && sel.length <= 12 ? lines.map(l => ({ label: l.name + ' (' + l.unit + ')', color: l.color, dash: l.dash, axis: l.axis })) : null, ysig: sel.map(d => d[0]).join('|'), xLabel: 'seconds since the test started', logY: false, zeroY: false, markers: false, xFmt: v => fmt(v) + ' s' });
   html += chartTools(cid) + `<div class="chartbox big" data-chart="${cid}"></div>`;
+  const progs = (sec.programs || []).filter(p => p.cpu_avg_pct >= 0.1 || p.gpu_avg_pct >= 0.1);
+  if (sec.programs) {
+    html += '<h3>Other programs while the tests ran</h3>' + (progs.length
+      ? '<div style="color:var(--dim);font-size:12px">Share of the whole CPU (100 % = every core busy) and of the GPU\'s busiest engine, averaged over the run. Anything busy here competed with the tests; the rows of the tests it overlapped say so under "unusual values".</div>' +
+        `<div class="scroll" style="max-height:300px"><table><thead><tr><th>Program</th><th>CPU avg %</th><th>CPU max %</th><th>GPU avg %</th><th>GPU max %</th></tr></thead><tbody>` +
+        progs.map(p => `<tr><td>${esc(p.name)}</td><td class="${p.cpu_avg_pct >= 5 ? 'warn' : ''}">${fmt(p.cpu_avg_pct)}</td><td>${fmt(p.cpu_max_pct)}</td><td class="${p.gpu_avg_pct >= 5 ? 'warn' : ''}">${fmt(p.gpu_avg_pct)}</td><td>${fmt(p.gpu_max_pct)}</td></tr>`).join('') + '</tbody></table></div>'
+      : '<div style="color:var(--dim);font-size:12px">✓ No other program used a noticeable share of the CPU or GPU.</div>');
+  }
   const peaks = sec.core_peak_temps_c || [];
   if (peaks.length) {
     html += '<h3>Peak temperature per core</h3><div class="row">' + peaks.map(p => { const t = p[1], c = t > 85 ? 'bad' : t > 70 ? 'warn' : 'ok'; return `<span class="badge ${c === 'ok' ? 'ok' : c === 'warn' ? 'warn' : 'bad'}">core ${p[0]}: ${t.toFixed(0)} °C</span>`; }).join('') + '</div>';

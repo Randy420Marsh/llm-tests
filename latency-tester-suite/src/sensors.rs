@@ -38,6 +38,8 @@ pub enum SensorKind {
     Power,
     Voltage,
     Current,
+    /// A share of the machine in %, e.g. how much CPU or GPU another program used
+    Load,
 }
 
 impl SensorKind {
@@ -48,6 +50,7 @@ impl SensorKind {
             SensorKind::Power => "W",
             SensorKind::Voltage => "V",
             SensorKind::Current => "A",
+            SensorKind::Load => "%",
         }
     }
 
@@ -60,6 +63,7 @@ impl SensorKind {
                 SensorKind::Power => (0.0..5_000.0).contains(&v),
                 SensorKind::Voltage => (0.0..60.0).contains(&v),
                 SensorKind::Current => (0.0..500.0).contains(&v),
+                SensorKind::Load => (0.0..=400.0).contains(&v),
             }
     }
 
@@ -98,6 +102,19 @@ pub struct Phase {
     pub end_ms: u64,
 }
 
+/// Another program's share of the machine at one sample (processes with the same name added up)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProcUsage {
+    pub name: String,
+    /// % of all CPU cores together (100 = every core busy)
+    pub cpu_pct: f32,
+    /// % of the busiest GPU engine type (3D, compute, copy, video) it used, like Task Manager (Windows)
+    pub gpu_pct: f32,
+}
+
+/// Programs kept per sample (the busiest ones)
+const MAX_PROCS: usize = 8;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Milliseconds since the sampler started
@@ -114,6 +131,12 @@ pub struct Snapshot {
     /// Every other sensor found (see [`SensorReading`])
     #[serde(default)]
     pub sensors: Vec<SensorReading>,
+    /// The busiest other programs (this app and its sensor helper left out)
+    #[serde(default)]
+    pub procs: Vec<ProcUsage>,
+    /// Whether programs were sampled at all (an empty `procs` then means nothing else was busy)
+    #[serde(default)]
+    pub procs_sampled: bool,
 }
 
 impl Snapshot {
@@ -154,6 +177,59 @@ pub struct Telemetry {
     pub vram_total_mb: Option<f32>,
     pub gpu_power_max_w: Option<f32>,
     pub gpu_clock_avg_mhz: Option<f32>,
+    /// CPU share of every other program together during the test, average % of the whole CPU
+    #[serde(default)]
+    pub others_cpu_avg_pct: Option<f32>,
+    /// GPU share of every other program together, average % (Windows)
+    #[serde(default)]
+    pub others_gpu_avg_pct: Option<f32>,
+    /// The busiest other programs during the test: (name, average CPU %, average GPU %)
+    #[serde(default)]
+    pub others_top: Vec<(String, f32, f32)>,
+}
+
+impl Telemetry {
+    /// "chrome.exe 12 % CPU, obs64.exe 8 % GPU" (empty when nothing else was busy)
+    pub fn others_text(&self) -> String {
+        self.others_top
+            .iter()
+            .filter(|t| t.1 >= 0.5 || t.2 >= 0.5)
+            .map(|(n, c, g)| {
+                let mut parts = Vec::new();
+                if *c >= 0.5 {
+                    parts.push(format!("{:.0} % CPU", c));
+                }
+                if *g >= 0.5 {
+                    parts.push(format!("{:.0} % GPU", g));
+                }
+                format!("{} {}", n, parts.join(" / "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Average use of every other program over `samples`: (name, avg CPU %, max CPU %, avg GPU %, max GPU %),
+/// busiest first; None when programs were not sampled
+pub fn program_usage(samples: &[Snapshot]) -> Option<Vec<(String, f32, f32, f32, f32)>> {
+    let sampled: Vec<&Snapshot> = samples.iter().filter(|s| s.procs_sampled).collect();
+    if sampled.is_empty() {
+        return None;
+    }
+    let mut by: std::collections::BTreeMap<&str, (f32, f32, f32, f32)> = Default::default();
+    for s in &sampled {
+        for p in &s.procs {
+            let e = by.entry(&p.name).or_default();
+            e.0 += p.cpu_pct;
+            e.1 = e.1.max(p.cpu_pct);
+            e.2 += p.gpu_pct;
+            e.3 = e.3.max(p.gpu_pct);
+        }
+    }
+    let n = sampled.len() as f32;
+    let mut v: Vec<(String, f32, f32, f32, f32)> = by.into_iter().map(|(k, e)| (k.to_string(), e.0 / n, e.1, e.2 / n, e.3)).collect();
+    v.sort_by(|a, b| (b.1 + b.3).total_cmp(&(a.1 + a.3)));
+    Some(v)
 }
 
 fn avg(v: impl Iterator<Item = f32>) -> Option<f32> {
@@ -224,6 +300,12 @@ pub fn summarize(samples: &[Snapshot]) -> Telemetry {
     t.vram_total_mb = max(gpus().filter_map(|g| g.vram_total_mb));
     t.gpu_power_max_w = max(gpus().filter_map(|g| g.power_w));
     t.gpu_clock_avg_mhz = avg(gpus().filter_map(|g| g.clock_mhz));
+    if let Some(progs) = program_usage(samples) {
+        t.others_cpu_avg_pct = Some(progs.iter().map(|p| p.1).sum());
+        let gpu: f32 = progs.iter().map(|p| p.3).sum();
+        t.others_gpu_avg_pct = samples.iter().any(|s| s.procs.iter().any(|p| p.gpu_pct > 0.0)).then_some(gpu);
+        t.others_top = progs.iter().take(3).map(|p| (p.0.clone(), p.1, p.3)).collect();
+    }
     t
 }
 
@@ -464,6 +546,8 @@ pub struct WinSensors {
     pub pawnio: Option<String>,
     /// P and E cores LibreHardwareMonitor names in its temperatures ("P-Core #n", "E-Core #n")
     pub lhm_pe: Option<(usize, usize)>,
+    /// GPU use per process id, % of its busiest engine type ("GPU Engine" counters)
+    pub gpu_procs: Vec<(u32, f32)>,
 }
 
 const ACPI_SOURCE: &str = "ACPI thermal zone";
@@ -540,6 +624,19 @@ pub fn parse_win_sensor_line_with(line: &str, map: &crate::topology::CoreMap) ->
         }
         w.core_freq_mhz = f;
     }
+    // GPU Engine counters: one per process and engine; Task Manager's figure is the busiest engine type
+    let mut per: std::collections::HashMap<(u32, String), f32> = Default::default();
+    for g in as_list(&v["gp"]) {
+        let (Some(pid), Some(e), Some(val)) = (g["p"].as_u64(), g["e"].as_str(), g["v"].as_f64()) else { continue };
+        *per.entry((pid as u32, e.to_string())).or_default() += val as f32;
+    }
+    let mut by_pid: std::collections::HashMap<u32, f32> = Default::default();
+    for ((pid, _), v) in per {
+        let e = by_pid.entry(pid).or_default();
+        *e = e.max(v.min(100.0));
+    }
+    w.gpu_procs = by_pid.into_iter().collect();
+    w.gpu_procs.sort_by_key(|p| p.0);
     w.lhm_present = v["lhm"].as_bool().unwrap_or(false);
     w.lhm_error = v["lerr"].as_str().map(str::trim).filter(|e| !e.is_empty()).map(String::from);
     w.pawnio = v["pawn"].as_str().map(str::trim).filter(|e| !e.is_empty()).map(String::from);
@@ -593,9 +690,11 @@ $base = (Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1).Ma
 $hp = '\Thermal Zone Information(*)\High Precision Temperature'
 $tzc = '\Thermal Zone Information(*)\Temperature'
 $pf = '\Processor Information(*)\% Processor Performance'
+# GPU use per process and engine (instances "pid_1234_luid_..._engtype_3D")
+$ge = '\GPU Engine(*)\Utilization Percentage'
 # A counter set that does not exist on this PC (no ACPI zones, older Windows) fails the whole call,
 # so fall back to smaller sets instead of losing the clocks as well
-$sets = @(@($hp, $tzc, $pf), @($tzc, $pf), @($pf))
+$sets = @(@($hp, $tzc, $pf, $ge), @($tzc, $pf, $ge), @($pf, $ge), @($hp, $tzc, $pf), @($tzc, $pf), @($pf))
 # 1) LibreHardwareMonitor's own library next to the exe ($env:LTS_LHM_DIR): no separate app needed.
 #    Since v0.9.5 it reads CPU (MSR), board (Super I/O: VRM, fans, voltages) and memory (SPD) sensors
 #    through the PawnIO driver, which LibreHardwareMonitor.exe installs on its first start. Without
@@ -674,7 +773,7 @@ while ($true) {
       @{ n = "$($h): $($_.Name)"; k = [string]$_.SensorType; v = [double]$_.Value } })
   }
   if ($s) { $t = @($s | ForEach-Object { @{ n = $_.Name; v = [double]$_.Value } }) }
-  $tz = @(); $tzh = @(); $perf = @(); $samples = $null
+  $tz = @(); $tzh = @(); $perf = @(); $gp = @(); $samples = $null
   foreach ($set in $sets) {
     try { $samples = (Get-Counter -Counter $set -ErrorAction Stop).CounterSamples; break } catch {}
   }
@@ -682,8 +781,10 @@ while ($true) {
     $tzh = @($samples | Where-Object { $_.Path -like '*\high precision temperature' } | ForEach-Object { [double]$_.CookedValue })
     $tz = @($samples | Where-Object { $_.Path -like '*thermal zone*' -and $_.Path -like '*\temperature' } | ForEach-Object { [double]$_.CookedValue })
     $perf = @($samples | Where-Object { $_.Path -like '*processor performance*' -and $_.InstanceName -notmatch '_total' } | ForEach-Object { @{ n = $_.InstanceName; v = [double]$_.CookedValue } })
+    $gp = @($samples | Where-Object { $_.Path -like '*gpu engine*' -and $_.CookedValue -gt 0.3 -and $_.InstanceName -match 'pid_(\d+)_.*engtype_(\w+)' } | ForEach-Object {
+      if ($_.InstanceName -match 'pid_(\d+)_.*engtype_(\w+)') { @{ p = [int]$matches[1]; e = $matches[2]; v = [double]$_.CookedValue } } })
   }
-  [pscustomobject]@{ src = $ns; t = $t; x = $x; cl = $cl; tz = $tz; tzh = $tzh; perf = $perf; base = $base; lhm = [bool]$lhm; lerr = $lerr; pawn = $pawn } | ConvertTo-Json -Compress -Depth 4
+  [pscustomobject]@{ src = $ns; t = $t; x = $x; cl = $cl; tz = $tz; tzh = $tzh; perf = $perf; gp = $gp; base = $base; lhm = [bool]$lhm; lerr = $lerr; pawn = $pawn } | ConvertTo-Json -Compress -Depth 4
   Start-Sleep -Milliseconds 500
 }
 "#;
@@ -1135,6 +1236,32 @@ impl Collector {
         }
     }
 
+    /// The busiest other programs right now; processes of the same name are added up (a browser is
+    /// dozens of processes). CPU is % of the whole CPU; GPU comes from `gpu_by_pid` (Windows).
+    fn sample_programs(&mut self, helper: Option<u32>, gpu_by_pid: &[(u32, f32)]) -> Vec<ProcUsage> {
+        self.sys.refresh_processes();
+        let ncpu = self.sys.cpus().len().max(1) as f32;
+        let me = std::process::id();
+        let mut by: std::collections::HashMap<String, (f32, f32)> = Default::default();
+        for (pid, p) in self.sys.processes() {
+            let pid = pid.as_u32();
+            if pid == me || Some(pid) == helper || p.parent().map(|pp| pp.as_u32()) == Some(me) {
+                continue;
+            }
+            let cpu = p.cpu_usage() / ncpu;
+            let gpu = gpu_by_pid.iter().find(|g| g.0 == pid).map_or(0.0, |g| g.1);
+            if cpu >= 0.2 || gpu >= 0.2 {
+                let e = by.entry(p.name().to_string()).or_default();
+                e.0 += cpu;
+                e.1 = (e.1 + gpu).min(100.0);
+            }
+        }
+        let mut v: Vec<ProcUsage> = by.into_iter().map(|(name, (c, g))| ProcUsage { name, cpu_pct: c.min(100.0), gpu_pct: g }).collect();
+        v.sort_by(|a, b| (b.cpu_pct + b.gpu_pct).total_cmp(&(a.cpu_pct + a.gpu_pct)));
+        v.truncate(MAX_PROCS);
+        v
+    }
+
     /// Keep the Windows sensor helper process on the app's core as well
     fn follow_app_core(&mut self) {
         // re-applied every sample: cheap, and covers a helper that was restarted meanwhile
@@ -1241,10 +1368,25 @@ impl Collector {
         // Everything else the machine exposes
         snap.sensors = read_hwmon_all(&self.hwmon_root);
         snap.sensors.extend(self.rapl.read(&self.powercap_root));
-        if let Some(w) = self.win.as_ref().and_then(|w| w.fresh()) {
-            snap.sensors.extend(w.extra);
+        let win_now = self.win.as_ref().and_then(|w| w.fresh());
+        if let Some(w) = &win_now {
+            snap.sensors.extend(w.extra.clone());
         }
         snap.sensors.truncate(MAX_EXTRA_SENSORS);
+
+        // Other programs: which ones used the CPU / GPU while the tests ran
+        let helper = self.win.as_ref().and_then(|w| w.child.as_ref().map(|c| c.id()));
+        let gpu_by_pid = win_now.as_ref().map(|w| w.gpu_procs.clone()).unwrap_or_default();
+        snap.procs = self.sample_programs(helper, &gpu_by_pid);
+        snap.procs_sampled = true;
+        for p in snap.procs.iter().take(5) {
+            if p.cpu_pct >= 1.0 {
+                snap.sensors.push(SensorReading { name: format!("Program {}: CPU", p.name), kind: SensorKind::Load, value: p.cpu_pct });
+            }
+            if p.gpu_pct >= 1.0 {
+                snap.sensors.push(SensorReading { name: format!("Program {}: GPU", p.name), kind: SensorKind::Load, value: p.gpu_pct });
+            }
+        }
         if !snap.sensors.is_empty() {
             let count = |k: SensorKind| snap.sensors.iter().filter(|r| r.kind == k).count();
             notes.push(format!(
@@ -1303,6 +1445,51 @@ mod tests {
     fn write(dir: &Path, file: &str, content: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(file), content).unwrap();
+    }
+
+    #[test]
+    fn other_programs_are_averaged_per_test() {
+        let prog = |n: &str, c: f32, g: f32| ProcUsage { name: n.into(), cpu_pct: c, gpu_pct: g };
+        let a = Snapshot { t_ms: 0, procs: vec![prog("chrome.exe", 20.0, 0.0), prog("obs64.exe", 2.0, 30.0)], procs_sampled: true, ..Default::default() };
+        let b = Snapshot { t_ms: 500, procs: vec![prog("chrome.exe", 10.0, 0.0)], procs_sampled: true, ..Default::default() };
+        let t = summarize(&[a, b]);
+        assert_eq!(t.others_cpu_avg_pct, Some(16.0), "15 % chrome + 1 % obs");
+        assert_eq!(t.others_gpu_avg_pct, Some(15.0));
+        assert_eq!(t.others_top[0], ("obs64.exe".to_string(), 1.0, 15.0), "busiest (CPU + GPU) first");
+        assert_eq!(t.others_text(), "obs64.exe 1 % CPU / 15 % GPU, chrome.exe 15 % CPU");
+        // not sampled at all: unknown, not zero
+        assert_eq!(summarize(&[Snapshot::default()]).others_cpu_avg_pct, None);
+        let quiet = summarize(&[Snapshot { procs_sampled: true, ..Default::default() }]);
+        assert_eq!((quiet.others_cpu_avg_pct, quiet.others_gpu_avg_pct), (Some(0.0), None));
+    }
+
+    #[test]
+    fn gpu_engine_counters_become_per_process_use() {
+        // pid 42: 3D engines 30 + 25 = 55 %, copy 10 %  ->  55 %; pid 7: video decode 12 %
+        let line = r#"{"src":null,"t":[],"tz":[300.0],"gp":[{"p":42,"e":"3D","v":30.0},{"p":42,"e":"3D","v":25.0},{"p":42,"e":"Copy","v":10.0},{"p":7,"e":"VideoDecode","v":12.0}]}"#;
+        let w = parse_win_sensor_line(line).unwrap();
+        assert_eq!(w.gpu_procs, vec![(7, 12.0), (42, 55.0)]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_program_is_seen() {
+        let mut c = Collector::new();
+        // `sh` is our child and left out (the app's own helpers are); `yes` under it is another program
+        let mut child = std::process::Command::new("sh").args(["-c", "exec 2>/dev/null; yes > /dev/null & sleep 3; kill $!"]).spawn().unwrap();
+        // a process's share shows from its second sample on: let it start first
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // like `collect`: the CPU totals are refreshed each sample (process shares are relative to them)
+        c.sys.refresh_cpu();
+        c.sample_programs(None, &[]);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        c.sys.refresh_cpu();
+        let v = c.sample_programs(None, &[]);
+        let _ = child.wait();
+        let yes = v.iter().find(|p| p.name == "yes").unwrap_or_else(|| panic!("yes not seen in {:?}", v));
+        assert!(yes.cpu_pct > 1.0, "{:?}", yes);
+        assert!(v.iter().all(|p| p.name != "sh"), "our own child is left out");
+        assert!(v.len() <= MAX_PROCS);
     }
 
     #[test]
@@ -1624,6 +1811,7 @@ mod tests {
             ram_total_mb: 64000.0,
             gpu: gpu_t.map(|t| GpuSensors { name: "g".into(), temp_c: Some(t), vram_used_mb: vram, vram_total_mb: Some(16000.0), ..Default::default() }),
             sensors: Vec::new(),
+            ..Default::default()
         }
     }
 

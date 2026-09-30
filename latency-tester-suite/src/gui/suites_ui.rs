@@ -179,6 +179,26 @@ impl LatencyTesterApp {
                 self.sensor_notes = s.notes();
             }
             self.sampler_active = false;
+            // which other programs were busy meanwhile (they can pull results down)
+            if let Some(progs) = crate::sensors::program_usage(&self.last_timeline) {
+                let busy: Vec<String> = progs
+                    .iter()
+                    .filter(|p| p.1 >= 1.0 || p.3 >= 1.0)
+                    .take(6)
+                    .map(|p| {
+                        let mut s = format!("{} {:.1} % CPU (max {:.0} %)", p.0, p.1, p.2);
+                        if p.3 >= 0.5 {
+                            s.push_str(&format!(", {:.1} % GPU (max {:.0} %)", p.3, p.4));
+                        }
+                        s
+                    })
+                    .collect();
+                if busy.is_empty() {
+                    self.log("Other programs: none used more than 1 % of the CPU or GPU on average while the tests ran");
+                } else {
+                    self.log(&format!("Other programs while the tests ran (average): {}", busy.join(" · ")));
+                }
+            }
             if crate::app_core::is_active() {
                 let moves = crate::app_core::moves();
                 crate::app_core::release();
