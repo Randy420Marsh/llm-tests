@@ -15,6 +15,7 @@ mod memory_ui;
 mod polling_ui;
 mod aim_ui;
 mod bench3d_ui;
+mod measure_ui;
 mod results_ui;
 mod run_all_ui;
 mod suites_ui;

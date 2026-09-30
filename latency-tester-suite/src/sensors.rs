@@ -1387,7 +1387,7 @@ impl Collector {
                 snap.sensors.push(SensorReading { name: format!("Program {}: GPU", p.name), kind: SensorKind::Load, value: p.gpu_pct });
             }
         }
-        if !snap.sensors.is_empty() {
+        if snap.sensors.iter().any(|r| r.kind != SensorKind::Load) {
             let count = |k: SensorKind| snap.sensors.iter().filter(|r| r.kind == k).count();
             notes.push(format!(
                 "Other sensors: {} temperatures, {} fans, {} power, {} voltages, {} currents",

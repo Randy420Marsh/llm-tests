@@ -159,6 +159,20 @@ the performance-counter estimate. Without the library the app reads the LibreHar
 OpenHardwareMonitor app if one is running (WMI), and otherwise only the ACPI thermal zone, which on many boards is
 a fixed value.
 
+**Measuring on the charts.** Every chart in the report has *Measure* tools next to its zoom buttons:
+
+- **📍 marker**: click to drop named, colour-coded markers (they snap to a measured point nearby); a table lists
+  every line's value at each marker and the change from the first to the last marker (absolute, %, per second on
+  the timeline). Rename a marker in its table; × removes it.
+- **↔ range**: drag across the chart to measure a range: points, min, average, median, 1 % / 99 %, max, standard
+  deviation and the change from first to last, for every line. On the timeline, clicking a test's background band
+  measures exactly that test.
+- **― threshold**: a horizontal line at a value (e.g. 90 °C) with, per line, the share of points above it, the time
+  above it and how often it was crossed.
+- **crosshair**: a vertical line that follows the mouse and lists every line's value there.
+- *Copy measurements (CSV)* copies all of it. The app's Results & Graphs charts have markers and ranges too
+  (click, click; Shift + click on the timeline measures the test under the pointer).
+
 **Report / viewer:** the *Sensors over time* chart can overlay any mix of sensors (presets: temperatures, fans,
 power, voltages, clocks, load, RAM/VRAM; filter box for names like "VRM" or "DIMM"). Each unit gets its own axis.
 Every test is drawn as a background band (memory red, CPU blue, GPU green, input amber) with an opacity slider

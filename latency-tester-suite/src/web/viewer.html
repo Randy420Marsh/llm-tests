@@ -59,6 +59,12 @@
   .chartbox.big { height:84vh; }
   .chartbox.drag { cursor:grabbing; }
   .chartbox svg { display:block; }
+  .mtools { display:inline-flex; gap:4px; align-items:center; margin-left:6px; padding-left:8px; border-left:1px solid var(--line); }
+  .mtools button.on { border-color:var(--accent); background:#22344a; }
+  .meas { margin:6px 0 2px; font-size:12px; }
+  .meas table { font-size:12px; }
+  .meas input.mname { width:90px; background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:1px 4px; }
+  .meas h4 { margin:8px 0 3px; font-size:12px; color:var(--dim); font-weight:600; }
   .tip { position:absolute; pointer-events:none; background:#0b0d11ee; border:1px solid var(--line); border-radius:6px; padding:4px 9px; font-size:12px; line-height:1.35; white-space:nowrap; z-index:5; }
   .bars { padding:6px 10px; }
   .bh { color:var(--dim); font-size:12px; margin:8px 0 2px; text-transform:uppercase; letter-spacing:.04em; }
@@ -395,6 +401,25 @@ function logTicks(lo, hi) {
   }
   return out;
 }
+const meas = {};               // chart id -> { mode, markers, ranges, thresholds, cross }: kept across redraws
+const MEAS_COLORS = ['#ff5d8f', '#ffd166', '#06d6a0', '#4cc9f0', '#f77f00', '#c77dff', '#90be6d', '#f94144'];
+const measOf = id => (meas[id] ??= { mode: null, markers: [], ranges: [], thresholds: [], cross: false, seq: 0 });
+// value of a line at x: exact point, or linear between its neighbours; null outside it
+function valueAt(pts, x) {
+  if (!pts.length || x < pts[0][0] - 1e-9 || x > pts[pts.length - 1][0] + 1e-9) return null;
+  let lo = 0, hi = pts.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (pts[m][0] <= x) lo = m; else hi = m; }
+  const a = pts[lo], b = pts[hi];
+  if (Math.abs(a[0] - x) < 1e-9) return a[1];
+  if (Math.abs(b[0] - x) < 1e-9) return b[1];
+  return b[0] === a[0] ? a[1] : a[1] + (b[1] - a[1]) * (x - a[0]) / (b[0] - a[0]);
+}
+function statsOf(v) {
+  if (!v.length) return null;
+  const s = [...v].sort((a, b) => a - b), n = s.length, mean = v.reduce((a, b) => a + b, 0) / n;
+  const at = p => s[Math.min(n - 1, Math.floor(n * p))];
+  return { n, min: s[0], max: s[n - 1], avg: mean, median: n % 2 ? s[n >> 1] : (s[n / 2 - 1] + s[n / 2]) / 2, p1: at(0.01), p99: at(0.99), sd: Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / n), first: v[0], last: v[n - 1] };
+}
 const views = {};              // chart id -> { x:[lo,hi]|null, y:[f0,f1]|null, ysig }
 const liveCharts = new Map();  // chart id -> Chart
 const pendingSpecs = new Map();
@@ -407,6 +432,7 @@ class Chart {
     views[spec.id] = this.view;
     el.innerHTML = '<div class="svghost"></div><div class="tip" hidden></div>';
     this.host = el.firstChild; this.tip = el.lastChild;
+    this.m = measOf(spec.id);
     this.domains();
     this.ro = new ResizeObserver(() => { cancelAnimationFrame(this.raf); this.raf = requestAnimationFrame(() => this.draw()); });
     this.ro.observe(el);
@@ -486,6 +512,10 @@ class Chart {
   down(e) {
     if (e.button !== 0 && e.button !== 1) return;
     const p = this.local(e); if (!this.inPlot(p)) return;
+    if (e.button === 0 && (this.m.mode === 'marker' || this.m.mode === 'range')) {
+      this.el.setPointerCapture(e.pointerId); this.pointers.set(e.pointerId, p);
+      this.drag = { mode: 'm-' + this.m.mode, start: p, last: p }; this.tip.hidden = true; return;
+    }
     // double press = reset (a real dblclick event is lost because every redraw replaces the svg)
     const now = performance.now(), ld = this.lastDown;
     if (ld && now - ld.t < 400 && Math.hypot(p.x - ld.x, p.y - ld.y) < 8) { this.lastDown = null; this.pointers.clear(); this.drag = null; this.el.classList.remove('drag'); this.reset(); return; }
@@ -505,12 +535,21 @@ class Chart {
         this.zoomAt({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, d1 / d2);
       } else if (this.drag && this.drag.mode === 'pan') {
         this.panBy(p.x - this.drag.last.x, p.y - this.drag.last.y); this.drag.last = p;
-      } else if (this.drag && this.drag.mode === 'box') { this.drag.last = p; this.drawOverlay(); }
+      } else if (this.drag && (this.drag.mode === 'box' || this.drag.mode === 'm-range')) { this.drag.last = p; this.drawOverlay(); }
       return;
     }
     if (!this.drag) this.hover(p);
   }
   up(e) {
+    if (this.drag && this.drag.mode.startsWith('m-')) {
+      const a = this.drag.start, b = this.drag.last, moved = Math.abs(a.x - b.x) > 6;
+      if (this.drag.mode === 'm-marker' && !moved) this.addMarker(a.x);
+      if (this.drag.mode === 'm-range') {
+        if (moved) this.addRange(this.dataX(Math.min(a.x, b.x)), this.dataX(Math.max(a.x, b.x)));
+        else { const band = (this.bandHits || []).find(h => a.x >= h.x0 && a.x <= h.x1); if (band) this.addRange(band.b.x0, band.b.x1, band.b.label); }
+      }
+      this.pointers.delete(e.pointerId); this.drag = null; this.el.classList.remove('drag'); this.draw(); return;
+    }
     if (this.drag && this.drag.mode === 'box' && this.pointers.size === 1) {
       const a = this.drag.start, b = this.drag.last, g = this.geo;
       if (Math.abs(a.x - b.x) > 6 && Math.abs(a.y - b.y) > 6) {
@@ -527,7 +566,21 @@ class Chart {
   }
   setHighlight(name, pt) { this.hlSeries = name; this.hlPoint = pt || null; this.drawOverlay(); }
   hover(p) {
-    if (!this.hit || !this.inPlot(p)) { this.tip.hidden = true; this.setHighlight(null); return; }
+    if (!this.hit || !this.inPlot(p)) { this.tip.hidden = true; this.cross = null; this.setHighlight(null); return; }
+    if (this.m.cross) {
+      // every line's value at the cursor
+      const x = this.dataX(p.x), s = this.spec, many = s.lines.some(o => o.metric !== s.lines[0].metric);
+      const rows = s.lines.map(l => [l, valueAt(l.pts, x)]).filter(r => r[1] != null).slice(0, 16);
+      const band = (this.bandHits || []).find(h => p.x >= h.x0 && p.x <= h.x1);
+      this.tip.innerHTML = `<b>${esc(s.xFmt ? s.xFmt(x) : fmt(x))}</b>` + (band ? ` <span style="color:${band.b.color}">· ${esc(band.b.label)}</span>` : '') +
+        rows.map(([l, v]) => `<br><span style="color:${l.color}">●</span> ${esc(l.name)}${many && l.metric !== l.name ? ' · ' + esc(l.metric) : ''}: <b>${fmt(v, l.unit)}</b>`).join('') + (s.lines.length > rows.length ? `<br><span style="color:var(--dim)">(${s.lines.length - rows.length} more have no value here)</span>` : '');
+      this.tip.hidden = false;
+      const tw = this.tip.offsetWidth, th = this.tip.offsetHeight;
+      this.tip.style.left = (p.x + 16 + tw < this.W ? p.x + 16 : p.x - tw - 16) + 'px';
+      this.tip.style.top = Math.min(Math.max(4, p.y - th / 2), this.H - th - 4) + 'px';
+      this.cross = p.x; this.drawOverlay();
+      return;
+    }
     let best = null, bd = 22 * 22;
     for (const h of this.hit) { const d = (h.x - p.x) ** 2 + (h.y - p.y) ** 2; if (d < bd) { bd = d; best = h; } }
     const band = (this.bandHits || []).find(h => p.x >= h.x0 && p.x <= h.x1);
@@ -547,6 +600,117 @@ class Chart {
     this.tip.style.left = Math.min(Math.max(4, best.x + 14), this.W - tw - 4) + 'px';
     this.tip.style.top = Math.min(Math.max(4, best.y - th - 10), this.H - th - 4) + 'px';
     this.setHighlight(l.series, best);
+  }
+  dataX(px) { const g = this.geo, [lo, hi] = this.xr; return lo + (Math.min(Math.max(px, g.L), g.L + g.pw) - g.L) / g.pw * (hi - lo); }
+  nextName(prefix) { return prefix + (++this.m.seq); }
+  addMarker(px) {
+    // snap to the nearest measured x when one is close (categories such as buffer sizes or cores)
+    let x = this.dataX(px), best = 14;
+    for (const h of this.hit || []) { const d = Math.abs(h.x - px); if (d < best) { best = d; x = h.p[0]; } }
+    const k = this.m.markers.length;
+    this.m.markers.push({ id: 'm' + (++this.m.seq), name: String.fromCharCode(65 + (k % 26)) + (k >= 26 ? Math.floor(k / 26) : ''), x, color: MEAS_COLORS[k % MEAS_COLORS.length] });
+  }
+  addRange(x0, x1, label) {
+    const k = this.m.ranges.length;
+    this.m.ranges.push({ id: 'r' + (++this.m.seq), name: label ? label.slice(0, 48) : `R${k + 1}`, x0, x1, color: MEAS_COLORS[(k + 3) % MEAS_COLORS.length] });
+  }
+  addThreshold() {
+    const axes = this.spec.axes;
+    let k = 0;
+    if (axes.length > 1) {
+      const pick = prompt('Which axis? ' + axes.map((a, i) => `${i + 1} = ${a.unit || a.label}`).join(', '), '1');
+      if (pick === null) return;
+      k = Math.max(0, Math.min(axes.length - 1, (parseInt(pick, 10) || 1) - 1));
+    }
+    const v = prompt(`Threshold on the ${axes[k].unit || 'value'} axis (e.g. 90):`, '');
+    if (v === null || v.trim() === '' || !Number.isFinite(parseFloat(v))) return;
+    const n = this.m.thresholds.length;
+    this.m.thresholds.push({ id: 't' + (++this.m.seq), name: `T${n + 1}`, axis: k, y: parseFloat(v), color: MEAS_COLORS[(n + 5) % MEAS_COLORS.length] });
+    this.draw();
+  }
+  // markers, ranges and thresholds drawn over the data
+  measSvg(sx, sy) {
+    const { L, T, pw, ph } = this.geo, m = this.m; let g = '';
+    for (const r of m.ranges) {
+      const a = Math.max(L, sx(r.x0)), b = Math.min(L + pw, sx(r.x1)); if (b <= L || a >= L + pw) continue;
+      g += `<rect x="${a.toFixed(1)}" y="${T}" width="${Math.max(1, b - a).toFixed(1)}" height="${ph}" fill="${r.color}" fill-opacity="0.10" stroke="${r.color}" stroke-dasharray="4 3"/>` +
+        `<text x="${(a + 4).toFixed(1)}" y="${T + 13}" style="fill:${r.color}">${esc(r.name)}</text>`;
+    }
+    for (const k of m.markers) {
+      const x = sx(k.x); if (x < L || x > L + pw) continue;
+      g += `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${T}" y2="${T + ph}" stroke="${k.color}" stroke-width="1.5" stroke-dasharray="5 3"/>` +
+        `<rect x="${(x - 11).toFixed(1)}" y="${T + 2}" width="22" height="15" rx="3" fill="${k.color}"/><text x="${x.toFixed(1)}" y="${T + 13}" text-anchor="middle" style="fill:#111;font-weight:700">${esc(k.name.slice(0, 3))}</text>`;
+    }
+    for (const t of m.thresholds) {
+      if (t.axis >= this.spec.axes.length) continue;
+      const yv = this.tr(t.y); if (yv === null) continue;
+      const y = sy(t.axis, yv); if (y < T || y > T + ph) continue;
+      g += `<line x1="${L}" x2="${L + pw}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${t.color}" stroke-width="1.5" stroke-dasharray="8 4"/>` +
+        `<text x="${L + pw - 4}" y="${(y - 4).toFixed(1)}" text-anchor="end" style="fill:${t.color}">${esc(t.name)}: ${esc(fmt(t.y, this.spec.axes[t.axis].unit))}</text>`;
+    }
+    return g;
+  }
+  // the tables under the chart
+  renderMeas() {
+    const panel = document.querySelector(`[data-meas="${CSS.escape(this.spec.id)}"]`); if (!panel) return;
+    const s = this.spec, m = this.m, lines = s.lines.slice(0, 40), xf = x => s.xFmt ? s.xFmt(x) : fmt(x);
+    const timeX = /second/.test(s.xLabel || '');
+    const many = s.lines.some(o => o.metric !== s.lines[0].metric);
+    const lname = l => `<span class="sw" style="background:${l.color}"></span> ${esc(l.name)}${many && l.metric !== l.name ? ' · ' + esc(l.metric) : ''}`;
+    const head = (it, extra) => `<span class="sw" style="background:${it.color}"></span> <input class="mname" data-mname="${it.id}" value="${esc(it.name)}"> <button class="small" data-mdel="${it.id}" title="Remove">×</button>${extra ? '<br><span style="color:var(--dim)">' + esc(extra) + '</span>' : ''}`;
+    const csv = [];
+    let h = '';
+    if (m.mode === 'marker') h += '<div style="color:var(--accent)">📍 Click the chart to drop a marker (it snaps to a measured point nearby). Click 📍 again to stop.</div>';
+    if (m.mode === 'range') h += `<div style="color:var(--accent)">↔ Drag across the chart to measure a range${s.bands ? ", or click a test's band to measure that test" : ''}. Click ↔ again to stop.</div>`;
+    if (m.markers.length) {
+      const mk = [...m.markers].sort((a, b) => a.x - b.x), A = mk[0], B = mk[mk.length - 1];
+      h += '<h4>Markers</h4><div class="scroll"><table><thead><tr><th>Line</th>' + mk.map(k => `<th>${head(k, xf(k.x))}</th>`).join('') +
+        (mk.length >= 2 ? `<th>${esc(B.name)} − ${esc(A.name)}</th><th>change</th>${timeX ? '<th>per second</th>' : ''}` : '') + '</tr></thead><tbody>';
+      csv.push(['line', ...mk.map(k => `${k.name} @ ${xf(k.x)}`)].join(','));
+      for (const l of lines) {
+        const v = mk.map(k => valueAt(l.pts, k.x)), a = v[0], b = v[v.length - 1], d = a != null && b != null ? b - a : null;
+        h += `<tr><td>${lname(l)}</td>` + v.map(x => `<td>${fmt(x, l.unit)}</td>`).join('');
+        if (mk.length >= 2) h += `<td>${d == null ? '—' : (d > 0 ? '+' : '') + fmt(d, l.unit)}</td><td>${d == null || !a ? '—' : (d > 0 ? '+' : '') + fmt(d / Math.abs(a) * 100) + ' %'}</td>` + (timeX ? `<td>${d == null || B.x === A.x ? '—' : fmt(d / (B.x - A.x), l.unit)}</td>` : '');
+        h += '</tr>';
+        csv.push([JSON.stringify(l.name + (many ? ' · ' + l.metric : '')), ...v.map(x => x ?? '')].join(','));
+      }
+      h += '</tbody></table></div>';
+    }
+    for (const r of m.ranges) {
+      h += `<h4>Range ${head(r, xf(r.x0) + ' – ' + xf(r.x1) + (timeX ? ` (${fmt(r.x1 - r.x0)} s)` : ''))}</h4><div class="scroll"><table><thead><tr><th>Line</th><th>points</th><th>min</th><th>average</th><th>median</th><th>1 %</th><th>99 %</th><th>max</th><th>std dev</th><th>first → last</th></tr></thead><tbody>`;
+      csv.push(''); csv.push([`range ${r.name}`, 'points', 'min', 'average', 'median', 'p1', 'p99', 'max', 'sd', 'first_to_last'].join(','));
+      for (const l of lines) {
+        const st = statsOf(l.pts.filter(q => q[0] >= r.x0 - 1e-9 && q[0] <= r.x1 + 1e-9).map(q => q[1]));
+        if (!st) { h += `<tr><td>${lname(l)}</td><td colspan="9" style="color:var(--dim)">no points in this range</td></tr>`; continue; }
+        const d = st.last - st.first;
+        h += `<tr><td>${lname(l)}</td><td>${st.n}</td>` + [st.min, st.avg, st.median, st.p1, st.p99, st.max, st.sd].map(x => `<td>${fmt(x, l.unit)}</td>`).join('') + `<td>${(d > 0 ? '+' : '') + fmt(d, l.unit)}</td></tr>`;
+        csv.push([JSON.stringify(l.name), st.n, st.min, st.avg, st.median, st.p1, st.p99, st.max, st.sd, d].join(','));
+      }
+      h += '</tbody></table></div>';
+    }
+    for (const t of m.thresholds) {
+      const ax = s.axes[t.axis] || s.axes[0], mine = lines.filter(l => l.axis === t.axis);
+      h += `<h4>Threshold ${head(t, fmt(t.y, ax.unit))}</h4><div class="scroll"><table><thead><tr><th>Line</th><th>points above</th>${timeX ? '<th>time above</th>' : ''}<th>crossings</th><th>highest</th></tr></thead><tbody>`;
+      csv.push(''); csv.push([`threshold ${t.name} = ${t.y}`, 'share_above_pct', 'time_above_s', 'crossings', 'max'].join(','));
+      for (const l of mine) {
+        const p = l.pts; if (!p.length) continue;
+        let above = 0, time = 0, cross = 0;
+        for (let i = 0; i < p.length; i++) {
+          if (p[i][1] > t.y) { above++; if (i + 1 < p.length) time += p[i + 1][0] - p[i][0]; }
+          if (i && (p[i][1] > t.y) !== (p[i - 1][1] > t.y)) cross++;
+        }
+        const mx = Math.max(...p.map(q => q[1]));
+        h += `<tr><td>${lname(l)}</td><td>${fmt(above / p.length * 100)} %</td>${timeX ? `<td>${fmt(time)} s</td>` : ''}<td>${cross}</td><td class="${mx > t.y ? 'warn' : ''}">${fmt(mx, l.unit)}</td></tr>`;
+        csv.push([JSON.stringify(l.name), above / p.length * 100, timeX ? time : '', cross, mx].join(','));
+      }
+      h += '</tbody></table></div>';
+    }
+    if (csv.length) h += `<div class="row"><button class="small" data-mcsv>Copy measurements (CSV)</button></div>`;
+    panel.innerHTML = h;
+    const find = id => [m.markers, m.ranges, m.thresholds].find(a => a.some(x => x.id === id));
+    panel.querySelectorAll('[data-mname]').forEach(el => el.onchange = () => { const a = find(el.dataset.mname); const it = a && a.find(x => x.id === el.dataset.mname); if (it) { it.name = el.value.trim() || it.name; this.draw(); } });
+    panel.querySelectorAll('[data-mdel]').forEach(el => el.onclick = () => { const a = find(el.dataset.mdel); if (a) { a.splice(a.findIndex(x => x.id === el.dataset.mdel), 1); this.draw(); } });
+    const c = panel.querySelector('[data-mcsv]'); if (c) c.onclick = () => { navigator.clipboard && navigator.clipboard.writeText(csv.join('\n')); c.textContent = 'Copied'; };
   }
   ticksX(xr, pw) {
     const s = this.spec; let xt;
@@ -621,7 +785,7 @@ class Chart {
         if (s.marks && s.marks.has(l.series + '|' + q[2][0])) markers += `<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="8" fill="none" stroke="#ff5d5d" stroke-width="1.8"/>`;
       }
     });
-    g += `<g clip-path="url(#${sid})">${body}${markers}</g><g id="ov" clip-path="url(#${sid})"></g>`;
+    g += `<g clip-path="url(#${sid})">${body}${markers}${this.measSvg(sx, sy)}</g><g id="ov" clip-path="url(#${sid})"></g>`;
     if (s.legend && s.legend.length) {
       const rowH = 15, lw = Math.min(pw - 20, Math.max(...s.legend.map(e => e.label.length)) * 6.3 + 48);
       g += `<g><rect x="${L + 8}" y="${T + 6}" width="${lw}" height="${s.legend.length * rowH + 6}" rx="5" fill="#12141ad9" stroke="#343a46"/>` + s.legend.map((e, i) => {
@@ -630,7 +794,7 @@ class Chart {
       }).join('') + '</g>';
     }
     this.host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`;
-    this.drawOverlay(); this.updateInfo();
+    this.drawOverlay(); this.updateInfo(); this.renderMeas();
   }
   drawOverlay() {
     const ov = this.host.querySelector('#ov'); if (!ov) return;
@@ -642,6 +806,11 @@ class Chart {
         h += `<polyline fill="none" stroke="${l.color}" stroke-width="3.4" stroke-linejoin="round" ${l.dash ? `stroke-dasharray="${l.dash}"` : ''} points="${pts.map(q => q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(' ')}"/>`;
       });
       if (this.hlPoint) h += `<circle cx="${this.hlPoint.x}" cy="${this.hlPoint.y}" r="6.5" fill="none" stroke="#fff" stroke-width="1.6"/>`;
+    }
+    if (this.m.cross && this.cross != null) h += `<line x1="${this.cross}" x2="${this.cross}" y1="${T}" y2="${T + ph}" stroke="#c8ccd6" stroke-opacity="0.7" stroke-dasharray="3 3"/>`;
+    if (this.drag && this.drag.mode === 'm-range' && this.drag.last) {
+      const a = Math.min(this.drag.start.x, this.drag.last.x), b = Math.max(this.drag.start.x, this.drag.last.x);
+      h += `<rect x="${a}" y="${T}" width="${b - a}" height="${ph}" fill="#ffd16622" stroke="#ffd166" stroke-dasharray="4 3"/>`;
     }
     if (this.drag && this.drag.mode === 'box' && this.drag.last) {
       const a = this.drag.start, b = this.drag.last;
@@ -662,6 +831,17 @@ class Chart {
   }
 }
 
+// Esc leaves marker / range mode
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  for (const [id, m] of Object.entries(meas)) {
+    if (!m.mode) continue;
+    m.mode = null;
+    document.querySelectorAll(`[data-mm][data-for="${CSS.escape(id)}"]`).forEach(o => o.classList.remove('on'));
+    const c = liveCharts.get(id); if (c) { c.el.style.cursor = ''; c.draw(); }
+  }
+});
+
 function mountCharts(root) {
   root.querySelectorAll('.chartbox[data-chart]').forEach(el => {
     const id = el.dataset.chart, spec = pendingSpecs.get(id); if (!spec) return;
@@ -675,6 +855,20 @@ function mountCharts(root) {
     if (a === 'big') { c.el.classList.toggle('big'); b.textContent = c.el.classList.contains('big') ? '⤡ shrink' : '⤢ expand'; c.draw(); }
     if (a === 'svg') download(c.spec.id.replace(/\W/g, '_') + '.svg', c.svgText(), 'image/svg+xml');
   });
+  root.querySelectorAll('[data-mm]').forEach(b => {
+    const m = measOf(b.dataset.for), a = b.dataset.mm;
+    if (a === m.mode) b.classList.add('on');
+    b.onclick = () => {
+      const c = liveCharts.get(b.dataset.for); if (!c) return;
+      if (a === 'clear') { m.markers = []; m.ranges = []; m.thresholds = []; m.mode = null; }
+      else if (a === 'thr') { c.addThreshold(); return; }
+      else m.mode = m.mode === a ? null : a;
+      root.querySelectorAll(`[data-mm][data-for="${CSS.escape(b.dataset.for)}"]`).forEach(o => o.classList.toggle('on', o.dataset.mm === m.mode));
+      c.el.style.cursor = m.mode ? 'crosshair' : '';
+      c.draw();
+    };
+  });
+  root.querySelectorAll('[data-mx]').forEach(cb => cb.onchange = () => { const m = measOf(cb.dataset.for); m.cross = cb.checked; const c = liveCharts.get(cb.dataset.for); if (c) { c.cross = null; c.draw(); } });
   root.querySelectorAll('[data-wheel]').forEach(cb => cb.onchange = () => { state.wheelZoom = cb.checked; document.querySelectorAll('[data-wheel]').forEach(o => o.checked = cb.checked); });
   root.querySelectorAll('[data-hl]').forEach(el => {
     el.onmouseenter = () => liveCharts.get(el.dataset.for)?.setHighlight(el.dataset.hl);
@@ -686,8 +880,16 @@ function chartTools(id) {
   return `<div class="ctools"><button class="small" data-z="in" data-for="${esc(id)}" title="Zoom in">＋</button><button class="small" data-z="out" data-for="${esc(id)}" title="Zoom out">－</button>` +
     `<button class="small" data-z="reset" data-for="${esc(id)}">⟲ reset zoom</button><button class="small" data-z="big" data-for="${esc(id)}">⤢ expand</button><button class="small" data-z="svg" data-for="${esc(id)}" title="Save the chart as it is shown">SVG</button>` +
     `<label class="chk" title="Otherwise hold Ctrl while scrolling"><input type="checkbox" data-wheel ${state.wheelZoom ? 'checked' : ''}>zoom with the mouse wheel</label>` +
+    `<span class="mtools">Measure: ` +
+    `<button class="small" data-mm="marker" data-for="${esc(id)}" title="Click the chart to drop a named marker: the value of every line there, and the change between markers">📍 marker</button>` +
+    `<button class="small" data-mm="range" data-for="${esc(id)}" title="Drag across the chart to measure a range: min / average / max … of every line in it. On the timeline, a click on a test's band measures that test">↔ range</button>` +
+    `<button class="small" data-mm="thr" data-for="${esc(id)}" title="A horizontal line at a value: how long / how often each line is above it and how often it crosses it">― threshold</button>` +
+    `<label class="chk" title="A vertical line that follows the mouse and lists every line's value there"><input type="checkbox" data-mx data-for="${esc(id)}" ${measOf(id).cross ? 'checked' : ''}>crosshair</label>` +
+    `<button class="small" data-mm="clear" data-for="${esc(id)}" title="Remove this chart's markers, ranges and thresholds">clear</button></span>` +
     `<span class="hint">Ctrl + wheel or ＋/－ = zoom · drag = pan · Shift + drag = box zoom · double-click = reset · hover a point for its value</span><span class="zinfo" data-zinfo="${esc(id)}"></span></div>`;
 }
+// a chart with its tools above and its measurements below
+const chartBlock = (id, big) => chartTools(id) + `<div class="chartbox${big ? ' big' : ''}" data-chart="${id}"></div><div class="meas" data-meas="${id}"></div>`;
 
 function barsHtml(items, unit) {
   const max = Math.max(...items.map(i => i.value), 0) || 1;
@@ -889,7 +1091,7 @@ function kindSection(kindKey, entries) {
         marks: new Set(anomalies.map(a => a.series + '|' + a.x)),
         xInt: !!kind.logX, xTicks: !kind.logX && xs.length <= 40 ? xs : undefined,
       });
-      html += chartTools(cid) + `<div class="chartbox" data-chart="${cid}"></div>`;
+      html += chartBlock(cid);
     }
   } else html += '<div style="color:var(--dim)">All values are hidden.</div>';
   html += `<div class="row"><span style="color:var(--dim)">${visRows.length} rows</span><button class="small" data-act="csv">Copy CSV</button><button class="small" data-act="dl-csv">Download CSV</button></div>`;
@@ -994,7 +1196,7 @@ function sensorsSection(entries) {
   });
   const cid = 'chart_sensors';
   pendingSpecs.set(cid, { id: cid, lines, axes, bands, legend: sel.length > 1 && sel.length <= 12 ? lines.map(l => ({ label: l.name + ' (' + l.unit + ')', color: l.color, dash: l.dash, axis: l.axis })) : null, ysig: sel.map(d => d[0]).join('|'), xLabel: 'seconds since the test started', logY: false, zeroY: false, markers: false, xFmt: v => fmt(v) + ' s' });
-  html += chartTools(cid) + `<div class="chartbox big" data-chart="${cid}"></div>`;
+  html += chartBlock(cid, true);
   const progs = (sec.programs || []).filter(p => p.cpu_avg_pct >= 0.1 || p.gpu_avg_pct >= 0.1);
   if (sec.programs) {
     html += '<h3>Other programs while the tests ran</h3>' + (progs.length

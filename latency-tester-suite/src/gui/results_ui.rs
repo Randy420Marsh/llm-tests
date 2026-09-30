@@ -588,6 +588,8 @@ pub(super) struct ResultsUi {
     pub reset_view: HashSet<&'static str>,
     /// Points ringed on the chart as unusual values (series, x)
     pub marks: Vec<(String, f64)>,
+    /// Markers and measured ranges per chart ("sen" or a dataset tag)
+    pub measures: std::collections::HashMap<&'static str, super::measure_ui::Measure>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -663,6 +665,7 @@ impl ResultsUi {
             phase_opacity: 0.18,
             reset_view: HashSet::new(),
             marks: Vec::new(),
+            measures: Default::default(),
         }
     }
 
@@ -685,7 +688,7 @@ impl ResultsUi {
     }
 }
 
-fn format_value(v: f64, unit: &str) -> String {
+pub(super) fn format_value(v: f64, unit: &str) -> String {
     let a = v.abs();
     let s = if (v.fract() == 0.0 && a < 1e9) || a >= 1000.0 {
         format!("{:.0}", v)
@@ -756,7 +759,7 @@ impl LatencyTesterApp {
 
         let d = self.results_ui.dataset;
         if d == Dataset::Sensors {
-            self.sensors_view(ui);
+            egui::ScrollArea::vertical().id_salt("sensors_scroll").auto_shrink([false, false]).show(ui, |ui| self.sensors_view(ui));
             return;
         }
         let rows = self.dataset_rows(d);
@@ -991,10 +994,14 @@ impl LatencyTesterApp {
         let zero_y = self.results_ui.zero_y && !log_y;
         let ylabel = format!("{} ({}){}", metric.1, metric.2, if log_y { " — log scale" } else { "" });
         let labels: BTreeMap<i64, String> = rows.iter().map(|r| (r.x.round() as i64, r.x_label.clone())).collect();
+        let x_label_of = labels.clone();
+        let mut meas = self.results_ui.measures.remove(d.tag()).unwrap_or_default();
+        meas.tools(ui, "Click where a range starts, then where it ends: min / average / max of every line in it");
         // no legend inside the plot: with dozens of lines it covered the data; it is drawn below instead
         let mut plot = Plot::new(("plot", d.tag()))
             .height(320.0)
             .y_axis_label(ylabel)
+            .allow_drag(meas.mode.is_none())
             .allow_scroll(false);
         if log_y {
             plot = plot.y_axis_formatter(|mark, _| {
@@ -1018,7 +1025,19 @@ impl LatencyTesterApp {
         if self.results_ui.reset_view.remove(d.tag()) {
             plot = plot.reset();
         }
-        plot.show(ui, |plot_ui| {
+        let mut pointer_x = None;
+        let y_top = rows
+            .iter()
+            .filter(|r| !self.results_ui.series_hidden(d, &r.series))
+            .filter_map(|r| r.values.get(metric.0).copied())
+            .filter(|v| !log_y || *v > 0.0)
+            .map(|v| if log_y { v.log10() } else { v })
+            .fold(f64::MIN, f64::max);
+        let resp = plot.show(ui, |plot_ui| {
+            if y_top > f64::MIN {
+                meas.draw(plot_ui, y_top);
+            }
+            pointer_x = plot_ui.pointer_coordinate().map(|p| p.x);
             for (i, s) in series.iter().enumerate() {
                 if self.results_ui.series_hidden(d, s) {
                     continue;
@@ -1043,8 +1062,28 @@ impl LatencyTesterApp {
                 }
             }
         });
+        if resp.response.clicked() {
+            if let Some(x) = pointer_x {
+                // snap to the nearest measured x (buffer sizes, cores)
+                let snapped = rows.iter().map(|r| r.x).min_by(|a, b| (a - x).abs().total_cmp(&(b - x).abs())).unwrap_or(x);
+                meas.click(snapped, false, None);
+            }
+        }
         let shown: Vec<(usize, &String)> = series.iter().enumerate().filter(|(_, s)| !self.results_ui.series_hidden(d, s)).collect();
         legend_below(ui, ("legend", d.tag()), shown.iter().map(|(i, s)| (color_for(*i), s.as_str())));
+        if !meas.markers.is_empty() || !meas.ranges.is_empty() {
+            let lines: Vec<(String, Vec<[f64; 2]>)> = shown
+                .iter()
+                .map(|(_, s)| {
+                    let mut pts: Vec<[f64; 2]> = rows.iter().filter(|r| &r.series == *s).filter_map(|r| r.values.get(metric.0).map(|v| [r.x, *v])).collect();
+                    pts.sort_by(|a, b| a[0].total_cmp(&b[0]));
+                    ((*s).clone(), pts)
+                })
+                .collect();
+            let fmt_x = move |x: f64| if log_x { human_size(2f64.powf(x) as usize) } else { x_label_of.get(&(x.round() as i64)).cloned().unwrap_or_else(|| format!("{:.2}", x)) };
+            meas.panel(ui, d.tag(), &lines, metric.2, &fmt_x);
+        }
+        self.results_ui.measures.insert(d.tag(), meas);
     }
 
     // ------------------------------------------------------------------ sensors over time
@@ -1135,11 +1174,19 @@ impl LatencyTesterApp {
         if ui.button("⟲ Reset view").on_hover_text("Back to the whole run after zooming or panning (double-click the chart does the same)").clicked() {
             self.results_ui.reset_view.insert("sen");
         }
-        let mut sensor_plot = Plot::new("sensor_plot").height(420.0).x_axis_label("seconds since the test started");
+        let mut meas = self.results_ui.measures.remove("sen").unwrap_or_default();
+        meas.tools(ui, "Click where a range starts, then where it ends; Shift + click measures the test under the pointer");
+        // the mouse wheel scrolls the page (zoom: Ctrl + wheel or a box drag), like the results charts
+        let mut sensor_plot = Plot::new("sensor_plot").height(420.0).x_axis_label("seconds since the test started").allow_drag(meas.mode.is_none()).allow_scroll(false);
         if self.results_ui.reset_view.remove("sen") {
             sensor_plot = sensor_plot.reset();
         }
+        let mut pointer_x = None;
         let plot = sensor_plot.show(ui, |plot_ui| {
+            if band_lo < band_hi {
+                meas.draw(plot_ui, band_hi);
+            }
+            pointer_x = plot_ui.pointer_coordinate().map(|p| p.x);
             if opacity > 0.0 && band_lo < band_hi {
                 for p in &phases {
                     let (x0, x1) = (p.start_ms as f64 / 1000.0, (p.end_ms.max(p.start_ms + 50)) as f64 / 1000.0);
@@ -1163,12 +1210,28 @@ impl LatencyTesterApp {
             let p = phases.iter().rev().find(|p| x >= p.start_ms as f64 / 1000.0 && x <= p.end_ms.max(p.start_ms + 50) as f64 / 1000.0)?;
             Some(format!("{}\n{:.1} – {:.1} s ({:.1} s)", p.label, p.start_ms as f64 / 1000.0, p.end_ms as f64 / 1000.0, (p.end_ms.saturating_sub(p.start_ms)) as f64 / 1000.0))
         });
+        if plot.response.clicked() {
+            if let Some(x) = pointer_x {
+                let shift = ui.input(|i| i.modifiers.shift);
+                let band = phases
+                    .iter()
+                    .rev()
+                    .find(|p| x >= p.start_ms as f64 / 1000.0 && x <= p.end_ms.max(p.start_ms + 50) as f64 / 1000.0)
+                    .map(|p| (p.start_ms as f64 / 1000.0, p.end_ms as f64 / 1000.0, p.label.chars().take(48).collect::<String>()));
+                meas.click(x, shift, band);
+            }
+        }
         if let Some(text) = plot.inner {
             plot.response.on_hover_text_at_pointer(text);
         }
         let shown: Vec<(usize, &String)> =
             lines.iter().map(|l| &l.0).enumerate().filter(|(_, n)| !self.results_ui.series_hidden(Dataset::Sensors, n)).collect();
         legend_below(ui, "sensor_legend", shown.iter().map(|(i, n)| (color_for(*i), n.as_str())));
+        if !meas.markers.is_empty() || !meas.ranges.is_empty() {
+            let vis: Vec<(String, Vec<[f64; 2]>)> = lines.iter().filter(|(n, _)| !self.results_ui.series_hidden(Dataset::Sensors, n)).cloned().collect();
+            meas.panel(ui, "sen", &vis, "", &|x: f64| format!("{:.1} s", x));
+        }
+        self.results_ui.measures.insert("sen", meas);
 
         // Peak temperature per core over the whole run
         let peaks = core_peaks(&self.last_timeline);
