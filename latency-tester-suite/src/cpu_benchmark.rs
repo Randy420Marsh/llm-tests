@@ -1,0 +1,701 @@
+//! CPU benchmark with core affinity testing for P-cores, E-cores, and combined workloads
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::thread;
+use crate::timer::HighResTimer;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuBenchmarkConfig {
+    pub workload_types: Vec<WorkloadType>,
+    pub thread_counts: Vec<usize>,
+    pub affinity_modes: Vec<AffinityMode>,
+    pub duration_seconds: u64,
+    pub warmup_seconds: u64,
+    pub iterations: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkloadType {
+    IntegerAdd,
+    IntegerMul,
+    IntegerDiv,
+    FloatAdd,
+    FloatMul,
+    FloatDiv,
+    FloatFma,
+    VectorAdd,
+    VectorMul,
+    VectorFma,
+    MemoryCopy,
+    MemoryLatency,
+    BranchPrediction,
+    CryptoAes,
+    CryptoSha,
+    MixedWorkload,
+    CompilationSim,    // Simulate compilation workload
+    GameSim,           // Simulate game workload
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AffinityMode {
+    AllCores,          // No affinity, OS scheduler decides
+    PerformanceCores,  // Only P-cores
+    EfficiencyCores,   // Only E-cores
+    SingleCore,        // Single core (iterates through each)
+    HyperThreadPairs,  // HT pairs (logical cores sharing physical)
+    CustomMask(u64),   // Custom affinity mask
+}
+
+impl Default for CpuBenchmarkConfig {
+    fn default() -> Self {
+        let logical_cores = num_cpus::get();
+        let mut thread_counts = vec![1];
+        
+        // Add powers of 2 up to logical cores
+        let mut count = 2;
+        while count <= logical_cores {
+            thread_counts.push(count);
+            count *= 2;
+        }
+        // Add logical core count if not already present
+        if thread_counts.last() != Some(&logical_cores) {
+            thread_counts.push(logical_cores);
+        }
+
+        Self {
+            workload_types: vec![
+                WorkloadType::IntegerAdd,
+                WorkloadType::FloatFma,
+                WorkloadType::VectorFma,
+                WorkloadType::MemoryLatency,
+                WorkloadType::MixedWorkload,
+                WorkloadType::CompilationSim,
+                WorkloadType::GameSim,
+            ],
+            thread_counts,
+            affinity_modes: vec![
+                AffinityMode::AllCores,
+                AffinityMode::PerformanceCores,
+                AffinityMode::EfficiencyCores,
+            ],
+            duration_seconds: 10,
+            warmup_seconds: 2,
+            iterations: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuBenchmarkResult {
+    pub workload: WorkloadType,
+    pub thread_count: usize,
+    pub affinity_mode: AffinityMode,
+    pub core_mask: u64,
+    pub operations_per_second: f64,
+    pub latency_ns: f64,
+    pub instructions_per_cycle: Option<f64>,
+    pub cycles_per_operation: Option<f64>,
+    pub frequency_mhz: u64,
+    pub temperature_c: Option<f32>,
+    pub power_watts: Option<f32>,
+    pub iteration_results: Vec<IterationResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationResult {
+    pub iteration: u32,
+    pub operations: u64,
+    pub duration_ns: u64,
+    pub frequency_mhz: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuBenchmarkSummary {
+    pub results: Vec<CpuBenchmarkResult>,
+    pub config: CpuBenchmarkConfig,
+    pub system_info: crate::system_info::SystemInfo,
+    pub timestamp: String,
+    pub core_topology: CoreTopology,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreTopology {
+    pub total_logical: usize,
+    pub total_physical: usize,
+    pub performance_cores: Vec<usize>,  // Logical core IDs for P-cores
+    pub efficiency_cores: Vec<usize>,   // Logical core IDs for E-cores
+    pub ht_pairs: Vec<(usize, usize)>,  // Pairs of logical cores sharing physical
+    pub cache_topology: Vec<CacheLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheLevel {
+    pub level: u32,
+    pub size_kb: usize,
+    pub associativity: u32,
+    pub line_size: usize,
+    pub shared_by: Vec<usize>, // Logical cores sharing this cache
+}
+
+pub struct CpuBenchmark {
+    config: CpuBenchmarkConfig,
+    timer: HighResTimer,
+    topology: CoreTopology,
+}
+
+impl CpuBenchmark {
+    pub fn new(config: CpuBenchmarkConfig) -> Result<Self> {
+        let topology = Self::detect_topology()?;
+        Ok(Self {
+            config,
+            timer: HighResTimer::new(),
+            topology,
+        })
+    }
+
+    fn detect_topology() -> Result<CoreTopology> {
+        let logical = num_cpus::get();
+        let physical = Self::detect_physical_cores(logical);
+        
+        // Detect P-cores and E-cores on Intel hybrid
+        let (p_cores, e_cores, ht_pairs) = Self::detect_hybrid_topology();
+        
+        Ok(CoreTopology {
+            total_logical: logical,
+            total_physical: physical,
+            performance_cores: p_cores,
+            efficiency_cores: e_cores,
+            ht_pairs,
+            cache_topology: Vec::new(), // Would need platform-specific detection
+        })
+    }
+
+    /// Best-effort physical core count via CPUID leaf 1
+    /// (EBX 16:23 = logical siblings, EDX bit 28 = SMT/HT enabled).
+    fn detect_physical_cores(logical: usize) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use raw_cpuid::CpuId;
+            let cpuid = CpuId::new();
+            if let Ok((_, ebx, _ecx, edx)) = cpuid.get_cpuid_leaf(1) {
+                let siblings = ((ebx >> 16) & 0xFF) as usize;
+                let smt = ((edx >> 28) & 1) == 1;
+                if siblings > 0 {
+                    return if smt {
+                        siblings.div_ceil(2)
+                    } else {
+                        siblings.min(logical).max(1)
+                    };
+                }
+            }
+        }
+        logical
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn detect_hybrid_topology() -> (Vec<usize>, Vec<usize>, Vec<(usize, usize)>) {
+        // Intel convention (Alder/Raptor/Arrow Lake): logical thread IDs 0..p are the
+        // P-core threads (HT-interleaved where SMT exists), followed by E-core threads.
+        let logical = num_cpus::get();
+        let physical = Self::detect_physical_cores(logical);
+        let (p_threads, e_threads) = hybrid_thread_counts();
+
+        let p_end = p_threads.min(logical);
+        let p_cores: Vec<usize> = (0..p_end).collect();
+        let e_cores: Vec<usize> = if e_threads > 0 {
+            (p_end..logical).collect()
+        } else {
+            Vec::new()
+        };
+
+        // HT pairs exist only when SMT is enabled (more logical threads than physical cores),
+        // and Intel interleaves HT pairs within the P-core range: (0,1), (2,3), ...
+        let mut ht_pairs = Vec::new();
+        if logical > physical {
+            for i in (0..p_end.max(2)).step_by(2) {
+                if i + 1 < p_end {
+                    ht_pairs.push((i, i + 1));
+                }
+            }
+        }
+
+        (p_cores, e_cores, ht_pairs)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect_hybrid_topology() -> (Vec<usize>, Vec<usize>, Vec<(usize, usize)>) {
+        let logical = num_cpus::get();
+        let mut p_cores = Vec::new();
+        let mut ht_pairs = Vec::new();
+        
+        for i in 0..logical {
+            p_cores.push(i);
+        }
+        for i in (0..logical).step_by(2) {
+            if i + 1 < logical {
+                ht_pairs.push((i, i + 1));
+            }
+        }
+        
+        (p_cores, Vec::new(), ht_pairs)
+    }
+
+    pub fn run(&mut self) -> Result<CpuBenchmarkSummary> {
+        let system_info = crate::system_info::collect_system_info()?;
+        let mut results = Vec::new();
+
+        for &workload in &self.config.workload_types {
+            for &thread_count in &self.config.thread_counts {
+                for &affinity_mode in &self.config.affinity_modes {
+                    // Skip invalid combinations
+                    if !self.is_valid_combination(thread_count, affinity_mode) {
+                        continue;
+                    }
+
+                    let result = self.run_workload(workload, thread_count, affinity_mode)?;
+                    results.push(result);
+                }
+            }
+        }
+
+        Ok(CpuBenchmarkSummary {
+            results,
+            config: self.config.clone(),
+            system_info,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            core_topology: self.topology.clone(),
+        })
+    }
+
+    fn is_valid_combination(&self, thread_count: usize, affinity_mode: AffinityMode) -> bool {
+        match affinity_mode {
+            AffinityMode::PerformanceCores => {
+                thread_count <= self.topology.performance_cores.len()
+            }
+            AffinityMode::EfficiencyCores => {
+                thread_count <= self.topology.efficiency_cores.len()
+            }
+            AffinityMode::SingleCore => thread_count == 1,
+            AffinityMode::HyperThreadPairs => {
+                thread_count <= self.topology.ht_pairs.len() * 2
+            }
+            _ => thread_count <= self.topology.total_logical,
+        }
+    }
+
+    fn run_workload(
+        &mut self,
+        workload: WorkloadType,
+        thread_count: usize,
+        affinity_mode: AffinityMode,
+    ) -> Result<CpuBenchmarkResult> {
+        let core_mask = self.get_affinity_mask(thread_count, affinity_mode);
+        let mut iteration_results = Vec::new();
+        let mut total_ops = 0u64;
+        let mut total_time_ns = 0u64;
+
+        for iter in 0..self.config.iterations {
+            // Warmup
+            if iter == 0 {
+                self.run_workload_internal(workload, thread_count, core_mask, affinity_mode, self.config.warmup_seconds)?;
+            }
+            
+            // Actual measurement
+            let (ops, duration_ns, freq) = self.run_workload_internal(
+                workload,
+                thread_count,
+                core_mask,
+                affinity_mode,
+                self.config.duration_seconds
+            )?;
+            
+            iteration_results.push(IterationResult {
+                iteration: iter,
+                operations: ops,
+                duration_ns,
+                frequency_mhz: freq,
+            });
+            
+            total_ops += ops;
+            total_time_ns += duration_ns;
+        }
+
+        let avg_ops_per_sec = (total_ops as f64 / total_time_ns as f64) * 1_000_000_000.0;
+        let avg_latency_ns = total_time_ns as f64 / total_ops as f64;
+        let avg_freq = iteration_results.iter().map(|r| r.frequency_mhz).sum::<u64>() / iteration_results.len() as u64;
+
+        Ok(CpuBenchmarkResult {
+            workload,
+            thread_count,
+            affinity_mode,
+            core_mask,
+            operations_per_second: avg_ops_per_sec,
+            latency_ns: avg_latency_ns,
+            instructions_per_cycle: None, // Would need PMU
+            cycles_per_operation: None,
+            frequency_mhz: avg_freq,
+            temperature_c: None,
+            power_watts: None,
+            iteration_results,
+        })
+    }
+
+    fn get_affinity_mask(&self, thread_count: usize, affinity_mode: AffinityMode) -> u64 {
+        match affinity_mode {
+            AffinityMode::AllCores => {
+                if thread_count >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << thread_count) - 1
+                }
+            }
+            AffinityMode::PerformanceCores => {
+                let mut mask = 0u64;
+                for &core in self.topology.performance_cores.iter().take(thread_count) {
+                    if core < 64 {
+                        mask |= 1u64 << core;
+                    }
+                }
+                mask
+            }
+            AffinityMode::EfficiencyCores => {
+                let mut mask = 0u64;
+                for &core in self.topology.efficiency_cores.iter().take(thread_count) {
+                    if core < 64 {
+                        mask |= 1u64 << core;
+                    }
+                }
+                mask
+            }
+            AffinityMode::SingleCore => {
+                // Will be set per-thread in run_workload_internal
+                1
+            }
+            AffinityMode::HyperThreadPairs => {
+                let mut mask = 0u64;
+                for (i, &(core1, core2)) in self.topology.ht_pairs.iter().enumerate() {
+                    if i >= thread_count / 2 {
+                        break;
+                    }
+                    if core1 < 64 { mask |= 1u64 << core1; }
+                    if core2 < 64 { mask |= 1u64 << core2; }
+                }
+                mask
+            }
+            AffinityMode::CustomMask(mask) => mask,
+        }
+    }
+
+    fn run_workload_internal(
+        &self,
+        workload: WorkloadType,
+        thread_count: usize,
+        core_mask: u64,
+        affinity_mode: AffinityMode,
+        duration_seconds: u64,
+    ) -> Result<(u64, u64, u64)> {
+        let mut handles = Vec::new();
+        let duration_ns = duration_seconds * 1_000_000_000;
+        let start_time = self.timer.now_ticks();
+        let target_end = start_time + (duration_ns as u128 * self.timer.frequency() as u128 / 1_000_000_000) as u64;
+
+        for i in 0..thread_count {
+            let workload = workload;
+            let timer = HighResTimer::new();
+            let target_end = target_end;
+            let core_id = self.get_core_for_thread(i, thread_count, core_mask, affinity_mode);
+            
+            let handle = thread::spawn(move || {
+                // Set thread affinity
+                #[cfg(target_os = "windows")]
+                {
+                    use windows::Win32::System::Threading::*;
+                    let handle = unsafe { GetCurrentThread() };
+                    let mask = 1u64 << core_id;
+                    unsafe { SetThreadAffinityMask(handle, mask as usize); }
+                }
+                
+                #[cfg(target_os = "linux")]
+                {
+                    use libc::{cpu_set_t, CPU_SET, CPU_ZERO, sched_setaffinity};
+                    let mut cpuset: cpu_set_t = unsafe { std::mem::zeroed() };
+                    unsafe { CPU_ZERO(&mut cpuset) };
+                    unsafe { CPU_SET(core_id, &mut cpuset) };
+                    unsafe { sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &cpuset) };
+                }
+
+                let mut ops = 0u64;
+                while timer.now_ticks() < target_end {
+                    ops = ops.wrapping_add(Self::execute_workload(workload, ops));
+                }
+                ops
+            });
+            handles.push(handle);
+        }
+
+        let mut total_ops = 0u64;
+        for handle in handles {
+            total_ops += handle.join().unwrap();
+        }
+
+        let end_time = self.timer.now_ticks();
+        let elapsed_ticks = end_time - start_time;
+        let elapsed_ns = (elapsed_ticks as u128 * 1_000_000_000 / self.timer.frequency() as u128) as u64;
+        
+        // Get average frequency (simplified)
+        let freq = self.get_current_frequency();
+
+        Ok((total_ops, elapsed_ns, freq))
+    }
+
+    fn get_core_for_thread(&self, thread_idx: usize, thread_count: usize, core_mask: u64, affinity_mode: AffinityMode) -> usize {
+        match affinity_mode {
+            AffinityMode::SingleCore => {
+                // Round-robin through available cores
+                let available: Vec<usize> = (0..64).filter(|&i| (core_mask >> i) & 1 == 1).collect();
+                available[thread_idx % available.len()]
+            }
+            _ => {
+                // Distribute threads across available cores in mask
+                let available: Vec<usize> = (0..64).filter(|&i| (core_mask >> i) & 1 == 1).collect();
+                if available.is_empty() { 0 } else { available[thread_idx % available.len()] }
+            }
+        }
+    }
+
+    fn get_current_frequency(&self) -> u64 {
+        use sysinfo::{System};
+        let mut sys = System::new();
+        sys.refresh_cpu();
+        sys.global_cpu_info().frequency()
+    }
+
+    fn execute_workload(workload: WorkloadType, seed: u64) -> u64 {
+        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        
+        match workload {
+            WorkloadType::IntegerAdd => {
+                for _ in 0..1000 {
+                    x = x.wrapping_add(0x123456789ABCDEF);
+                }
+            }
+            WorkloadType::IntegerMul => {
+                for _ in 0..1000 {
+                    x = x.wrapping_mul(0x123456789ABCDEF);
+                }
+            }
+            WorkloadType::IntegerDiv => {
+                for _ in 0..1000 {
+                    x = x.wrapping_div(0x123456789ABCDEF | 1);
+                }
+            }
+            WorkloadType::FloatAdd => {
+                let mut f = x as f64;
+                for _ in 0..1000 {
+                    f += 1.23456789;
+                }
+                x = f as u64;
+            }
+            WorkloadType::FloatMul => {
+                let mut f = x as f64;
+                for _ in 0..1000 {
+                    f *= 1.23456789;
+                }
+                x = f as u64;
+            }
+            WorkloadType::FloatDiv => {
+                let mut f = x as f64;
+                for _ in 0..1000 {
+                    f /= 1.23456789;
+                }
+                x = f as u64;
+            }
+            WorkloadType::FloatFma => {
+                let mut f = x as f64;
+                for _ in 0..1000 {
+                    f = f.mul_add(1.23456789, 9.87654321);
+                }
+                x = f as u64;
+            }
+            WorkloadType::VectorAdd => {
+                // Simulate AVX2 256-bit vector add (4 x f64)
+                let mut v = [x as f64; 4];
+                for _ in 0..250 {
+                    v[0] += 1.0; v[1] += 2.0; v[2] += 3.0; v[3] += 4.0;
+                }
+                x = v[0] as u64;
+            }
+            WorkloadType::VectorMul => {
+                let mut v = [x as f64; 4];
+                for _ in 0..250 {
+                    v[0] *= 1.1; v[1] *= 1.2; v[2] *= 1.3; v[3] *= 1.4;
+                }
+                x = v[0] as u64;
+            }
+            WorkloadType::VectorFma => {
+                let mut v = [x as f64; 4];
+                for _ in 0..250 {
+                    v[0] = v[0].mul_add(1.1, 2.2);
+                    v[1] = v[1].mul_add(1.2, 2.3);
+                    v[2] = v[2].mul_add(1.3, 2.4);
+                    v[3] = v[3].mul_add(1.4, 2.5);
+                }
+                x = v[0] as u64;
+            }
+            WorkloadType::MemoryCopy => {
+                let mut buf = [0u8; 64];
+                for _ in 0..1000 {
+                    buf.copy_from_slice(&buf);
+                }
+                x = buf[0] as u64;
+            }
+            WorkloadType::MemoryLatency => {
+                let mut ptr = &x as *const u64;
+                for _ in 0..1000 {
+                    x = unsafe { *ptr };
+                    ptr = &x as *const u64;
+                }
+            }
+            WorkloadType::BranchPrediction => {
+                for i in 0..1000 {
+                    if (x & 1) == 0 {
+                        x = x.wrapping_add(i);
+                    } else {
+                        x = x.wrapping_sub(i);
+                    }
+                }
+            }
+            WorkloadType::CryptoAes => {
+                // Simplified AES-like operations
+                for _ in 0..1000 {
+                    x ^= x.rotate_left(13);
+                    x = x.wrapping_mul(0x9E3779B97F4A7C15);
+                    x ^= x.rotate_right(7);
+                }
+            }
+            WorkloadType::CryptoSha => {
+                // Simplified SHA-like operations
+                for _ in 0..1000 {
+                    x = x.wrapping_add(0x5A827999);
+                    x ^= x.rotate_right(2);
+                    x = x.wrapping_mul(0x6ED9EBA1);
+                }
+            }
+            WorkloadType::MixedWorkload => {
+                for i in 0..1000 {
+                    match i % 6 {
+                        0 => x = x.wrapping_add(0x123456789ABCDEF),
+                        1 => x = x.wrapping_mul(0x123456789ABCDEF),
+                        2 => {
+                            let mut f = x as f64;
+                            f = f.mul_add(1.23456789, 9.87654321);
+                            x = f as u64;
+                        }
+                        3 => x ^= x.rotate_left(13),
+                        4 => x = x.wrapping_div(0x123456789ABCDEF | 1),
+                        _ => {
+                            let mut ptr = &x as *const u64;
+                            x = unsafe { *ptr };
+                        }
+                    }
+                }
+            }
+            WorkloadType::CompilationSim => {
+                // Simulate compilation: lots of pointer chasing, branching, memory allocation
+                let mut nodes = Vec::with_capacity(1000);
+                for i in 0..1000 {
+                    nodes.push(Box::new(i as u64));
+                }
+                for _ in 0..100 {
+                    for node in &nodes {
+                        x = x.wrapping_add(**node);
+                    }
+                }
+            }
+            WorkloadType::GameSim => {
+                // Simulate game workload: math, physics, AI
+                let mut pos = [x as f32, 0.0, 0.0];
+                let mut vel = [1.0, 2.0, 3.0];
+                for _ in 0..1000 {
+                    // Physics update
+                    pos[0] += vel[0] * 0.016;
+                    pos[1] += vel[1] * 0.016;
+                    pos[2] += vel[2] * 0.016;
+                    
+                    // Collision detection (simplified)
+                    if pos[0] > 100.0 { vel[0] = -vel[0]; }
+                    if pos[1] > 100.0 { vel[1] = -vel[1]; }
+                    if pos[2] > 100.0 { vel[2] = -vel[2]; }
+                    
+                    // AI decision
+                    x = x.wrapping_add((pos[0] * 1000.0) as u64);
+                }
+            }
+        }
+        
+        x
+    }
+}
+
+/// Returns `(p_thread_count, e_thread_count)` for Intel hybrid CPUs.
+///
+/// Uses CPUID leaf 7 (ECX bit 15 = HYBRID flag) and leaf 0x1B (EAX & 0xFF
+/// = logical P-core thread count, Intel convention: P threads come first).
+/// Non-hybrid or unknown CPUs report `(logical, 0)`.
+pub fn hybrid_thread_counts() -> (usize, usize) {
+    let logical = num_cpus::get();
+    #[cfg(target_arch = "x86_64")]
+    {
+        use raw_cpuid::CpuId;
+        let cpuid = CpuId::new();
+        let hybrid = matches!(
+            cpuid.get_cpuid_leaf(7),
+            Ok((_, _, ecx, _)) if ecx & (1 << 15) != 0
+        );
+        if hybrid {
+            if let Ok((eax, _, _, _)) = cpuid.get_cpuid_leaf(0x1B) {
+                let p_threads = (eax & 0xFF) as usize;
+                if p_threads > 0 && p_threads <= logical {
+                    return (p_threads, logical - p_threads);
+                }
+            }
+        }
+    }
+    (logical, 0)
+}
+
+/// Quick CPU test for GUI
+pub fn quick_cpu_test(workload: WorkloadType, thread_count: usize, duration_sec: u64) -> Result<f64> {
+    let config = CpuBenchmarkConfig {
+        workload_types: vec![workload],
+        thread_counts: vec![thread_count],
+        affinity_modes: vec![AffinityMode::AllCores],
+        duration_seconds: duration_sec,
+        warmup_seconds: 1,
+        iterations: 3,
+    };
+    
+    let mut bench = CpuBenchmark::new(config)?;
+    let summary = bench.run()?;
+    
+    Ok(summary.results[0].operations_per_second)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_topology_detection() {
+        let topology = CpuBenchmark::detect_topology().unwrap();
+        assert!(topology.total_logical > 0);
+        assert!(topology.total_physical > 0);
+    }
+
+    #[test]
+    fn test_integer_add() {
+        let result = CpuBenchmark::execute_workload(WorkloadType::IntegerAdd, 0);
+        assert_ne!(result, 0);
+    }
+}
