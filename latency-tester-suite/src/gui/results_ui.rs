@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use egui::{Color32, RichText, Ui};
-use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoints, Points};
+use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoints, Points, Polygon};
 use std::collections::{BTreeMap, HashSet};
 
 use super::input_ui::RunRecord;
@@ -12,7 +12,7 @@ use crate::cpu_benchmark::CpuBenchmarkResult;
 use crate::gpu_benchmark::GpuBenchmarkResult;
 use crate::input_latency::InputLatencyResult;
 use crate::memory_benchmark::MemoryBenchmarkResult;
-use crate::sensors::{Snapshot, Telemetry};
+use crate::sensors::{Phase, SensorKind, Snapshot, Telemetry};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) enum Dataset {
@@ -59,10 +59,12 @@ pub(super) struct Row {
 /// (key, label, unit) for every metric a dataset can hold
 pub(super) type Metric = (&'static str, &'static str, &'static str);
 
-const TELEMETRY_METRICS: [Metric; 12] = [
+const TELEMETRY_METRICS: [Metric; 14] = [
     ("cpu_temp_max", "CPU temp (max)", "°C"),
     ("cpu_temp_avg", "CPU temp (avg)", "°C"),
     ("hottest_core", "Hottest core", "°C"),
+    ("coolest_core", "Coolest core", "°C"),
+    ("core_temp_avg", "Core temp (avg of all cores)", "°C"),
     ("cpu_freq", "CPU clock (avg)", "MHz"),
     ("cpu_usage", "CPU load (avg)", "%"),
     ("ram_used", "RAM used (max)", "MB"),
@@ -134,7 +136,9 @@ fn telemetry_values(t: &Telemetry, values: &mut BTreeMap<&'static str, f64>) {
     }
     put(values, "cpu_temp_max", t.cpu_temp_max_c);
     put(values, "cpu_temp_avg", t.cpu_temp_avg_c);
-    put(values, "hottest_core", t.core_temp_max_c.iter().map(|c| c.1).fold(None, |m: Option<f32>, x| Some(m.map_or(x, |m| m.max(x)))));
+    put(values, "hottest_core", t.hottest_core().map(|c| c.1));
+    put(values, "coolest_core", t.coolest_core().map(|c| c.1));
+    put(values, "core_temp_avg", t.core_temp_avg_c);
     put(values, "cpu_freq", t.cpu_freq_avg_mhz);
     put(values, "cpu_usage", t.cpu_usage_avg_pct);
     put(values, "ram_used", t.ram_used_max_mb);
@@ -329,6 +333,8 @@ pub(super) struct ResultsUi {
     pub log_y: bool,
     /// Sensors chart: which group of lines to draw
     pub sensor_group: SensorGroup,
+    /// Opacity of the per-test background bands on the sensors chart (0 = off)
+    pub phase_opacity: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -336,7 +342,21 @@ pub(super) enum SensorGroup {
     Temperatures,
     Clocks,
     Load,
+    Power,
+    Fans,
+    Voltages,
     Memory,
+}
+
+/// Background colour of each kind of test on the sensors timeline
+pub(super) fn phase_color(kind: &str) -> Color32 {
+    match kind {
+        "memory" => Color32::from_rgb(229, 72, 77),
+        "cpu" => Color32::from_rgb(62, 139, 255),
+        "gpu" => Color32::from_rgb(48, 192, 112),
+        "input" => Color32::from_rgb(240, 180, 41),
+        _ => Color32::from_rgb(154, 163, 178),
+    }
 }
 
 impl ResultsUi {
@@ -352,6 +372,7 @@ impl ResultsUi {
             zero_y: true,
             log_y: false,
             sensor_group: SensorGroup::Temperatures,
+            phase_opacity: 0.18,
         }
     }
 
@@ -375,7 +396,18 @@ impl ResultsUi {
 }
 
 fn format_value(v: f64, unit: &str) -> String {
-    let s = if v.fract() == 0.0 && v.abs() < 1e9 { format!("{:.0}", v) } else if v.abs() >= 1000.0 { format!("{:.0}", v) } else if v.abs() >= 10.0 { format!("{:.1}", v) } else { format!("{:.2}", v) };
+    let a = v.abs();
+    let s = if (v.fract() == 0.0 && a < 1e9) || a >= 1000.0 {
+        format!("{:.0}", v)
+    } else if a >= 10.0 {
+        format!("{:.1}", v)
+    } else if a >= 0.1 {
+        format!("{:.2}", v)
+    } else {
+        // small values keep three significant digits instead of turning into 0.00
+        let digits = (2 - a.log10().floor() as i32).clamp(3, 9) as usize;
+        format!("{:.*}", digits, v)
+    };
     if unit.is_empty() { s } else { format!("{} {}", s, unit) }
 }
 
@@ -644,6 +676,9 @@ impl LatencyTesterApp {
                 (SensorGroup::Temperatures, "Temperatures"),
                 (SensorGroup::Clocks, "Clocks"),
                 (SensorGroup::Load, "Load"),
+                (SensorGroup::Power, "Power"),
+                (SensorGroup::Fans, "Fans"),
+                (SensorGroup::Voltages, "Voltages / currents"),
                 (SensorGroup::Memory, "RAM / VRAM"),
             ] {
                 ui.selectable_value(&mut self.results_ui.sensor_group, g, name);
@@ -672,11 +707,44 @@ impl LatencyTesterApp {
                 }
             });
         });
+        // per-test background bands
+        let phases: Vec<Phase> = self.last_phases.clone();
+        if !phases.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Test backgrounds:");
+                for (k, name) in [("input", "Input"), ("memory", "Memory"), ("cpu", "CPU"), ("gpu", "GPU")] {
+                    let n = phases.iter().filter(|p| p.kind == k).count();
+                    if n > 0 {
+                        ui.label(RichText::new(format!("■ {} ({})", name, n)).color(phase_color(k)));
+                    }
+                }
+                ui.add(egui::Slider::new(&mut self.results_ui.phase_opacity, 0.0..=0.6).text("opacity"));
+            });
+        }
+        let visible: Vec<&(String, Vec<[f64; 2]>)> =
+            lines.iter().filter(|(n, _)| !self.results_ui.series_hidden(Dataset::Sensors, n)).collect();
+        let ys = visible.iter().flat_map(|(_, p)| p.iter().map(|q| q[1]));
+        let (lo, hi) = ys.fold((f64::MAX, f64::MIN), |(a, b), y| (a.min(y), b.max(y)));
+        let pad = if hi > lo { (hi - lo) * 0.05 } else { 1.0 };
+        let (band_lo, band_hi) = (lo - pad, hi + pad);
+        let opacity = self.results_ui.phase_opacity;
         Plot::new("sensor_plot")
-            .height(320.0)
+            .height(420.0)
             .legend(Legend::default())
             .x_axis_label("seconds since the test started")
             .show(ui, |plot_ui| {
+                if opacity > 0.0 && band_lo < band_hi {
+                    for p in &phases {
+                        let (x0, x1) = (p.start_ms as f64 / 1000.0, (p.end_ms.max(p.start_ms + 50)) as f64 / 1000.0);
+                        let c = phase_color(&p.kind);
+                        let fill = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (opacity * 255.0) as u8);
+                        plot_ui.polygon(
+                            Polygon::new(PlotPoints::from(vec![[x0, band_lo], [x1, band_lo], [x1, band_hi], [x0, band_hi]]))
+                                .fill_color(fill)
+                                .stroke(egui::Stroke::NONE),
+                        );
+                    }
+                }
                 for (i, (name, pts)) in lines.iter().enumerate() {
                     if self.results_ui.series_hidden(Dataset::Sensors, name) {
                         continue;
@@ -728,12 +796,26 @@ pub(super) fn sensor_lines(tl: &[Snapshot], group: SensorGroup) -> Vec<(String, 
                 add("CPU load %", x, avg_f32(&s.core_usage_pct));
                 add("Busiest CPU %", x, s.core_usage_pct.iter().copied().reduce(f32::max));
                 add("GPU load %", x, s.gpu.as_ref().and_then(|g| g.util_pct));
+            }
+            SensorGroup::Power => {
                 add("GPU power W", x, s.gpu.as_ref().and_then(|g| g.power_w));
             }
+            SensorGroup::Fans | SensorGroup::Voltages => {}
             SensorGroup::Memory => {
                 add("RAM used MB", x, Some(s.ram_used_mb));
                 add("VRAM used MB", x, s.gpu.as_ref().and_then(|g| g.vram_used_mb));
             }
+        }
+        // every extra sensor (board, VRM, DIMM, drives, fans, PSU, RAPL ...) in the group of its unit
+        let kinds: &[SensorKind] = match group {
+            SensorGroup::Temperatures => &[SensorKind::Temp],
+            SensorGroup::Power => &[SensorKind::Power],
+            SensorGroup::Fans => &[SensorKind::Fan],
+            SensorGroup::Voltages => &[SensorKind::Voltage, SensorKind::Current],
+            _ => &[],
+        };
+        for r in s.sensors.iter().filter(|r| kinds.contains(&r.kind)) {
+            add(&format!("{} {}", r.name, r.kind.unit()), x, Some(r.value));
         }
     }
     lines.into_iter().collect()
@@ -758,6 +840,16 @@ pub(super) fn core_peaks(tl: &[Snapshot]) -> Vec<(usize, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_values_keep_significant_digits() {
+        assert_eq!(format_value(0.00042, "ms"), "0.000420 ms");
+        assert_eq!(format_value(0.036, ""), "0.0360");
+        assert_eq!(format_value(0.5, ""), "0.50");
+        assert_eq!(format_value(12.34, ""), "12.3");
+        assert_eq!(format_value(5000.0, "MHz"), "5000 MHz");
+        assert_eq!(format_value(0.0, ""), "0");
+    }
     use crate::cpu_benchmark::{AffinityMode, WorkloadType};
     use crate::memory_benchmark::AccessPattern;
     use crate::sensors::GpuSensors;
@@ -809,6 +901,7 @@ mod tests {
     #[test]
     fn memory_rows_include_telemetry_and_log_size_axis() {
         let r = MemoryBenchmarkResult {
+            passes_per_run: 1,
             size: 1 << 20,
             pattern: AccessPattern::PointerChase,
             thread_count: 2,
@@ -904,6 +997,7 @@ mod tests {
             ram_used_mb: 100.0,
             ram_total_mb: 1000.0,
             gpu: Some(GpuSensors { temp_c: Some(40.0), vram_used_mb: Some(512.0), ..Default::default() }),
+            sensors: Vec::new(),
         };
         let tl = vec![snap(0, Some(50.0), &[(0, 50.0), (1, 60.0)]), snap(1000, Some(55.0), &[(0, 58.0), (1, 52.0)])];
         let temps = sensor_lines(&tl, SensorGroup::Temperatures);

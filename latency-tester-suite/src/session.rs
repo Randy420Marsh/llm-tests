@@ -10,7 +10,7 @@ use crate::input_latency::InputLatencySummary;
 use crate::input_test::RunSummary;
 use crate::memory_benchmark::{MemoryBenchmarkConfig, MemoryBenchmarkResult};
 use crate::rig::RigCalibration;
-use crate::sensors::Snapshot;
+use crate::sensors::{Phase, Snapshot};
 
 /// Which parts of the session to save
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,8 +57,12 @@ pub struct SessionData<'a> {
     /// Manual click / key-press runs with the calibration that was active for each
     pub trials: &'a [(RunSummary, RigCalibration)],
     pub timeline: &'a [Snapshot],
+    /// Every test that ran while the timeline was recorded (coloured bands in the report)
+    pub phases: &'a [Phase],
     pub sensor_notes: &'a [String],
     pub virtualization: Option<Value>,
+    /// Clock source and timer resolution (crate::timer_info)
+    pub timers: Option<Value>,
     pub calibration: Option<&'a RigCalibration>,
     /// Configs of further memory / CPU passes of a combined run (e.g. "each core on its own"); the
     /// results of all passes are in `memory` / `cpu` and say which cores they ran on
@@ -91,6 +95,9 @@ pub fn downsample_timeline(tl: &[Snapshot], max_points: usize) -> Vec<Value> {
                 "gpu_util_pct": s.gpu.as_ref().and_then(|g| g.util_pct),
                 "gpu_power_w": s.gpu.as_ref().and_then(|g| g.power_w),
                 "vram_used_mb": s.gpu.as_ref().and_then(|g| g.vram_used_mb),
+                "cpu_power_w": s.cpu_package_power_w(),
+                // every other sensor by name (board, VRM, DIMM, drive temperatures, fans, power, voltages)
+                "sensors": s.sensors.iter().map(|r| (r.name.clone(), json!(r.value))).collect::<Map<String, Value>>(),
             })
         })
         .collect()
@@ -105,6 +112,17 @@ pub fn core_peaks(tl: &[Snapshot]) -> Vec<(usize, f32)> {
         }
     }
     m.into_iter().collect()
+}
+
+/// name -> {kind, unit} for every extra sensor seen in the timeline
+pub fn sensor_kinds(tl: &[Snapshot]) -> Map<String, Value> {
+    let mut m = Map::new();
+    for s in tl {
+        for r in &s.sensors {
+            m.entry(r.name.clone()).or_insert_with(|| json!({ "kind": r.kind, "unit": r.kind.unit() }));
+        }
+    }
+    m
 }
 
 fn to_value<T: serde::Serialize>(t: &T) -> Value {
@@ -173,6 +191,13 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
                 "samples_recorded": data.timeline.len(),
                 "duration_s": data.timeline.last().map(|s| s.t_ms as f64 / 1000.0),
                 "core_peak_temps_c": core_peaks(data.timeline),
+                "sensor_kinds": sensor_kinds(data.timeline),
+                "phases": data.phases.iter().map(|p| json!({
+                    "kind": p.kind,
+                    "label": p.label,
+                    "t0_s": p.start_ms as f64 / 1000.0,
+                    "t1_s": p.end_ms as f64 / 1000.0,
+                })).collect::<Vec<_>>(),
                 "timeline": downsample_timeline(data.timeline, MAX_TIMELINE_POINTS),
             }),
         );
@@ -180,6 +205,9 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
     if scope == Scope::Everything {
         if let Some(v) = &data.run_info {
             config.insert("run_all".into(), v.clone());
+        }
+        if let Some(v) = &data.timers {
+            results.insert("timers".into(), v.clone());
         }
         if let Some(v) = &data.virtualization {
             results.insert("virtualization".into(), v.clone());
@@ -270,6 +298,13 @@ pub fn csv_files(data: &SessionData) -> Vec<(String, String)> {
     }
     add("input_trials.csv", trials);
     add("sensors.csv", downsample_timeline(data.timeline, data.timeline.len().max(1)));
+    add(
+        "phases.csv",
+        data.phases
+            .iter()
+            .map(|p| json!({ "kind": p.kind, "test": p.label, "start_s": p.start_ms as f64 / 1000.0, "end_s": p.end_ms as f64 / 1000.0 }))
+            .collect(),
+    );
     files
 }
 
@@ -283,6 +318,7 @@ mod tests {
 
     fn mem_result(size: usize) -> MemoryBenchmarkResult {
         MemoryBenchmarkResult {
+            passes_per_run: 1,
             size,
             pattern: AccessPattern::RandomRead,
             thread_count: 1,
@@ -331,6 +367,7 @@ mod tests {
             ram_used_mb: 1000.0,
             ram_total_mb: 64000.0,
             gpu: Some(GpuSensors { name: "g".into(), temp_c: Some(40.0), vram_used_mb: Some(500.0), ..Default::default() }),
+            sensors: vec![crate::sensors::SensorReading { name: "nct6798: VRM MOS".into(), kind: crate::sensors::SensorKind::Temp, value: 61.5 }, crate::sensors::SensorReading { name: "RAPL: package-0".into(), kind: crate::sensors::SensorKind::Power, value: 88.0 }],
         }
     }
 
@@ -371,6 +408,10 @@ mod tests {
         // sensors
         assert_eq!(res["sensors"]["core_peak_temps_c"][1][0], 1);
         assert_eq!(res["sensors"]["timeline"].as_array().unwrap().len(), 4);
+        // every extra sensor is kept per point, with its unit, and CPU package power is picked out
+        assert_eq!(res["sensors"]["timeline"][0]["sensors"]["nct6798: VRM MOS"], 61.5);
+        assert_eq!(res["sensors"]["timeline"][0]["cpu_power_w"], 88.0);
+        assert_eq!(res["sensors"]["sensor_kinds"]["RAPL: package-0"]["unit"], "W");
     }
 
     #[test]

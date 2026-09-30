@@ -87,6 +87,7 @@ impl CpuUi {
             duration_seconds: self.duration_s.max(1),
             warmup_seconds: self.warmup_s,
             iterations: self.iterations.max(1),
+            core_by_core: self.cores.core_by_core,
         })
     }
 }
@@ -124,7 +125,10 @@ pub(super) fn progress_panel(ui: &mut Ui, p: &RunProgress, running: bool) {
     }
     ui.add_space(6.0);
     ui.group(|ui| {
-        let elapsed = p.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+        // `running` only says some task is busy (during "run all" that is always true): this suite
+        // itself is live only until all its tests are done or it was marked finished
+        let running = running && p.active();
+        let elapsed = p.elapsed_s();
         let eta = if running && p.done > 0 {
             format!(" · ETA ~{}", fmt_duration(elapsed / p.done as f64 * (p.total - p.done) as f64))
         } else {
@@ -151,6 +155,14 @@ impl LatencyTesterApp {
         if let Some(old) = self.sampler.take() {
             old.stop();
         }
+        // Keep the app's own threads on one quiet core while tests run (moved out of the way of
+        // every pinned test by the benchmarks)
+        if !crate::app_core::is_active() {
+            if let Some(core) = crate::app_core::reserve() {
+                crate::app_core::apply_gui();
+                self.log(&format!("App threads moved to logical CPU {} while tests run (the least busy, furthest core)", core));
+            }
+        }
         let s = Sampler::start(Duration::from_millis(500));
         self.sampler = Some(s.clone());
         self.sampler_active = true;
@@ -163,9 +175,18 @@ impl LatencyTesterApp {
             if let Some(s) = &self.sampler {
                 s.stop();
                 self.last_timeline = s.timeline();
+                self.last_phases = s.phases();
                 self.sensor_notes = s.notes();
             }
             self.sampler_active = false;
+            if crate::app_core::is_active() {
+                let moves = crate::app_core::moves();
+                crate::app_core::release();
+                crate::app_core::apply_gui();
+                if moves > 0 {
+                    self.log(&format!("The app moved out of the way of the tested core {} time(s); it may use every core again", moves));
+                }
+            }
         }
     }
 
@@ -338,7 +359,7 @@ impl LatencyTesterApp {
         ui.label(RichText::new("Open the Results & Graphs tab for charts, temperatures and column toggles.").weak().small());
         egui::ScrollArea::horizontal().show(ui, |ui| {
             egui::Grid::new("cpu_results").striped(true).spacing([18.0, 4.0]).show(ui, |ui| {
-                for h in ["Workload", "Threads", "Cores", "Throughput", "Per call", "Clock", "CPU °C (max)", "Hottest core"] {
+                for h in ["Workload", "Threads", "Cores", "Throughput", "Per call", "Clock", "CPU °C (max)", "Hottest core", "Coolest core", "Core avg °C"] {
                     ui.label(RichText::new(h).weak());
                 }
                 ui.end_row();
@@ -350,11 +371,11 @@ impl LatencyTesterApp {
                     ui.label(format!("{:.0} ns", r.latency_ns));
                     ui.label(if r.frequency_mhz > 0 { format!("{} MHz", r.frequency_mhz) } else { "—".into() });
                     ui.label(r.telemetry.cpu_temp_max_c.map(|t| format!("{:.0}", t)).unwrap_or_else(|| "—".into()));
-                    let hot = r.telemetry.core_temp_max_c.iter().cloned().fold(None, |m: Option<(usize, f32)>, c| match m {
-                        Some(x) if x.1 >= c.1 => Some(x),
-                        _ => Some(c),
-                    });
-                    ui.label(hot.map(|(c, t)| format!("core {} · {:.0}", c, t)).unwrap_or_else(|| "—".into()));
+                    // per-core sensors: shown for pinned and all-core (OS decides) runs alike
+                    let core = |c: Option<(usize, f32)>| c.map(|(c, t)| format!("core {} · {:.0}", c, t)).unwrap_or_else(|| "—".into());
+                    ui.label(core(r.telemetry.hottest_core()));
+                    ui.label(core(r.telemetry.coolest_core()));
+                    ui.label(r.telemetry.core_temp_avg_c.map(|t| format!("{:.1}", t)).unwrap_or_else(|| "—".into()));
                     ui.end_row();
                 }
             });

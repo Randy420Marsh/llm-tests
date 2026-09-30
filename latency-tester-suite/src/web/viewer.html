@@ -92,7 +92,8 @@ function humanSize(b) { if (b >= 2**30) return (b/2**30).toFixed(b % 2**30 ? 1 :
 function fmt(v, unit) {
   if (v === null || v === undefined || Number.isNaN(v)) return '—';
   const a = Math.abs(v);
-  const s = Number.isInteger(v) && a < 1e9 ? String(v) : a >= 1000 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : a >= 1 ? v.toFixed(2) : v.toFixed(3);
+  // small values keep three significant digits (0.000123 ms, not 0.000)
+  const s = Number.isInteger(v) && a < 1e9 ? String(v) : a >= 1000 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : a >= 1 ? v.toFixed(2) : a >= 0.1 ? v.toFixed(3) : a === 0 ? '0' : v.toFixed(Math.min(9, 2 - Math.floor(Math.log10(a))));
   return unit ? s + ' ' + unit : s;
 }
 function patternLabel(p) {
@@ -106,7 +107,7 @@ const isPow2 = n => Number.isInteger(n) && n > 0 && n < 2**53 && (n & (n - 1)) =
 // metric catalogues (mirrors the desktop app's Results & Graphs tab)
 // ------------------------------------------------------------------------------------------------
 const TELEMETRY = [
-  ['cpu_temp_max','CPU temp (max)','°C'],['cpu_temp_avg','CPU temp (avg)','°C'],['hottest_core','Hottest core','°C'],
+  ['cpu_temp_max','CPU temp (max)','°C'],['cpu_temp_avg','CPU temp (avg)','°C'],['hottest_core','Hottest core','°C'],['coolest_core','Coolest core','°C'],['core_temp_avg','Core temp (avg of all cores)','°C'],
   ['cpu_freq','CPU clock (avg)','MHz'],['cpu_usage','CPU load (avg)','%'],['ram_used','RAM used (max)','MB'],
   ['gpu_temp','GPU temp (max)','°C'],['gpu_util','GPU load (avg)','%'],['gpu_clock','GPU clock (avg)','MHz'],
   ['gpu_power','GPU power (max)','W'],['vram_used','VRAM used (max)','MB'],['vram_total','VRAM total','MB'],
@@ -116,7 +117,11 @@ function telemetryValues(t) {
   if (!t || !t.samples) return v;
   const put = (k, x) => { if (x !== null && x !== undefined) v[k] = x; };
   put('cpu_temp_max', t.cpu_temp_max_c); put('cpu_temp_avg', t.cpu_temp_avg_c);
-  if (t.core_temp_max_c && t.core_temp_max_c.length) put('hottest_core', Math.max(...t.core_temp_max_c.map(c => c[1])));
+  if (t.core_temp_max_c && t.core_temp_max_c.length) {
+    put('hottest_core', Math.max(...t.core_temp_max_c.map(c => c[1])));
+    put('coolest_core', Math.min(...t.core_temp_max_c.map(c => c[1])));
+  }
+  put('core_temp_avg', t.core_temp_avg_c);
   put('cpu_freq', t.cpu_freq_avg_mhz); put('cpu_usage', t.cpu_usage_avg_pct); put('ram_used', t.ram_used_max_mb);
   put('gpu_temp', t.gpu_temp_max_c); put('gpu_util', t.gpu_util_avg_pct); put('gpu_clock', t.gpu_clock_avg_mhz);
   put('gpu_power', t.gpu_power_max_w); put('vram_used', t.vram_used_max_mb); put('vram_total', t.vram_total_mb);
@@ -125,16 +130,17 @@ function telemetryValues(t) {
 const KINDS = {
   memory: {
     title: 'Memory', logX: true, xLabel: 'buffer size', xFmt: v => humanSize(2 ** v),
-    metrics: [['ns_per_access','Latency / access','ns'],['bandwidth','Bandwidth','GB/s'],['avg_run','Avg run','ms'],['p99_run','p99 run','ms'],['min_run','Best run','ms'],['runs','Runs','']].concat(TELEMETRY),
+    // run times are kept in ns; the column picks ns / µs / ms from its values (see autoTimeUnits)
+    metrics: [['ns_per_access','Latency / access','time'],['bandwidth','Bandwidth','GB/s'],['avg_run','Avg run','time'],['p99_run','p99 run','time'],['min_run','Best run','time'],['runs','Runs',''],['passes','Passes per run','']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map(r => ({
       series: `${patternLabel(r.pattern)} · ${r.thread_count}T` + (r.cores && !String(r.cores).startsWith('All cores') ? ` · ${r.cores}` : ''),
       x: Math.log2(r.size), xLabel: humanSize(r.size),
-      values: Object.assign({ ns_per_access: r.ns_per_access, bandwidth: r.bandwidth_gb_s, avg_run: r.latency_ns/1e6, p99_run: r.percentile_99_ns/1e6, min_run: r.min_latency_ns/1e6, runs: r.iterations }, telemetryValues(r.telemetry)),
+      values: Object.assign({ ns_per_access: r.ns_per_access, bandwidth: r.bandwidth_gb_s, avg_run: r.latency_ns, p99_run: r.percentile_99_ns, min_run: r.min_latency_ns, runs: r.iterations, passes: r.passes_per_run ?? 1 }, telemetryValues(r.telemetry)),
     })); },
   },
   cpu: {
     title: 'CPU',
-    metrics: [['mcalls','Throughput','M calls/s'],['ns_per_call','Time per call','ns'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
+    metrics: [['mcalls','Throughput','M calls/s'],['ns_per_call','Time per call','time'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map((r, i) => {
       const mask = Number(r.core_mask);
       const single = Number.isFinite(mask) && mask > 0 && mask < 2**53 && Math.log2(mask) % 1 === 0 ? Math.log2(mask) : null;
@@ -146,23 +152,23 @@ const KINDS = {
   },
   gpu: {
     title: 'GPU (Vulkan compute)', logX: true, xLabel: 'elements per dispatch', xFmt: v => humanCount(2 ** v),
-    metrics: [['avg_ms','Avg dispatch','ms'],['p95_ms','p95 dispatch','ms'],['p99_ms','p99 dispatch','ms'],['min_ms','Best dispatch','ms'],['gops','Throughput','GOPS']].concat(TELEMETRY),
+    metrics: [['avg_ms','Avg dispatch','time'],['p95_ms','p95 dispatch','time'],['p99_ms','p99 dispatch','time'],['min_ms','Best dispatch','time'],['gops','Throughput','GOPS']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map(r => ({
       series: 'GPU compute', x: Math.log2(r.workload_size), xLabel: `${r.workload_size} elements`,
-      values: Object.assign({ avg_ms: r.avg_latency_ms, p95_ms: r.percentile_95_ms, p99_ms: r.percentile_99_ms, min_ms: r.min_latency_ms, gops: r.throughput_geops }, telemetryValues(r.telemetry)),
+      values: Object.assign({ avg_ms: r.avg_latency_ms * 1e6, p95_ms: r.percentile_95_ms * 1e6, p99_ms: r.percentile_99_ms * 1e6, min_ms: r.min_latency_ms * 1e6, gops: r.throughput_geops }, telemetryValues(r.telemetry)),
     })); },
   },
   input_timing_suite: {
     title: 'Input timing suite',
-    metrics: [['avg_ms','Average','ms'],['p99_ms','p99','ms'],['max_ms','Worst','ms'],['jitter_ms','Jitter','ms'],['polling_hz','Loop rate','Hz'],['samples','Samples','']].concat(TELEMETRY),
+    metrics: [['avg_ms','Average','time'],['p99_ms','p99','time'],['max_ms','Worst','time'],['jitter_ms','Jitter','time'],['polling_hz','Loop rate','Hz'],['samples','Samples','']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map((r, i) => ({
       series: String(r.mode), x: r.core ?? i, xLabel: r.core !== null && r.core !== undefined ? `core ${r.core}` : 'OS scheduled',
-      values: Object.assign({ avg_ms: r.avg_latency_ms, p99_ms: r.percentile_99_ms, max_ms: r.max_latency_ms, jitter_ms: r.jitter_ms, samples: r.sample_count, ...(r.polling_rate_hz ? { polling_hz: r.polling_rate_hz } : {}) }, telemetryValues(r.telemetry)),
+      values: Object.assign({ avg_ms: r.avg_latency_ms * 1e6, p99_ms: r.percentile_99_ms * 1e6, max_ms: r.max_latency_ms * 1e6, jitter_ms: r.jitter_ms * 1e6, samples: r.sample_count, ...(r.polling_rate_hz ? { polling_hz: r.polling_rate_hz } : {}) }, telemetryValues(r.telemetry)),
     })); },
   },
   input_trials: {
     title: 'Click / key-press trials',
-    metrics: [['trial_ms','Trial latency','ms'],['trial_corrected_ms','Trial latency (rig-corrected)','ms']],
+    metrics: [['trial_ms','Trial latency','time'],['trial_corrected_ms','Trial latency (rig-corrected)','time']],
     rows(sec) {
       const rows = [];
       (sec.runs || []).forEach((run, ri) => {
@@ -171,7 +177,7 @@ const KINDS = {
         const cal = run.calibration_used || {};
         const off = s.robot && cal.subtract_robot ? (s.kind === 'KeyPress' ? cal.keyboard_robot_ms : cal.mouse_robot_ms) : 0;
         const off2 = s.robot && cal.subtract_display ? cal.display_ms : 0;
-        (s.samples_ms || []).forEach((ms, i) => rows.push({ series: name, x: i + 1, xLabel: `trial ${i + 1}`, values: Object.assign({ trial_ms: ms }, s.robot ? { trial_corrected_ms: ms - off - off2 } : {}) }));
+        (s.samples_ms || []).forEach((ms, i) => rows.push({ series: name, x: i + 1, xLabel: `trial ${i + 1}`, values: Object.assign({ trial_ms: ms * 1e6 }, s.robot ? { trial_corrected_ms: (ms - off - off2) * 1e6 } : {}) }));
       });
       return rows;
     },
@@ -187,7 +193,7 @@ const state = {
   selected: [],         // names
   hiddenSeries: new Set(), hiddenCols: new Set(), chartMetrics: {}, filters: {}, wheelZoom: false,
   optsBy: {},
-  sensorSel: null,
+  timeUnit: 'ns', sensorSel: null, sensorFilter: '', phaseOpacity: 0.18, phaseHidden: new Set(),
   serverMode: false,
 };
 
@@ -453,9 +459,18 @@ class Chart {
     if (!this.hit || !this.inPlot(p)) { this.tip.hidden = true; this.setHighlight(null); return; }
     let best = null, bd = 22 * 22;
     for (const h of this.hit) { const d = (h.x - p.x) ** 2 + (h.y - p.y) ** 2; if (d < bd) { bd = d; best = h; } }
+    const band = (this.bandHits || []).find(h => p.x >= h.x0 && p.x <= h.x1);
+    if (!best && band) {
+      this.tip.innerHTML = `<b style="color:${band.b.color}">${esc(band.b.label)}</b><br>${fmt(band.b.x0)} – ${fmt(band.b.x1)} s`;
+      this.tip.hidden = false;
+      this.tip.style.left = Math.min(Math.max(4, p.x + 14), this.W - this.tip.offsetWidth - 4) + 'px';
+      this.tip.style.top = Math.max(4, p.y - this.tip.offsetHeight - 10) + 'px';
+      this.setHighlight(null);
+      return;
+    }
     if (!best) { this.tip.hidden = true; this.setHighlight(null); return; }
     const s = this.spec, l = best.line;
-    this.tip.innerHTML = `<b style="color:${l.color}">${esc(l.series)}</b><br>${esc(l.metric)}<br>${esc(s.xFmt ? s.xFmt(best.p[0]) : fmt(best.p[0]))}: <b>${fmt(best.p[1], l.unit)}</b>`;
+    this.tip.innerHTML = `<b style="color:${l.color}">${esc(l.series)}</b><br>${esc(l.metric)}<br>${esc(s.xFmt ? s.xFmt(best.p[0]) : fmt(best.p[0]))}: <b>${fmt(best.p[1], l.unit)}</b>` + (band ? `<br><span style="color:${band.b.color}">during ${esc(band.b.label)}</span>` : '');
     this.tip.hidden = false;
     const tw = this.tip.offsetWidth, th = this.tip.offsetHeight;
     this.tip.style.left = Math.min(Math.max(4, best.x + 14), this.W - tw - 4) + 'px';
@@ -491,6 +506,18 @@ class Chart {
     // grid follows the first axis
     for (const t of yTicks(0)) g += `<line x1="${L}" x2="${L + pw}" y1="${sy(0, t).toFixed(1)}" y2="${sy(0, t).toFixed(1)}" stroke="#2a2f39"/>`;
     for (const t of this.ticksX(xr, pw)) g += `<line x1="${sx(t).toFixed(1)}" x2="${sx(t).toFixed(1)}" y1="${T}" y2="${T + ph}" stroke="#20242c"/><text x="${sx(t).toFixed(1)}" y="${T + ph + 15}" text-anchor="middle">${esc(s.xFmt ? s.xFmt(t) : fmt(t))}</text>`;
+    // test phases as background bands (under the grid lines and the data)
+    this.bandHits = [];
+    if (s.bands && s.bands.length && state.phaseOpacity > 0) {
+      let bg = '';
+      for (const b of s.bands) {
+        const x0 = Math.max(L, sx(b.x0)), x1 = Math.min(L + pw, sx(b.x1));
+        if (x1 <= L || x0 >= L + pw) continue;
+        bg += `<rect x="${x0.toFixed(1)}" y="${T}" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${ph}" fill="${b.color}" fill-opacity="${state.phaseOpacity}"/>`;
+        this.bandHits.push({ x0, x1, b });
+      }
+      g = bg + g;
+    }
     g += `<rect x="${L}" y="${T}" width="${pw}" height="${ph}" fill="none" stroke="#3a404c"/>`;
     g += `<text x="${L + pw / 2}" y="${H - 6}" text-anchor="middle">${esc(s.xLabel || '')}</text>`;
     s.axes.forEach((ax, k) => {
@@ -614,13 +641,25 @@ function flatTempWarning(rows) {
   return '';
 }
 
+// Every time value is held in ns (memory / CPU are saved in ns; GPU / input are saved as f64 ms, converted
+// here without losing precision). All time columns and charts use one unit, picked at the top of the page.
+const TIME_UNITS = { ns: 1, 'µs': 1e3, ms: 1e6 };
+function autoTimeUnits(metrics, rows) {
+  const div = TIME_UNITS[state.timeUnit] || 1;
+  return metrics.map(m => {
+    if (m[2] !== 'time') return m;
+    if (div !== 1) rows.forEach(r => { if (r.values[m[0]] != null) r.values[m[0]] /= div; });
+    return [m[0], m[1], state.timeUnit];
+  });
+}
+
 function kindSection(kindKey, entries) {
   // entries: [{label, sec}] one per selected result
   const kind = KINDS[kindKey];
   const multi = entries.length > 1;
   const rows = entries.flatMap(e => kind.rows(e.sec).map(r => multi ? { ...r, series: `[${e.label}] ${r.series}` } : r));
   const series = [...new Set(rows.map(r => r.series))].sort();
-  const metrics = kind.metrics.filter(m => rows.some(r => r.values[m[0]] !== undefined && r.values[m[0]] !== null));
+  const metrics = autoTimeUnits(kind.metrics, rows).filter(m => rows.some(r => r.values[m[0]] !== undefined && r.values[m[0]] !== null));
   const hid = (k) => state.hiddenSeries.has(kindKey + ':' + k), hidc = (k) => state.hiddenCols.has(kindKey + ':' + k);
   const shownMetrics = metrics.filter(m => !hidc(m[0]));
   let chosen = (state.chartMetrics[kindKey] || []).filter(k => shownMetrics.some(m => m[0] === k));
@@ -706,48 +745,83 @@ function slowCoreNotes(rows) {
 const SENSOR_DEFS = [
   ['cpu_package_c', 'CPU package', '°C'], ['hottest_core_c', 'Hottest core', '°C'], ['gpu_temp_c', 'GPU temperature', '°C'],
   ['cpu_freq_avg_mhz', 'CPU clock (avg)', 'MHz'], ['cpu_load_pct', 'CPU load', '%'], ['gpu_util_pct', 'GPU load', '%'],
-  ['gpu_power_w', 'GPU power', 'W'], ['ram_used_mb', 'RAM used', 'MB'], ['vram_used_mb', 'VRAM used', 'MB'],
+  ['cpu_power_w', 'CPU package power', 'W'], ['gpu_power_w', 'GPU power', 'W'], ['ram_used_mb', 'RAM used', 'MB'], ['vram_used_mb', 'VRAM used', 'MB'],
 ];
+// presets pick by unit, so they include every extra sensor of that kind (board, VRM, DIMM, PSU ...)
 const SENSOR_PRESETS = {
-  temps: ['Temperatures', ['cpu_package_c', 'hottest_core_c', 'gpu_temp_c']], clocks: ['Clocks', ['cpu_freq_avg_mhz']],
-  load: ['Load / power', ['cpu_load_pct', 'gpu_util_pct', 'gpu_power_w']], mem: ['RAM / VRAM', ['ram_used_mb', 'vram_used_mb']],
+  temps: ['Temperatures', d => d[2] === '°C'], fans: ['Fans', d => d[2] === 'RPM'], power: ['Power', d => d[2] === 'W'],
+  volts: ['Voltages / currents', d => d[2] === 'V' || d[2] === 'A'], clocks: ['Clocks', d => d[2] === 'MHz'],
+  load: ['Load', d => d[2] === '%'], mem: ['RAM / VRAM', d => d[2] === 'MB'],
 };
+// background of each test on the timeline
+const PHASE_COLORS = { memory: '#e5484d', cpu: '#3e8bff', gpu: '#30c070', input: '#f0b429' };
+const PHASE_NAMES = { memory: 'Memory', cpu: 'CPU', gpu: 'GPU', input: 'Input' };
+const phaseColor = k => PHASE_COLORS[k] || '#9aa3b2';
+const sensorValue = (p, key) => key.startsWith('x:') ? (p.sensors || {})[key.slice(2)] : p[key];
+
+function sensorDefs(sec) {
+  const tl = sec.timeline || [];
+  const kinds = sec.sensor_kinds || {};
+  const builtin = SENSOR_DEFS.filter(d => tl.some(p => p[d[0]] != null));
+  const names = [...new Set(tl.flatMap(p => Object.keys(p.sensors || {})))].sort();
+  const extra = names.map(n => ['x:' + n, n, (kinds[n] && kinds[n].unit) || '']);
+  return builtin.concat(extra);
+}
 
 function sensorsSection(entries) {
   const sec = entries[0].sec;
   const tl = sec.timeline || [];
-  const has = d => tl.some(p => p[d[0]] != null);
-  const defs = SENSOR_DEFS.filter(has);
-  if (!state.sensorSel) state.sensorSel = new Set(SENSOR_PRESETS.temps[1]);
+  const defs = sensorDefs(sec);
+  if (!state.sensorSel) state.sensorSel = new Set(defs.filter(d => d[0] === 'cpu_package_c' || d[0] === 'hottest_core_c' || d[0] === 'gpu_temp_c').map(d => d[0]));
   let sel = defs.filter(d => state.sensorSel.has(d[0]));
-  if (!sel.length && defs.length) { sel = defs.filter(d => SENSOR_PRESETS.temps[1].includes(d[0])); if (!sel.length) sel = [defs[0]]; }
-  let html = `<h2>Sensors over time <span class="badge">${sec.samples_recorded ?? tl.length} samples</span></h2><div class="card">`;
+  if (!sel.length && defs.length) sel = [defs[0]];
+  const q = (state.sensorFilter || '').toLowerCase();
+  let html = `<h2>Sensors over time <span class="badge">${sec.samples_recorded ?? tl.length} samples · ${defs.length} sensors</span></h2><div class="card">`;
   html += (sec.sources || []).map(n => `<div style="color:var(--dim);font-size:12px">• ${esc(n)}</div>`).join('');
   // a busy CPU whose package temperature never moves is not a live sensor
   const cp = tl.filter(p => p.cpu_package_c != null), busy = tl.filter(p => p.cpu_load_pct != null);
   if (cp.length >= 20 && Math.max(...cp.map(p => p.cpu_package_c)) - Math.min(...cp.map(p => p.cpu_package_c)) < 0.05 && busy.length && busy.reduce((a, p) => a + p.cpu_load_pct, 0) / busy.length > 25)
     html += `<div class="flatwarn">⚠ The CPU package temperature never changed (${fmt(cp[0].cpu_package_c)} °C) although the CPU was busy. That is a fixed ACPI thermal-zone value, not a live reading; run LibreHardwareMonitor or OpenHardwareMonitor for real temperatures.</div>`;
-  html += '<div class="row"><b>Show:</b>' + Object.entries(SENSOR_PRESETS).map(([k, g]) => {
-    const same = g[1].filter(x => defs.some(d => d[0] === x)); const on = same.length && same.length === sel.length && same.every(x => sel.some(d => d[0] === x));
-    return `<button class="small" data-spreset="${k}" style="${on ? 'border-color:var(--accent)' : ''}">${g[0]}</button>`;
-  }).join('') + '<button class="small" data-spreset="all">everything</button><button class="small" data-spreset="none">none</button></div>';
+  html += '<div class="row"><b>Show:</b>' + Object.entries(SENSOR_PRESETS).filter(([, g]) => defs.some(g[1])).map(([k, g]) =>
+    `<button class="small" data-spreset="${k}">${g[0]} (${defs.filter(g[1]).length})</button>`).join('') +
+    '<button class="small" data-spreset="all">everything</button><button class="small" data-spreset="none">none</button>' +
+    `<input type="text" data-sfilter placeholder="filter sensors (VRM, DIMM, fan …)" value="${esc(state.sensorFilter || '')}" style="min-width:220px"></div>`;
   const units = [...new Set(sel.map(d => d[2]))];
-  html += '<div class="row">' + defs.map(d => {
-    const i = SENSOR_DEFS.indexOf(d), on = sel.includes(d), st = seriesStyle(i);
-    return `<label class="chip ${on ? 'on' : ''}"><input type="checkbox" data-ssel="${d[0]}" ${on ? 'checked' : ''}>${swatch(st.color, 'circle', on ? DASHES[units.indexOf(d[2]) % DASHES.length] : '')}${esc(d[1])} <span style="color:var(--dim)">(${esc(d[2])})</span></label>`;
-  }).join('') + '</div>';
+  const byUnit = {}; defs.forEach(d => (byUnit[d[2]] ??= []).push(d));
+  html += '<div class="serlist" style="max-height:220px">' + Object.entries(byUnit).map(([u, ds]) =>
+    `<div style="flex:1 1 100%;color:var(--dim);font-size:12px;margin-top:4px">${esc(u || 'other')}</div>` + ds.map(d => {
+      const i = defs.indexOf(d), on = sel.includes(d), st = seriesStyle(i);
+      const hide = q && !d[1].toLowerCase().includes(q) ? 'style="display:none"' : '';
+      return `<label class="chip ${on ? 'on' : ''}" data-sname="${esc(d[1].toLowerCase())}" ${hide}><input type="checkbox" data-ssel="${esc(d[0])}" ${on ? 'checked' : ''}>${swatch(st.color, 'circle', on ? DASHES[units.indexOf(d[2]) % DASHES.length] : '')}${esc(d[1])}</label>`;
+    }).join('')).join('') + '</div>';
+  // test phases as background bands
+  const phases = sec.phases || [];
+  const kindsSeen = [...new Set(phases.map(p => p.kind))];
+  if (phases.length) {
+    html += '<div class="row"><b>Test backgrounds:</b>' + kindsSeen.map(k =>
+      `<label class="chk"><input type="checkbox" data-pkind="${esc(k)}" ${state.phaseHidden.has(k) ? '' : 'checked'}><span class="sw" style="background:${phaseColor(k)}"></span>${esc(PHASE_NAMES[k] || k)} (${phases.filter(p => p.kind === k).length})</label>`).join('') +
+      `<label class="chk">opacity <input type="range" min="0" max="60" value="${Math.round(state.phaseOpacity * 100)}" data-popacity style="width:120px"> <span data-popv>${Math.round(state.phaseOpacity * 100)} %</span></label>` +
+      '<span style="color:var(--dim);font-size:12px">hover a band to see which test ran</span></div>';
+  }
   if (units.length > 1) html += '<div style="color:var(--dim);font-size:12px">Each unit has its own axis (first on the left, others on the right); lines on different axes use different dash patterns.</div>';
-  const axes = units.map(u => ({ unit: u, label: sel.filter(d => d[2] === u).map(d => d[1]).slice(0, 2).join(' · ') + ` (${u})` }));
+  const axes = units.map(u => ({ unit: u, label: sel.filter(d => d[2] === u).map(d => d[1]).slice(0, 2).join(' · ') + (sel.filter(d => d[2] === u).length > 2 ? ' …' : '') + ` (${u})` }));
   const lines = sel.map(d => {
-    const st = seriesStyle(SENSOR_DEFS.indexOf(d));
-    return { series: d[1], metric: d[1], unit: d[2], name: d[1], color: st.color, shape: 'circle', dash: DASHES[units.indexOf(d[2]) % DASHES.length], axis: units.indexOf(d[2]), pts: tl.filter(p => p[d[0]] != null).map(p => [p.t_s, p[d[0]]]) };
+    const st = seriesStyle(defs.indexOf(d));
+    return { series: d[1], metric: d[1], unit: d[2], name: d[1], color: st.color, shape: 'circle', dash: DASHES[units.indexOf(d[2]) % DASHES.length], axis: units.indexOf(d[2]), pts: tl.filter(p => sensorValue(p, d[0]) != null).map(p => [p.t_s, sensorValue(p, d[0])]) };
   });
+  const bands = phases.filter(p => !state.phaseHidden.has(p.kind)).map(p => ({ x0: p.t0_s, x1: Math.max(p.t1_s, p.t0_s + 0.05), color: phaseColor(p.kind), label: p.label }));
   const cid = 'chart_sensors';
-  pendingSpecs.set(cid, { id: cid, lines, axes, legend: sel.length > 1 ? lines.map(l => ({ label: l.name + ' (' + l.unit + ')', color: l.color, dash: l.dash, axis: l.axis })) : null, ysig: sel.map(d => d[0]).join('|'), xLabel: 'seconds since the test started', logY: false, zeroY: false, markers: false, xFmt: v => fmt(v) + ' s' });
-  html += chartTools(cid) + `<div class="chartbox" data-chart="${cid}"></div>`;
+  pendingSpecs.set(cid, { id: cid, lines, axes, bands, legend: sel.length > 1 && sel.length <= 12 ? lines.map(l => ({ label: l.name + ' (' + l.unit + ')', color: l.color, dash: l.dash, axis: l.axis })) : null, ysig: sel.map(d => d[0]).join('|'), xLabel: 'seconds since the test started', logY: false, zeroY: false, markers: false, xFmt: v => fmt(v) + ' s' });
+  html += chartTools(cid) + `<div class="chartbox big" data-chart="${cid}"></div>`;
   const peaks = sec.core_peak_temps_c || [];
   if (peaks.length) {
     html += '<h3>Peak temperature per core</h3><div class="row">' + peaks.map(p => { const t = p[1], c = t > 85 ? 'bad' : t > 70 ? 'warn' : 'ok'; return `<span class="badge ${c === 'ok' ? 'ok' : c === 'warn' ? 'warn' : 'bad'}">core ${p[0]}: ${t.toFixed(0)} °C</span>`; }).join('') + '</div>';
+  }
+  // peak / average of every sensor over the whole run
+  if (defs.length) {
+    const rows = defs.map(d => { const v = tl.map(p => sensorValue(p, d[0])).filter(x => x != null); return v.length ? [d, Math.min(...v), v.reduce((a, b) => a + b, 0) / v.length, Math.max(...v)] : null; }).filter(Boolean);
+    html += `<details><summary>Min / average / max of every sensor (${rows.length})</summary><div class="scroll" style="max-height:360px"><table><thead><tr><th>Sensor</th><th>Unit</th><th>Min</th><th>Average</th><th>Max</th></tr></thead><tbody>` +
+      rows.map(r => `<tr><td>${esc(r[0][1])}</td><td>${esc(r[0][2])}</td><td>${fmt(r[1])}</td><td>${fmt(r[2])}</td><td>${fmt(r[3])}</td></tr>`).join('') + '</tbody></table></div></details>';
   }
   return html + '</div>';
 }
@@ -798,6 +872,9 @@ function render() {
   else html += overview(docs[0][1], docs[0][0], state.list.find(m => m.name === docs[0][0]));
   const perDoc = docs.map(([n, d]) => ({ label: docLabel(d, n), sections: sectionsOf(d), doc: d }));
   lastRender = { built: [], docs, perDoc };
+  html += `<div class="row"><b>Time unit for every table and chart:</b>` + Object.keys(TIME_UNITS).map(u =>
+    `<label class="chk"><input type="radio" name="tunit" data-tunit="${u}" ${state.timeUnit === u ? 'checked' : ''}>${u}</label>`).join('') +
+    '<span style="color:var(--dim);font-size:12px">saved values are in nanoseconds (or f64 milliseconds for GPU / input), shown here in one unit so every run compares directly</span></div>';
   for (const k of KIND_ORDER) {
     const entries = entriesFor(k);
     if (entries.length) { const b = kindSection(k, entries); html += `<section id="ks_${k}">${b.html}</section>`; lastRender.built.push(b); }
@@ -858,9 +935,10 @@ function wireKind(host, kindKey) {
 }
 
 function wireSensors(host) {
+  const defs = () => sensorDefs(entriesFor('sensors')[0].sec);
   host.querySelectorAll('[data-spreset]').forEach(el => el.onclick = () => {
     const k = el.dataset.spreset;
-    state.sensorSel = new Set(k === 'all' ? SENSOR_DEFS.map(d => d[0]) : k === 'none' ? [] : SENSOR_PRESETS[k][1]);
+    state.sensorSel = new Set(defs().filter(d => k === 'all' ? true : k === 'none' ? false : SENSOR_PRESETS[k][1](d)).map(d => d[0]));
     rebuildSection('sensors');
   });
   host.querySelectorAll('[data-ssel]').forEach(el => el.onchange = () => {
@@ -868,10 +946,22 @@ function wireSensors(host) {
     if (!cur.size) cur.add(el.dataset.ssel);
     state.sensorSel = cur; rebuildSection('sensors');
   });
+  const f = host.querySelector('[data-sfilter]');
+  if (f) f.oninput = () => {
+    state.sensorFilter = f.value; const q = f.value.trim().toLowerCase();
+    host.querySelectorAll('[data-sname]').forEach(l => l.style.display = !q || l.dataset.sname.includes(q) ? '' : 'none');
+  };
+  host.querySelectorAll('[data-pkind]').forEach(el => el.onchange = () => { el.checked ? state.phaseHidden.delete(el.dataset.pkind) : state.phaseHidden.add(el.dataset.pkind); rebuildSection('sensors'); });
+  const op = host.querySelector('[data-popacity]');
+  if (op) op.oninput = () => {
+    state.phaseOpacity = op.value / 100; host.querySelector('[data-popv]').textContent = op.value + ' %';
+    liveCharts.get('chart_sensors')?.draw();
+  };
   mountCharts(host);
 }
 
 function wirePage() {
+  document.querySelectorAll('[data-tunit]').forEach(el => el.onchange = () => { state.timeUnit = el.dataset.tunit; render(); });
   const raw = $('[data-act=raw]'); if (raw) raw.onclick = () => { const d = lastRender.docs[0][1]; const pre = document.createElement('pre'); pre.textContent = JSON.stringify(d, null, 2); raw.closest('.card').appendChild(pre); raw.disabled = true; };
   const dj = $('[data-act=dl-json]'); if (dj) dj.onclick = () => download(lastRender.docs[0][0].replace(/[^\w.-]/g, '_'), JSON.stringify(lastRender.docs[0][1], null, 2), 'application/json');
 }

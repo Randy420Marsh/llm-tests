@@ -81,6 +81,13 @@ pub struct RunAllPlan {
     pub cpu_run_s: u64,
     pub cpu_runs: u32,
     pub cpu_warmup_s: u64,
+    /// Timings of the "each core on its own" pass: it runs every workload on every core, so with the
+    /// all-core timings (110 s per test) a 24-thread CPU would need about 9 hours for it alone
+    /// Per-core passes: every test on one core before the next (false = rotate cores between tests)
+    pub core_by_core: bool,
+    pub cpu_core_run_s: u64,
+    pub cpu_core_runs: u32,
+    pub cpu_core_warmup_s: u64,
 
     pub gpu: bool,
     /// Every GPU size keeps dispatching for at least this long so load, clocks and power register
@@ -108,6 +115,10 @@ impl Default for RunAllPlan {
             cpu_run_s: 10,
             cpu_runs: 10,
             cpu_warmup_s: 10,
+            core_by_core: false,
+            cpu_core_run_s: 2,
+            cpu_core_runs: 3,
+            cpu_core_warmup_s: 1,
             gpu: true,
             gpu_min_sample_ms: 2000,
         }
@@ -130,6 +141,9 @@ impl RunAllPlan {
             cpu_run_s: 2,
             cpu_runs: 2,
             cpu_warmup_s: 1,
+            cpu_core_run_s: 1,
+            cpu_core_runs: 1,
+            cpu_core_warmup_s: 0,
             gpu_min_sample_ms: 400,
             ..Self::default()
         }
@@ -287,6 +301,7 @@ impl RunAllPlan {
             },
             time_budget_ms: (self.mem_time_limit_s.max(0.0) * 1000.0) as u64,
             per_core: each_core,
+            core_by_core: self.core_by_core,
         };
         (config, skipped)
     }
@@ -303,9 +318,10 @@ impl RunAllPlan {
                 workload_types: ALL_WORKLOADS.to_vec(),
                 thread_counts,
                 affinity_modes,
-                duration_seconds: self.cpu_run_s.max(1),
-                warmup_seconds: self.cpu_warmup_s,
-                iterations: self.cpu_runs.max(1),
+                duration_seconds: if each_core { self.cpu_core_run_s } else { self.cpu_run_s }.max(1),
+                warmup_seconds: if each_core { self.cpu_core_warmup_s } else { self.cpu_warmup_s },
+                iterations: if each_core { self.cpu_core_runs } else { self.cpu_runs }.max(1),
+                core_by_core: self.core_by_core,
             },
             host.logical_cores - pinnable,
         )
@@ -521,6 +537,19 @@ pub fn execute(
             }
         };
 
+        // Whatever happened, this step's progress panel must stop counting
+        match step {
+            StepSpec::Memory { .. } => {
+                if let Ok(mut p) = handles.mem.lock() {
+                    p.finished.get_or_insert_with(Instant::now);
+                }
+            }
+            StepSpec::Cpu { .. } => crate::progress::finish(&handles.cpu_progress),
+            StepSpec::Gpu { .. } => crate::progress::finish(&handles.gpu_progress),
+            StepSpec::InputSuite { .. } => crate::progress::finish(&handles.input_progress),
+            StepSpec::Interactive(_) => {}
+        }
+
         match result {
             Ok(()) => {
                 out.steps_done += 1;
@@ -609,6 +638,10 @@ mod tests {
         assert_eq!(config.thread_counts, vec![1]);
         assert_eq!(config.affinity_modes.len(), 24, "each core on its own");
         assert_eq!(config.affinity_modes[5], AffinityMode::CustomMask(1 << 5));
+        // the per-core pass has its own short timings: 12 workloads × 24 cores must not take 9 hours
+        assert_eq!((config.duration_seconds, config.iterations, config.warmup_seconds), (2, 3, 1));
+        let per_core = StepSpec::Cpu { label: String::new(), config: config.clone() }.estimate().expected_s;
+        assert!(per_core < 3600.0, "per-core CPU pass on 24 threads: {}", fmt_span(per_core));
         assert!(matches!(job.steps[6], StepSpec::Gpu { .. }));
     }
 
@@ -674,7 +707,7 @@ mod tests {
         let quick = RunAllPlan::quick().job(&h).estimate();
         let full = plan.job(&h).estimate();
         assert!(quick.worst_s < 20.0 * 60.0, "quick preset is a few minutes: {}", fmt_span(quick.worst_s));
-        assert!(full.expected_s > 8.0 * 3600.0, "the full profile is hours: {}", fmt_span(full.expected_s));
+        assert!(full.expected_s > 3600.0 && full.expected_s < 3.0 * 3600.0, "the full profile is one to three hours: {}", fmt_span(full.expected_s));
         assert!(full.worst_s >= full.expected_s);
     }
 
@@ -737,6 +770,7 @@ mod tests {
                         duration_seconds: 1,
                         warmup_seconds: 0,
                         iterations: 1,
+                        core_by_core: false,
                     },
                 },
             ],

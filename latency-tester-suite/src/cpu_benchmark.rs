@@ -17,6 +17,10 @@ pub struct CpuBenchmarkConfig {
     pub duration_seconds: u64,
     pub warmup_seconds: u64,
     pub iterations: u32,
+    /// With several core sets (e.g. each core on its own): run every workload on one core set before
+    /// the next (false = rotate the core sets between workloads, which spreads the heat)
+    #[serde(default)]
+    pub core_by_core: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +90,7 @@ impl Default for CpuBenchmarkConfig {
             duration_seconds: 10,
             warmup_seconds: 2,
             iterations: 5,
+            core_by_core: false,
         }
     }
 }
@@ -290,6 +295,12 @@ impl CpuBenchmark {
         if combos.is_empty() {
             return Err(anyhow::anyhow!("No valid combination of workload, threads and cores to run"));
         }
+        let mut combos = combos;
+        if self.config.core_by_core {
+            // stable sort: workload / thread order is kept within each core set
+            let modes = self.config.affinity_modes.clone();
+            combos.sort_by_key(|c| modes.iter().position(|m| *m == c.2).unwrap_or(usize::MAX));
+        }
         progress::update(&self.progress, |p| {
             *p = progress::RunProgress { total: combos.len(), started: Some(std::time::Instant::now()), ..Default::default() }
         });
@@ -309,6 +320,7 @@ impl CpuBenchmark {
             results.push(result);
         }
 
+        progress::update(&self.progress, |p| p.finished = Some(std::time::Instant::now()));
         Ok(CpuBenchmarkSummary {
             results,
             config: self.config.clone(),
@@ -361,6 +373,11 @@ impl CpuBenchmark {
         affinity_mode: AffinityMode,
     ) -> Result<CpuBenchmarkResult> {
         let core_mask = self.get_affinity_mask(thread_count, affinity_mode);
+        if affinity_mode != AffinityMode::AllCores {
+            // move the app's own threads off the core(s) this test is pinned to
+            let cores: Vec<usize> = (0..64).filter(|&i| (core_mask >> i) & 1 == 1).collect();
+            crate::app_core::keep_off(&cores);
+        }
         let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
         let mut iteration_results = Vec::new();
         let mut total_ops = 0u64;
@@ -400,7 +417,12 @@ impl CpuBenchmark {
         let avg_freq = iteration_results.iter().map(|r| r.frequency_mhz).sum::<u64>() / iteration_results.len() as u64;
 
         let telemetry = match (&self.sensors, sensor_start) {
-            (Some(s), Some(t0)) => s.window(t0, s.now_ms()),
+            (Some(s), Some(t0)) => s.record(
+                "cpu",
+                format!("CPU · {:?} · {} thread(s) · {}", workload, thread_count, Self::mask_label(core_mask, affinity_mode)),
+                t0,
+                s.now_ms(),
+            ),
             _ => Telemetry::default(),
         };
         Ok(CpuBenchmarkResult {
@@ -476,15 +498,18 @@ impl CpuBenchmark {
     ) -> Result<(u64, u64, u64)> {
         let mut handles = Vec::new();
         let duration_ns = duration_seconds * 1_000_000_000;
-        let start_time = self.timer.now_ticks();
-        let target_end = start_time + (duration_ns as u128 * self.timer.frequency() as u128 / 1_000_000_000) as u64;
+        let window_ticks = (duration_ns as u128 * self.timer.frequency() as u128 / 1_000_000_000) as u64;
+        // Every worker (and this thread) waits here, so all of them start measuring together: a thread
+        // that is created late (many threads, a busy machine) still gets its full window and no
+        // thread ends up with zero work
+        let start_line = Arc::new(std::sync::Barrier::new(thread_count + 1));
 
         for i in 0..thread_count {
             let workload = workload;
             let timer = HighResTimer::new();
-            let target_end = target_end;
             let core_id = self.get_core_for_thread(i, thread_count, core_mask, affinity_mode);
-            
+            let start_line = start_line.clone();
+
             let cancel_flag = self.cancel.clone();
             let pin = affinity_mode != AffinityMode::AllCores;
             let handle = thread::spawn(move || {
@@ -492,20 +517,28 @@ impl CpuBenchmark {
                 if pin {
                     crate::topology::pin_current_thread(core_id);
                 }
+                start_line.wait();
+                let target_end = timer.now_ticks() + window_ticks;
 
+                // at least one call, so a result can never be 0 operations
                 let mut ops = 0u64;
-                while timer.now_ticks() < target_end && !cancel::is_cancelled(&cancel_flag) {
+                loop {
                     std::hint::black_box(Self::execute_workload(workload, ops));
                     ops += 1;
+                    if timer.now_ticks() >= target_end || cancel::is_cancelled(&cancel_flag) {
+                        break;
+                    }
                 }
                 ops
             });
             handles.push(handle);
         }
 
+        start_line.wait();
+        let start_time = self.timer.now_ticks();
         let mut total_ops = 0u64;
         for handle in handles {
-            total_ops += handle.join().unwrap();
+            total_ops += handle.join().map_err(|_| anyhow::anyhow!("CPU worker thread panicked"))?;
         }
 
         cancel::check(&self.cancel)?;
@@ -782,6 +815,7 @@ pub fn quick_cpu_test(workload: WorkloadType, thread_count: usize, duration_sec:
         duration_seconds: duration_sec,
         warmup_seconds: 1,
         iterations: 3,
+        core_by_core: false,
     };
     
     let mut bench = CpuBenchmark::new(config)?;
@@ -806,6 +840,29 @@ mod tests {
     }
 
     #[test]
+    fn test_core_by_core_runs_every_workload_on_one_core_first() {
+        if num_cpus::get() < 2 {
+            return;
+        }
+        let run = |core_by_core| {
+            let mut b = CpuBenchmark::new(CpuBenchmarkConfig {
+                workload_types: vec![WorkloadType::IntegerAdd, WorkloadType::IntegerMul],
+                thread_counts: vec![1],
+                affinity_modes: vec![AffinityMode::CustomMask(1), AffinityMode::CustomMask(2)],
+                duration_seconds: 1,
+                warmup_seconds: 0,
+                iterations: 1,
+                core_by_core,
+            })
+            .unwrap();
+            b.run().unwrap().results.iter().map(|r| (r.workload, r.core_mask)).collect::<Vec<_>>()
+        };
+        use WorkloadType::*;
+        assert_eq!(run(false), vec![(IntegerAdd, 1), (IntegerAdd, 2), (IntegerMul, 1), (IntegerMul, 2)]);
+        assert_eq!(run(true), vec![(IntegerAdd, 1), (IntegerMul, 1), (IntegerAdd, 2), (IntegerMul, 2)]);
+    }
+
+    #[test]
     fn test_short_run_produces_ops() {
         let mut bench = CpuBenchmark::new(CpuBenchmarkConfig {
             workload_types: vec![WorkloadType::IntegerAdd, WorkloadType::MemoryCopy, WorkloadType::MemoryLatency],
@@ -814,6 +871,7 @@ mod tests {
             duration_seconds: 1,
             warmup_seconds: 0,
             iterations: 1,
+            core_by_core: false,
         })
         .unwrap();
         let summary = bench.run().unwrap();

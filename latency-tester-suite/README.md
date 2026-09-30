@@ -57,21 +57,34 @@ Linux GUI needs `libxkbcommon`, X11/Wayland and OpenGL. The GPU suite needs a Vu
    bar above skips them,
 3. runs the input timing tests (timer, jitter, polling; unpinned and on every core), then **memory** (all 18 buffer
    sizes, all 14 access patterns, every thread count up to your logical CPUs, 10 runs, 1 warm-up run, 5 s limit per
-   test), **CPU** (all 12 workloads on all cores, 10 s runs × 10 with 10 s warm-up, then each core on its own) and
+   test), **CPU** (all 12 workloads on all cores, 10 s runs × 10 with 10 s warm-up, then each core on its own with
+   short runs: 2 s × 3, 1 s warm-up, so 12 workloads × 24 cores take about 35 min instead of 9 hours) and
    **GPU** (six sizes, each dispatched for at least 2 s so the load registers),
 4. signs and saves one record (`latency_results/…_session_….json`), writes a folder
    `latency_results/run_all_<date_time>/` with `memory.csv`, `cpu.csv`, `gpu.csv`, `input_timing.csv`,
    `input_trials.csv`, `sensors.csv`, a self-contained `report.html` and a short `summary.txt`, and shows everything in
    **Results & Graphs**.
 
-The full profile takes **hours** (the panel shows a typical and a worst-case time before you start; the per-core CPU
-test alone is one run per workload per core). Use **Quick check** for a few-minute pass, untick parts, or change any
-number in the panel. *Every core on its own* for memory is off by default because it adds thousands of tests. **Stop**
-ends the run early and still saves and exports what finished; a step that fails (for example no Vulkan device) is
-noted and the run carries on.
+The full profile takes **about an hour** on a 24-thread CPU (the panel shows a typical and a worst-case time
+before you start, and every number, including the per-core CPU timings, can be changed). Use **Quick check** for a
+few-minute pass or untick parts. *Every core on its own* for memory is off by default because it adds thousands of
+tests. **Stop** ends the run early and still saves and exports what finished; a step that fails (for example no
+Vulkan device) is noted and the run carries on. Each progress panel stops counting as soon as its suite has ended,
+so the tab you look at always shows the step that is really running.
 
 The manual tabs use the same defaults (memory: 10 runs, 1 warm-up, 5 s limit; CPU: 10 s runs × 10, 10 s warm-up, all
 workloads), and every suite can still be run and saved by hand.
+
+## Units and short runs
+
+- Every time is saved in **nanoseconds** (memory, CPU) or as 64-bit floating-point milliseconds (GPU, input), so no
+  resolution is lost. The web report shows all time columns and charts in one unit you pick at the top of the page
+  (ns by default, µs or ms), so every run and every test can be compared directly.
+- Small memory buffers are measured with repeated passes: a timed run keeps passing over the buffer until it lasts
+  at least 50 µs, and the time is reported per pass (`passes_per_run` in the results). One pass over a small buffer
+  takes nanoseconds, so on its own the timer read, a TLB miss or an interrupt could decide the result (for example a
+  128 KB StridedRead with a 4 KB stride used to show 255 ns per access in one of three runs; it now measures
+  about 1 ns every time).
 
 ## Choosing what to test
 
@@ -87,18 +100,68 @@ Every tab shows live progress (what is running right now, ETA) and fills its res
 
 ## Sensors and graphs
 
-While any test runs, a background sampler records CPU per-core temperatures, clocks, load, RAM and
-GPU temperature/load/power/VRAM, and each result stores a summary of the readings taken during that test.
-The **Results & Graphs** tab charts every value, and each line or column can be switched on and off.
+While any test runs, a background sampler records every sensor it can find twice a second, and each
+result stores a summary of the readings taken during that test (CPU temperature max/avg, hottest, coolest
+and average core, clocks, load, CPU package power, RAM, GPU temperature/load/power/VRAM). Every test is
+also recorded as a *phase*, so the timeline shows which test was running when.
 
 | Reading | Linux | Windows |
 |---|---|---|
-| CPU temperature (package / per core) | hwmon (`coretemp`, `k10temp`) | per-core needs [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (or OpenHardwareMonitor) running; otherwise a package-level ACPI thermal zone |
-| CPU clocks / load / RAM | yes | yes |
+| CPU temperature (package / per core) | hwmon (`coretemp`, `k10temp`) | LibreHardwareMonitor library next to the exe, or the LibreHardwareMonitor / OpenHardwareMonitor app through WMI; otherwise a package-level ACPI thermal zone |
+| Board: VRM, chipset, system temps, fans, voltages | hwmon (`nct67xx`, `it87`, …) | LibreHardwareMonitor |
+| Memory (DIMM) temperatures | hwmon (`spd5118`, `jc42`) | LibreHardwareMonitor |
+| Drive temperatures | hwmon (`nvme`, `drivetemp`) | LibreHardwareMonitor |
+| Power: CPU package, DRAM, PSU | RAPL energy counters (root), PSU hwmon drivers (`corsair-psu`, `nzxt`) | LibreHardwareMonitor (CPU package power; PSU on supported models) |
+| CPU clocks / load / RAM | yes | yes (real clocks from `% Processor Performance`) |
 | GPU temp / load / power / VRAM | `nvidia-smi` or amdgpu sysfs | `nvidia-smi` (ships with the NVIDIA driver) |
 
-The Dashboard lists which sensors were found. Windows itself does not expose per-core CPU temperatures
-to normal programs, so without a helper such as LibreHardwareMonitor those columns stay empty.
+**LibreHardwareMonitor on Windows.** `build.bat` downloads the official
+[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) release (MPL-2.0) into
+`dist\LibreHardwareMonitor\`, and the Dashboard has a *Download LibreHardwareMonitor* button for an exe that was
+copied elsewhere. The app loads the library itself, so the LibreHardwareMonitor program does not have to run.
+Its driver, and with it the CPU, board and memory sensors, only loads for an administrator:
+use *Restart as administrator* on the Dashboard. Without the library the app reads the LibreHardwareMonitor or
+OpenHardwareMonitor app if one is running, and otherwise only the ACPI thermal zone.
+
+**Report / viewer:** the *Sensors over time* chart can overlay any mix of sensors (presets: temperatures, fans,
+power, voltages, clocks, load, RAM/VRAM; filter box for names like "VRM" or "DIMM"). Each unit gets its own axis.
+Every test is drawn as a background band (memory red, CPU blue, GPU green, input amber) with an opacity slider
+and per-suite switches; hovering a band names the test. A table lists min / average / max of every sensor for the
+whole run. The app's **Results & Graphs** tab shows the same bands and sensor groups. `sensors.csv` holds every
+sample with one column per sensor, and `phases.csv` lists each test's start and end.
+
+## Keeping the app out of the measurement
+
+- **Reserved core.** While a test runs, the app's own threads (the window, the sensor sampler and the Windows
+  sensor helper process) are moved to one logical CPU: the least busy one, preferring the highest-numbered.
+  Before any test pinned to particular cores, the app checks that it is not on one of them or on a
+  hyper-threading sibling of one (found from the OS topology), moves if it is, waits until the move is
+  confirmed and lets the scheduler settle for 0.3 s. The log says how often it had to move.
+- **Frame cap.** The window normally redraws as fast as it can (VSync off, for input timing). While a benchmark
+  runs, and no click/key trial or display pattern is on screen, it draws at most ~20 frames per second instead of
+  keeping one core at 100 %.
+- **Per-core order.** With *Test each core on its own*, choose *rotate cores between tests* (test 1 on core 0,
+  1, 2 …, then test 2; spreads the heat) or *all tests on one core, then the next* (core 0 runs everything, then
+  core 1 …). The same option is in the Run all plan.
+- Tests on *All cores (OS decides)* still share the CPU with the app; the frame cap keeps that small.
+
+## Display, timers and the pattern window
+
+- **Renderer.** The window is drawn with **Vulkan through wgpu** when a Vulkan GPU is present (one frame queued,
+  Immediate / Mailbox presentation, i.e. no VSync, for the lowest latency) and falls back to **OpenGL** otherwise.
+  The Dashboard and the Input tab show which one is in use. `--renderer vulkan` / `--renderer opengl` forces one.
+- **Precise pattern window.** Input tab → *Display / rig patterns* → *Open precise pattern window*: a separate
+  full-screen window that is VSync-locked (FIFO presentation) and switches white/black only on whole refresh
+  periods, measuring the refresh rate first. The main window's own pattern follows whenever a frame happens to be
+  drawn, so short phases (e.g. 1 ms white) flicker irregularly; a display cannot show anything shorter than one
+  refresh anyway, and in the precise window 1 ms white becomes exactly one frame, every cycle. It shows the
+  refresh rate, the frames per phase, frame-time p50/p99 and late (dropped) frames. `Esc` closes, `I` hides the text.
+  (`latency-tester --pattern --on-ms 1 --off-ms 500 [--cycles N] [--windowed]` starts it directly.)
+- **Timers.** The Dashboard shows the time source and the timer resolution. On Windows the QPC frequency tells
+  the source (10 MHz = invariant TSC, 14.318 MHz = HPET forced with `bcdedit /set useplatformclock true`,
+  3.58 MHz = ACPI PM timer), and the app requests the finest system timer resolution (usually 0.5 ms) while it
+  runs. On Linux it shows the clocksource (`tsc`, `hpet`, `acpi_pm`). A slow source is flagged. Both are saved
+  in the session record.
 
 Notes on the numbers:
 
@@ -139,6 +202,54 @@ waits so you cannot anticipate, red *wait* / green *go* screen with a black/whit
 red-black-red finish flash). A small Arduino Pro Micro rig can click/press for you, and measure the
 display too (refresh rate, response time, click-to-photon). Schematics, parts list, wiring and calibration:
 [`docs/latency-rig/README.md`](docs/latency-rig/README.md). Firmware: [`arduino/latency_rig`](arduino/latency_rig).
+
+## How the code fits together
+
+```mermaid
+flowchart TD
+  user(("User")) --> main["main.rs<br/>arguments, renderer choice"]
+  main -->|"--cli"| cli["cli.rs"]
+  main -->|"--serve / --report"| server["server.rs / report.rs"]
+  main -->|"--pattern"| pattern["pattern_window.rs<br/>VSync-locked pattern"]
+  main -->|"default"| gui["gui.rs + gui/*<br/>tabs, Run all, graphs"]
+  main --> render["render_setup.rs<br/>Vulkan (wgpu) or OpenGL"]
+  pattern --> render
+
+  gui -->|"starts"| runall["run_all.rs<br/>ordered job, user hand-off"]
+  gui --> suites
+  cli --> suites
+  runall --> suites
+  subgraph suites["Benchmark suites"]
+    mem["memory_benchmark.rs"]
+    cpu["cpu_benchmark.rs"]
+    gpu["gpu_benchmark.rs (Vulkan compute)"]
+    inp["input_latency.rs (timing suite)"]
+  end
+  gui --> trials["input_test.rs + gui/input_ui.rs<br/>click / key trials"]
+  gui --> rig["rig.rs<br/>display patterns, calibration"]
+
+  suites -->|"record phase + telemetry"| sensors["sensors.rs<br/>sampler: hwmon, RAPL, LHM, nvidia-smi"]
+  sensors --> lhm["lhm.rs<br/>LibreHardwareMonitor library"]
+  suites -->|"keep_off(test cores)"| appcore["app_core.rs<br/>reserved core for the app"]
+  gui -->|"follows"| appcore
+  sensors -->|"follows"| appcore
+  suites --> timer["timer.rs"]
+  suites --> cancel["cancel.rs / progress.rs"]
+  mem --> topo["topology.rs<br/>pinning, P/E cores"]
+  cpu --> topo
+
+  gui --> sysinfo["system_info.rs + hwinfo.rs"]
+  gui --> virt["virtualization.rs"]
+  gui --> timers["timer_info.rs<br/>QPC / HPET, timer resolution"]
+
+  gui -->|"session data"| session["session.rs<br/>record + CSV export"]
+  cli --> session
+  session --> logger["result_logger.rs<br/>Ed25519, hash chain"]
+  logger --> files[("latency_results/*.json")]
+  files --> server
+  server --> viewer["web/viewer.html"]
+  browser(("Browser")) --> server
+```
 
 ## Tests
 

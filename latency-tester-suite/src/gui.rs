@@ -88,6 +88,7 @@ pub struct LatencyTesterApp {
     sampler: Option<Arc<crate::sensors::Sampler>>,
     sampler_active: bool,
     last_timeline: Vec<crate::sensors::Snapshot>,
+    last_phases: Vec<crate::sensors::Phase>,
     sensor_notes: Vec<String>,
     sensor_probe: Option<(Vec<String>, crate::sensors::Snapshot)>,
     
@@ -106,6 +107,19 @@ pub struct LatencyTesterApp {
     web_lan: bool,
     web_note: String,
     results_dir_path: std::path::PathBuf,
+    /// Start of the previous frame (the frame cap while tests run)
+    last_frame: Instant,
+    /// Finest system timer resolution, held while the app runs (Windows)
+    _timer_res: crate::timer_info::HighResolutionTimer,
+    /// Clock sources and timer resolution, read after the request above
+    timers: crate::timer_info::TimerSources,
+    /// How the window is drawn (Vulkan via wgpu or OpenGL), shown to the user
+    renderer: String,
+    is_admin: bool,
+    /// Result of the LibreHardwareMonitor download, filled by its worker thread
+    lhm_fetch: Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    lhm_fetching: bool,
+    lhm_note: String,
 }
 
 /// See `LatencyTesterApp::session_snapshot`
@@ -188,6 +202,7 @@ impl LatencyTesterApp {
             sampler: None,
             sampler_active: false,
             last_timeline: Vec::new(),
+            last_phases: Vec::new(),
             sensor_notes: Vec::new(),
             sensor_probe: None,
             gpu_config: GpuBenchmarkConfig::default(),
@@ -202,7 +217,20 @@ impl LatencyTesterApp {
             web_lan: false,
             web_note: String::new(),
             results_dir_path: config_dir.clone(),
+            last_frame: Instant::now(),
+            _timer_res: crate::timer_info::HighResolutionTimer::acquire(),
+            timers: crate::timer_info::query(),
+            renderer: String::new(),
+            is_admin: crate::lhm::is_admin(),
+            lhm_fetch: Arc::new(std::sync::Mutex::new(None)),
+            lhm_fetching: false,
+            lhm_note: String::new(),
         }
+    }
+
+    pub fn set_renderer(&mut self, r: String) {
+        self.log(&format!("Drawing with: {}", r));
+        self.renderer = r;
     }
 
     /// Folder holding the signed result files (next to the executable)
@@ -309,6 +337,8 @@ impl LatencyTesterApp {
     }
 
     fn check_completed_tasks(&mut self) {
+        // follow the core reservation (tests may have moved the app away from the core they measure)
+        crate::app_core::apply_gui();
         self.finish_sampler_if_idle();
         if let Some(p) = COMPLETE_PROBE.lock().unwrap().take() {
             self.sensor_probe = Some(p);
@@ -434,8 +464,10 @@ impl LatencyTesterApp {
             input_suite: self.last_input_result.as_ref(),
             trials: &snap.trials,
             timeline: &self.last_timeline,
+            phases: &self.last_phases,
             sensor_notes: &self.sensor_notes,
             virtualization: snap.virtualization.clone(),
+            timers: serde_json::to_value(&self.timers).ok(),
             calibration: Some(&self.input_test.cal),
             memory_extra_configs: &self.mem_extra_configs,
             cpu_extra_configs: &self.cpu_extra_configs,
@@ -577,7 +609,43 @@ impl LatencyTesterApp {
         }
         
         ui.separator();
+        ui.heading("Display");
+        ui.label(format!("Renderer: {}", if self.renderer.is_empty() { "unknown" } else { &self.renderer }));
+        ui.label(RichText::new("Start with --renderer opengl or --renderer vulkan to force one; the precise pattern window always presents with VSync.").weak().small());
+
+        ui.separator();
+        ui.heading("Timers");
+        let t = &self.timers;
+        egui::Grid::new("timers").show(ui, |ui| {
+            ui.label("Time source:");
+            ui.label(format!("{} · {} Hz", t.qpc_source, t.qpc_hz));
+            ui.end_row();
+            if let Some(cur) = t.timer_res_current_ms {
+                ui.label("Timer resolution:");
+                ui.label(format!(
+                    "{:.3} ms now (finest {:.3} ms, default {:.3} ms)",
+                    cur,
+                    t.timer_res_finest_ms.unwrap_or(0.0),
+                    t.timer_res_coarsest_ms.unwrap_or(0.0)
+                ));
+                ui.end_row();
+            }
+            if let Some(avail) = &t.clocksources_available {
+                ui.label("Available clocksources:");
+                ui.label(avail);
+                ui.end_row();
+            }
+        });
+        for n in &t.notes {
+            ui.colored_label(Color32::YELLOW, format!("⚠ {}", n));
+        }
+        if ui.small_button("Re-check timers").clicked() {
+            self.timers = crate::timer_info::query();
+        }
+
+        ui.separator();
         ui.heading("Sensors");
+        self.lhm_panel(ui);
         match &self.sensor_probe {
             None => {
                 ui.label("Probing sensors...");
@@ -616,6 +684,63 @@ impl LatencyTesterApp {
         }
         ui.separator();
         ui.label(format!("Last refresh: {:.0} seconds ago", self.last_refresh.elapsed().as_secs()));
+    }
+
+    /// Where the extra sensors come from, and the buttons to get more of them
+    fn lhm_panel(&mut self, ui: &mut Ui) {
+        let fetched = self.lhm_fetch.lock().unwrap().take();
+        if let Some(r) = fetched {
+            self.lhm_fetching = false;
+            self.lhm_note = match r {
+                Ok(t) => format!("{} · used from the next test on", t.lines().last().unwrap_or("done")),
+                Err(e) => format!("download failed: {}", e.lines().last().unwrap_or("")),
+            };
+            let n = self.lhm_note.clone();
+            self.log(&format!("LibreHardwareMonitor: {}", n));
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Administrator: {}", if self.is_admin { "yes" } else { "no" }));
+            if !self.is_admin
+                && ui
+                    .button("Restart as administrator")
+                    .on_hover_text("Board, VRM, memory and CPU sensors (LibreHardwareMonitor driver, RAPL on Linux) need administrator rights")
+                    .clicked()
+            {
+                match crate::lhm::restart_as_admin() {
+                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.lhm_note = e,
+                }
+            }
+        });
+        if cfg!(target_os = "windows") {
+            ui.horizontal_wrapped(|ui| {
+                match crate::lhm::dir() {
+                    Some(d) => {
+                        ui.label(format!("LibreHardwareMonitor library: {}", d.display()));
+                    }
+                    None => {
+                        ui.label("LibreHardwareMonitor library: not installed (sensors come from the LibreHardwareMonitor app if it runs, else ACPI)");
+                    }
+                }
+                let label = if crate::lhm::dir().is_some() { "Update LibreHardwareMonitor" } else { "Download LibreHardwareMonitor" };
+                if ui
+                    .add_enabled(!self.lhm_fetching, egui::Button::new(label))
+                    .on_hover_text("Fetches the latest release from github.com/LibreHardwareMonitor/LibreHardwareMonitor (MPL-2.0) into a folder next to the exe")
+                    .clicked()
+                {
+                    self.lhm_fetching = true;
+                    self.lhm_note = "downloading…".into();
+                    let slot = self.lhm_fetch.clone();
+                    thread::spawn(move || {
+                        let r = crate::lhm::fetch();
+                        *slot.lock().unwrap() = Some(r);
+                    });
+                }
+            });
+        }
+        if !self.lhm_note.is_empty() {
+            ui.label(RichText::new(&self.lhm_note).weak().small());
+        }
     }
 
     fn render_gpu_tab(&mut self, ui: &mut Ui) {
@@ -943,6 +1068,19 @@ impl LatencyTesterApp {
 
 impl eframe::App for LatencyTesterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // VSync is off and spinners ask for a new frame every frame, so the GUI thread would otherwise
+        // spin at 100 % on one core for the whole test. While a benchmark runs (and no interactive
+        // trial or display pattern needs exact frame timing) draw at most ~20 frames per second.
+        let timing_screen = self.input_test.engine.is_active() || self.input_test.display.is_running();
+        if self.is_running() && !timing_screen {
+            let min_frame = Duration::from_millis(50);
+            let spent = self.last_frame.elapsed();
+            if spent < min_frame {
+                thread::sleep(min_frame - spent);
+            }
+        }
+        self.last_frame = Instant::now();
+
         self.check_completed_tasks();
         self.run_all_tick();
 

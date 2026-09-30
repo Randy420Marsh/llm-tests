@@ -397,6 +397,7 @@ impl GpuBenchmark {
             results.push(r);
         }
 
+        progress::update(&self.progress, |p| p.finished = Some(std::time::Instant::now()));
         Ok(GpuBenchmarkSummary {
             results,
             config: self.config.clone(),
@@ -650,7 +651,7 @@ impl GpuBenchmark {
             percentile_99_ms: pct(0.99),
             throughput_geops: if avg > 0.0 { ops / (avg / 1000.0) / 1e9 } else { 0.0 },
             telemetry: match (&self.sensors, sensor_start) {
-                (Some(s), Some(t0)) => s.window(t0, s.now_ms()),
+                (Some(s), Some(t0)) => s.record("gpu", format!("GPU · {} elements", size), t0, s.now_ms()),
                 _ => Telemetry::default(),
             },
         })

@@ -33,6 +33,10 @@ pub struct MemoryBenchmarkConfig {
     /// faulty core stands out. Thread counts are ignored in this mode.
     #[serde(default)]
     pub per_core: bool,
+    /// Per-core mode only: run every test on one core before moving to the next (false = rotate the
+    /// cores between tests, which spreads the heat more evenly)
+    #[serde(default)]
+    pub core_by_core: bool,
 }
 
 /// Every buffer size the app offers, 4 KB to 1 GB
@@ -51,6 +55,16 @@ pub fn memory_needed_for(size: usize, patterns: &[AccessPattern]) -> usize {
     let chase = patterns.iter().any(|p| matches!(p, AccessPattern::PointerChase));
     size + if aux { size } else { 0 } + if chase { size + size / 8 } else { 0 }
 }
+
+fn one() -> u32 {
+    1
+}
+
+/// A timed run lasts at least this long: small buffers repeat their pass inside the run, otherwise one
+/// pass takes nanoseconds and the timer read, a TLB miss or an interrupt decides the result
+const MIN_RUN_NS: f64 = 50_000.0;
+/// Most passes repeated inside one timed run
+const MAX_PASSES_PER_RUN: u32 = 100_000;
 
 /// Fewest measured runs a test does before the time budget may cut it short
 const MIN_ITERATIONS: usize = 3;
@@ -106,6 +120,7 @@ impl Default for MemoryBenchmarkConfig {
             core_label: "All cores (OS scheduled)".to_string(),
             time_budget_ms: 5000,
             per_core: false,
+            core_by_core: false,
         }
     }
 }
@@ -224,6 +239,10 @@ impl AccessPattern {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryBenchmarkResult {
+    /// Passes over the buffer inside each timed run (small buffers repeat so a run lasts ≥ 50 µs);
+    /// all times are per pass
+    #[serde(default = "one")]
+    pub passes_per_run: u32,
     pub size: usize,
     pub pattern: AccessPattern,
     pub thread_count: usize,
@@ -273,6 +292,8 @@ pub struct MemProgress {
     pub last_run_ns: f64,
     pub completed: Vec<MemoryBenchmarkResult>,
     pub started: Option<std::time::Instant>,
+    /// Set when the run ended (finished, stopped or failed)
+    pub finished: Option<std::time::Instant>,
 }
 
 pub type ProgressHandle = Arc<Mutex<MemProgress>>;
@@ -294,6 +315,8 @@ pub struct MemoryBenchmark {
     timer: HighResTimer,
     rng: StdRng,
     cancel: CancelFlag,
+    /// Passes over the buffer inside one timed run (see MIN_RUN_NS)
+    passes: std::sync::atomic::AtomicU32,
 }
 
 /// Per-(size, pattern, threads) setup data built once, outside the timed region and
@@ -337,6 +360,7 @@ impl MemoryBenchmark {
             cancel: cancel::new_flag(),
             progress: None,
             carry_over: false,
+            passes: std::sync::atomic::AtomicU32::new(1),
             sensors: None,
             active_cores: Vec::new(),
             active_label: String::new(),
@@ -409,20 +433,41 @@ impl MemoryBenchmark {
             }
         });
 
-        for size in self.config.sizes.clone() {
+        let sizes = self.config.sizes.clone();
+        let needs_aux = self.config.patterns.iter().any(|p| p.needs_aux());
+        // (size, core group) in run order: sizes outermost rotates the cores between tests; with
+        // core_by_core every size and pattern finishes on one core before the next core starts
+        let order: Vec<(usize, usize)> = if self.config.core_by_core {
+            (0..groups.len()).flat_map(|g| sizes.iter().map(move |&s| (s, g))).collect()
+        } else {
+            sizes.iter().flat_map(|&s| (0..groups.len()).map(move |g| (s, g))).collect()
+        };
+        let (mut data, mut aux, mut have) = (Vec::new(), Vec::new(), None::<usize>);
+        for (size, gi) in order {
             cancel::check(&self.cancel)?;
-            self.update_progress(|p| {
-                p.size = size;
-                p.pattern = None;
-                p.phase = "allocating".into();
-            });
-            // Allocate once per size and reuse across all patterns, threads and cores;
-            // the second buffer only exists for the STREAM patterns that need it
-            let mut data = self.allocate_buffer(size)?;
-            let needs_aux = self.config.patterns.iter().any(|p| p.needs_aux());
-            let mut aux = if needs_aux { self.allocate_buffer(size)? } else { Vec::new() };
-
-            for (group_cores, group_label) in &groups {
+            if have != Some(size) {
+                self.update_progress(|p| {
+                    p.size = size;
+                    p.pattern = None;
+                    p.phase = "allocating".into();
+                });
+                // Allocate once per size and reuse across patterns, threads (and cores, when rotating);
+                // the second buffer only exists for the STREAM patterns that need it
+                // free the previous size before allocating the next
+                drop(std::mem::take(&mut data));
+                drop(std::mem::take(&mut aux));
+                data = self.allocate_buffer(size)?;
+                if needs_aux {
+                    aux = self.allocate_buffer(size)?;
+                }
+                have = Some(size);
+            }
+            {
+                let (group_cores, group_label) = &groups[gi];
+                if self.active_cores != *group_cores {
+                    // the app's own threads must not share the core(s) being measured
+                    crate::app_core::keep_off(group_cores);
+                }
                 self.active_cores = group_cores.clone();
                 self.active_label = group_label.clone();
                 for pattern in self.config.patterns.clone() {
@@ -440,6 +485,7 @@ impl MemoryBenchmark {
             }
         }
         self.active_cores.clear();
+        self.update_progress(|p| p.finished = Some(std::time::Instant::now()));
 
         Ok(MemoryBenchmarkSummary {
             results,
@@ -491,6 +537,19 @@ impl MemoryBenchmark {
         }
         let prep = if thread_count == 1 { warm_prep } else { self.prepare(pattern, size, thread_count) };
 
+        // How many passes make a timed run long enough to measure: double until one untimed probe
+        // run lasts MIN_RUN_NS (a single probe pass would include thread start-up and look too slow)
+        let mut passes = 1u32;
+        loop {
+            self.passes.store(passes, std::sync::atomic::Ordering::Relaxed);
+            let (per_pass_ns, _) = self.run_pattern(data, aux, size, pattern, thread_count, &prep)?;
+            if per_pass_ns * passes as f64 >= MIN_RUN_NS || passes >= MAX_PASSES_PER_RUN {
+                break;
+            }
+            let want = (MIN_RUN_NS / per_pass_ns.max(1.0) / passes as f64).ceil().clamp(2.0, 16.0) as u32;
+            passes = passes.saturating_mul(want).min(MAX_PASSES_PER_RUN);
+        }
+
         // Actual benchmark
         let iterations = planned;
         let mut latencies = Vec::with_capacity(iterations as usize);
@@ -534,7 +593,9 @@ impl MemoryBenchmark {
         // Calculate bandwidth (bytes/ns == GB/s)
         let bandwidth_gb_s = if sum > 0.0 { total_bytes as f64 / sum } else { 0.0 };
 
+        let passes_per_run = self.passes.swap(1, std::sync::atomic::Ordering::Relaxed);
         Ok(MemoryBenchmarkResult {
+            passes_per_run,
             size,
             pattern,
             thread_count,
@@ -558,11 +619,16 @@ impl MemoryBenchmark {
                     0.0
                 }
             },
-            cores,
             telemetry: match (&self.sensors, sensor_start) {
-                (Some(s), Some(t0)) => s.window(t0, s.now_ms()),
+                (Some(s), Some(t0)) => s.record(
+                    "memory",
+                    format!("Memory · {} KB · {} · {} thread(s) · {}", size / 1024, pattern.label(), thread_count, cores),
+                    t0,
+                    s.now_ms(),
+                ),
                 _ => Telemetry::default(),
             },
+            cores,
         })
     }
 
@@ -599,6 +665,7 @@ impl MemoryBenchmark {
         F: Fn(usize) -> usize + Sync,
     {
         let barrier = Barrier::new(tc);
+        let passes = self.passes.load(std::sync::atomic::Ordering::Relaxed).max(1);
         let results: Vec<(usize, u64)> = std::thread::scope(|s| {
             let (worker, barrier) = (&worker, &barrier);
             let handles: Vec<_> = (0..tc)
@@ -607,7 +674,10 @@ impl MemoryBenchmark {
                         self.pin_worker(i);
                         barrier.wait();
                         let t0 = self.timer.now_ticks();
-                        let bytes = worker(i);
+                        let mut bytes = 0;
+                        for _ in 0..passes {
+                            bytes += worker(i);
+                        }
                         (bytes, self.timer.now_ticks() - t0)
                     })
                 })
@@ -624,6 +694,7 @@ impl MemoryBenchmark {
     {
         let chunks = split_mut(buf, tc);
         let barrier = Barrier::new(tc);
+        let passes = self.passes.load(std::sync::atomic::Ordering::Relaxed).max(1);
         let results: Vec<(usize, u64)> = std::thread::scope(|s| {
             let (worker, barrier) = (&worker, &barrier);
             let handles: Vec<_> = chunks
@@ -634,7 +705,10 @@ impl MemoryBenchmark {
                         self.pin_worker(i);
                         barrier.wait();
                         let t0 = self.timer.now_ticks();
-                        let bytes = worker(i, chunk);
+                        let mut bytes = 0;
+                        for _ in 0..passes {
+                            bytes += worker(i, &mut chunk[..]);
+                        }
                         (bytes, self.timer.now_ticks() - t0)
                     })
                 })
@@ -676,7 +750,9 @@ impl MemoryBenchmark {
             AccessPattern::StreamAdd => self.stream_add(data, aux, tc),
             AccessPattern::StreamTriad => self.stream_triad(data, aux, tc),
         };
-        Ok((ns, bytes))
+        // one "run" is reported per pass over the buffer
+        let passes = self.passes.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        Ok((ns / passes as f64, bytes / passes as u64))
     }
 
     // Sequential read - measures memory read bandwidth
@@ -1075,6 +1151,64 @@ mod tests {
         assert!(started.elapsed().as_secs_f64() < 5.0, "budget ignored: {:?}", started.elapsed());
         let n = s.results[0].iterations;
         assert!(n >= 3 && n < 100_000, "iterations = {}", n);
+    }
+
+    #[test]
+    fn test_short_runs_repeat_their_pass_until_they_are_measurable() {
+        let run = |size: usize, stride: usize| {
+            let cfg = MemoryBenchmarkConfig {
+                sizes: vec![size],
+                patterns: vec![AccessPattern::StridedRead { stride }],
+                iterations: 5,
+                warmup_iterations: 1,
+                thread_counts: vec![1],
+                time_budget_ms: 0,
+                ..MemoryBenchmarkConfig::default()
+            };
+            MemoryBenchmark::new(cfg).run().unwrap().results.remove(0)
+        };
+        // 128 KB with a 4 KB stride is 32 loads: one pass is far below a microsecond
+        let small = run(128 * 1024, 4096);
+        assert!(small.passes_per_run > 1, "passes {}", small.passes_per_run);
+        assert!(small.min_latency_ns * small.passes_per_run as f64 >= MIN_RUN_NS * 0.5, "a timed run lasts tens of µs");
+        assert!(small.min_latency_ns < 50_000.0, "times are reported per pass");
+        // a big buffer already takes long enough per pass
+        let big = run(64 << 20, 64);
+        assert_eq!(big.passes_per_run, 1);
+    }
+
+    #[test]
+    fn test_core_order_modes() {
+        let n = num_cpus::get().min(3);
+        if n < 2 {
+            return;
+        }
+        let cfg = |core_by_core| MemoryBenchmarkConfig {
+            sizes: vec![16 * 1024, 32 * 1024],
+            patterns: vec![AccessPattern::SequentialRead],
+            iterations: 3,
+            warmup_iterations: 0,
+            thread_counts: vec![1],
+            time_budget_ms: 0,
+            core_ids: (0..n).collect(),
+            per_core: true,
+            core_by_core,
+            ..MemoryBenchmarkConfig::default()
+        };
+        let order = |c| {
+            let s = MemoryBenchmark::new(cfg(c)).run().unwrap();
+            s.results.iter().map(|r| (r.size / 1024, r.cores.clone())).collect::<Vec<_>>()
+        };
+        // rotating: size 16 KB on every core, then 32 KB on every core
+        let rot = order(false);
+        assert_eq!(rot[0], (16, "Core 0".to_string()));
+        assert_eq!(rot[1], (16, "Core 1".to_string()));
+        // core by core: every size on core 0 first
+        let cbc = order(true);
+        assert_eq!(cbc[0], (16, "Core 0".to_string()));
+        assert_eq!(cbc[1], (32, "Core 0".to_string()));
+        assert_eq!(cbc[2], (16, "Core 1".to_string()));
+        assert_eq!(rot.len(), cbc.len());
     }
 
     #[test]

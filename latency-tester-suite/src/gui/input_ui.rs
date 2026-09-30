@@ -125,6 +125,7 @@ impl LatencyTesterApp {
                     ui.selectable_value(&mut self.input_test.sub, SubTab::Keyboard, "⌨ Keyboard press test");
                     ui.selectable_value(&mut self.input_test.sub, SubTab::Display, "🖥 Display / rig patterns");
                 });
+                ui.label(RichText::new(format!("drawn with {}", self.renderer)).weak().small());
                 if let Some(info) = &self.input_test.timer_info {
                     ui.label(RichText::new(format!("timer {} Hz · overhead {} ns", info.frequency_hz, info.overhead_ns)).weak().small());
                 }
@@ -368,6 +369,38 @@ impl LatencyTesterApp {
                 }
             });
             ui.checkbox(&mut self.display_whole_area, "Use the whole area (not just the right-hand bar)");
+        });
+        ui.group(|ui| {
+            ui.label(RichText::new("Precise pattern window (recommended for the rig)").strong());
+            ui.label(
+                RichText::new(
+                    "This app runs with VSync off, so the pattern below changes whenever a frame happens to be drawn and short phases \
+                     are shown irregularly. The precise window runs full screen, VSync-locked, at the highest timer resolution and \
+                     switches only on whole refresh periods: every flash is identical. A display cannot show less than one refresh, \
+                     so e.g. 1 ms white becomes exactly one frame. Esc closes it, I hides the text.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.horizontal(|ui| {
+                let d = self.input_test.display.cfg.clone();
+                if ui.button(RichText::new("▶ Open precise pattern window").strong()).clicked() {
+                    let args = [
+                        "--pattern".to_string(),
+                        "--on-ms".into(),
+                        d.on_ms.to_string(),
+                        "--off-ms".into(),
+                        d.off_ms.to_string(),
+                        "--cycles".into(),
+                        d.cycles.to_string(),
+                    ];
+                    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(&args).spawn()) {
+                        Ok(_) => self.log(&format!("Opened the precise pattern window: white {} ms, black {} ms, {} cycles", d.on_ms, d.off_ms, d.cycles)),
+                        Err(e) => self.log(&format!("Could not open the pattern window: {}", e)),
+                    }
+                }
+                ui.label(RichText::new("uses the White / Black / Cycles values below").weak().small());
+            });
         });
         ui.horizontal(|ui| {
             if !running {

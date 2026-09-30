@@ -13,6 +13,12 @@ if errorlevel 1 (
   echo The fresh build is at target\release\latency-tester.exe
   exit /b 1
 )
+rem Optional: LibreHardwareMonitor's library for board / VRM / memory / fan / power sensors (MPL-2.0).
+rem The app works without it; the Dashboard also has a Download button.
+if not exist dist\LibreHardwareMonitor\LibreHardwareMonitorLib.dll (
+  echo Fetching LibreHardwareMonitor library for the sensors...
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\get-librehardwaremonitor.ps1 -Target dist || echo   (skipped: no download possible, sensors fall back to the LibreHardwareMonitor app or ACPI)
+)
 echo.
 echo Done: %~dp0dist\LatencyTester.exe
 echo Run it with a double-click, or "dist\LatencyTester.exe --cli" from a terminal.

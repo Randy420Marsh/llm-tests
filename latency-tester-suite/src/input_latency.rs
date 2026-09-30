@@ -165,7 +165,8 @@ impl InputLatencyTester {
             let t0 = self.sensors.as_ref().map(|s| s.now_ms());
             let mut result = self.run_mode(mode)?;
             if let (Some(s), Some(t0)) = (&self.sensors, t0) {
-                result.telemetry = s.window(t0, s.now_ms());
+                let label = format!("Input · {:?}{}", mode, self.config.pin_core.map(|c| format!(" · core {}", c)).unwrap_or_default());
+                result.telemetry = s.record("input", label, t0, s.now_ms());
             }
             progress::update(&self.progress, |p| p.done += 1);
             results.push(result);
@@ -526,6 +527,9 @@ pub fn run_passes(
     let mut merged: Option<InputLatencySummary> = None;
     for (i, core) in passes.iter().enumerate() {
         crate::cancel::check(&cancel_flag)?;
+        if let Some(c) = core {
+            crate::app_core::keep_off(&[*c]);
+        }
         let inner = progress::new();
         let cfg = InputLatencyConfig { pin_core: *core, ..base.clone() };
         // Run on a fresh thread so the pin does not leak into the caller
@@ -559,6 +563,12 @@ pub fn run_passes(
             Some(m) => m.results.extend(summary.results),
             None => merged = Some(summary),
         }
+    }
+    // the watcher stops before it sees the last pass complete: publish the final state
+    if let Ok(mut o) = prog.lock() {
+        o.total = total;
+        o.done = total;
+        o.finished = Some(std::time::Instant::now());
     }
     merged.ok_or_else(|| anyhow::anyhow!("no input passes to run"))
 }
