@@ -70,6 +70,18 @@ The **Results & Graphs** tab charts every value, and each line or column can be 
 The Dashboard lists which sensors were found. Windows itself does not expose per-core CPU temperatures
 to normal programs, so without a helper such as LibreHardwareMonitor those columns stay empty.
 
+Notes on the numbers:
+
+- The ACPI thermal-zone fallback is not a CPU sensor on every PC: many boards report a fixed value (or a
+  whole-degree value that rarely changes). When the app sees a CPU temperature that has not moved for
+  ~15 s while the CPU is busy it says so in the sensor notes; run LibreHardwareMonitor for real readings.
+  Of several ACPI zones, the one that actually changes is used rather than simply the hottest.
+- If the Windows sensor helper stops updating, its old readings are discarded (and it is restarted)
+  instead of being repeated as if they were live.
+- Each GPU size keeps dispatching for at least 2 s so GPU load, clocks, power and temperature have time to
+  register; a single dispatch takes microseconds and would read as ~0 % load. GPU load comes from
+  `nvidia-smi` or, on Linux/AMD, `gpu_busy_percent`.
+
 ## Logging and viewing results
 
 - **Log everything** (Dashboard) runs nothing new: it saves all results currently in the app (memory, CPU, GPU,

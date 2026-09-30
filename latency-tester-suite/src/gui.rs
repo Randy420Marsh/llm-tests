@@ -219,7 +219,8 @@ impl LatencyTesterApp {
         // One-shot sensor probe (needs ~1 s of samples, so it runs on its own thread)
         thread::spawn(|| {
             let sampler = crate::sensors::Sampler::start(Duration::from_millis(250));
-            thread::sleep(Duration::from_millis(1400));
+            // The Windows sensor helper (PowerShell) needs a few seconds before its first reading
+            thread::sleep(Duration::from_millis(if cfg!(target_os = "windows") { 4500 } else { 1400 }));
             sampler.stop();
             if let Some(last) = sampler.timeline().pop() {
                 *COMPLETE_PROBE.lock().unwrap() = Some((sampler.notes(), last));
