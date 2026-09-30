@@ -189,6 +189,23 @@ const KINDS = {
       values: Object.assign({ avg_ms: r.avg_latency_ms * 1e6, p95_ms: r.percentile_95_ms * 1e6, p99_ms: r.percentile_99_ms * 1e6, min_ms: r.min_latency_ms * 1e6, gops: r.throughput_geops }, telemetryValues(r.telemetry)),
     })); },
   },
+  gpu3d: {
+    title: '3D graphics (wgpu, rendered off screen)',
+    metrics: [['fps_avg','Average FPS','FPS'],['fps_1pct','1 % low','FPS'],['fps_01pct','0.1 % low','FPS'],['ft_avg','Frame time avg','time'],['ft_p99','Frame time p99','time'],['ft_max','Worst frame','time'],['lat_avg','Latency (submit → done)','time'],['lat_p99','Latency p99','time'],['gpu_ms','GPU time per frame','time']].concat(TELEMETRY),
+    rows(sec) { return (sec.results || []).map(r => ({
+      series: `${String(r.detail || '').split(' (')[0]} · MSAA ${r.msaa}×`, x: r.height, xLabel: r.name,
+      values: Object.assign({ fps_avg: r.fps_avg, fps_1pct: r.fps_1pct_low, fps_01pct: r.fps_01pct_low, ft_avg: r.frametime_avg_ms * 1e6, ft_p99: r.frametime_p99_ms * 1e6, ft_max: r.frametime_max_ms * 1e6, lat_avg: r.latency_avg_ms * 1e6, lat_p99: r.latency_p99_ms * 1e6 }, r.gpu_time_avg_ms != null ? { gpu_ms: r.gpu_time_avg_ms * 1e6 } : {}, telemetryValues(r.telemetry)),
+    })); },
+  },
+  gpu3d_frames: {
+    title: '3D graphics: every frame (spikes are stutters)',
+    metrics: [['ft','Frame time','time']],
+    rows(sec) {
+      const rows = [];
+      (sec.results || []).forEach(r => (r.frametimes_ms || []).forEach((t, i) => rows.push({ series: `${r.name} (${r.width}×${r.height})`, x: i + 1, xLabel: `frame ${i + 1}`, values: { ft: t * 1e6 } })));
+      return rows;
+    },
+  },
   input_timing_suite: {
     title: 'OS timing suite (no device input: sleep / wake-up precision)',
     metrics: [['avg_ms','Average','time'],['p99_ms','p99','time'],['max_ms','Worst','time'],['jitter_ms','Jitter','time'],['polling_hz','Loop rate','Hz'],['samples','Samples','']].concat(TELEMETRY),
@@ -308,9 +325,11 @@ async function select(name, multi) {
 // ------------------------------------------------------------------------------------------------
 function sectionsOf(doc) {
   const p = doc.payload || {}; const br = p.benchmark_results || {}; const t = p.test_type;
-  const known = ['memory','cpu','gpu','input_timing_suite','input_trials','mouse_polling','reflex_game','sensors','virtualization'];
+  const known = ['memory','cpu','gpu','gpu3d','input_timing_suite','input_trials','mouse_polling','reflex_game','sensors','virtualization'];
   if (t === 'session' || known.some(k => br[k] !== undefined && typeof br[k] === 'object')) {
-    const s = {}; known.forEach(k => { if (br[k] !== undefined) s[k] = br[k]; }); return s;
+    const s = {}; known.forEach(k => { if (br[k] !== undefined) s[k] = br[k]; });
+    if (s.gpu3d) s.gpu3d_frames = s.gpu3d;   // the same results, drawn frame by frame
+    return s;
   }
   // older single-suite files: benchmark_results is the suite's summary
   if (t === 'input') return { input_timing_suite: br };
@@ -775,6 +794,7 @@ function findAnomalies(kindKey, rows) {
     const v = r.values;
     if (kindKey === 'memory' && v.p99_run > 0 && v.min_run > 0 && v.p99_run / v.min_run > 2) add(r, `unstable: slowest run ${(v.p99_run / v.min_run).toFixed(1)}× the best`, v.p99_run / v.min_run > 4);
     if (kindKey === 'gpu' && v.p99_ms > 0 && v.avg_ms > 0 && v.p99_ms / v.avg_ms > 2) add(r, `p99 dispatch ${(v.p99_ms / v.avg_ms).toFixed(1)}× the average`, v.p99_ms / v.avg_ms > 4);
+    if (kindKey === 'gpu3d' && v.ft_p99 > 0 && v.ft_avg > 0 && v.ft_p99 / v.ft_avg > 2) add(r, `stutter: p99 frame ${(v.ft_p99 / v.ft_avg).toFixed(1)}× the average frame`, v.ft_p99 / v.ft_avg > 4);
     if (kindKey === 'input_timing_suite' && v.p99_ms > 0 && v.avg_ms > 0 && v.p99_ms / v.avg_ms > 1.5) add(r, `p99 ${(v.p99_ms / v.avg_ms).toFixed(1)}× the average`, v.p99_ms / v.avg_ms > 3);
   });
   return out;
@@ -1012,7 +1032,7 @@ function overview(doc, name, meta) {
 // page
 // ------------------------------------------------------------------------------------------------
 let lastRender = null;
-const KIND_ORDER = ['memory', 'cpu', 'gpu', 'input_timing_suite', 'input_trials', 'mouse_polling', 'reflex_game'];
+const KIND_ORDER = ['memory', 'cpu', 'gpu', 'gpu3d', 'gpu3d_frames', 'input_timing_suite', 'input_trials', 'mouse_polling', 'reflex_game'];
 const entriesFor = k => lastRender.perDoc.filter(p => p.sections[k]).map(p => ({ label: p.label, sec: p.sections[k] }));
 
 function render() {

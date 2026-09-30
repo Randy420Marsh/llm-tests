@@ -14,6 +14,7 @@ mod input_ui;
 mod memory_ui;
 mod polling_ui;
 mod aim_ui;
+mod bench3d_ui;
 mod results_ui;
 mod run_all_ui;
 mod suites_ui;
@@ -105,6 +106,8 @@ pub struct LatencyTesterApp {
     polling: polling_ui::PollingUi,
     /// Input tab, "Reflex game"
     aim: aim_ui::AimUi,
+    /// GPU tab, "3D graphics benchmark"
+    bench3d: bench3d_ui::Bench3dUi,
     display_whole_area: bool,
     log_text: String,
     log_saved_note: String,
@@ -220,6 +223,7 @@ impl LatencyTesterApp {
             input_test: input_ui::InputTestUi::new(),
             polling: polling_ui::PollingUi::new(),
             aim: aim_ui::AimUi::new(),
+            bench3d: bench3d_ui::Bench3dUi::new(),
             display_whole_area: false,
             log_text: String::new(),
             log_saved_note: String::new(),
@@ -412,6 +416,7 @@ impl LatencyTesterApp {
             }
         }
         
+        self.poll_bench3d();
         if let Some(result) = COMPLETE_GPU_RESULT.lock().unwrap().take() {
             self.task_status = "Idle".to_string();
             match result {
@@ -487,6 +492,7 @@ impl LatencyTesterApp {
             run_info,
             mouse_polling: &self.polling.results,
             reflex_game: &self.aim.results,
+            gpu3d: self.bench3d.last.as_ref(),
         }
     }
 
@@ -789,6 +795,10 @@ impl LatencyTesterApp {
     }
 
     fn render_gpu_tab(&mut self, ui: &mut Ui) {
+        egui::ScrollArea::vertical().id_salt("gpu_tab").auto_shrink([false, false]).show(ui, |ui| self.gpu_tab_body(ui));
+    }
+
+    fn gpu_tab_body(&mut self, ui: &mut Ui) {
         ui.heading("GPU Benchmark (Vulkan)");
         ui.separator();
         
@@ -848,20 +858,20 @@ impl LatencyTesterApp {
             ui.label(format!("Vulkan device: {} ({})", vulkan_info.device_name, vulkan_info.device_type));
             ui.label(format!("API: {} Driver: {}", vulkan_info.api_version, vulkan_info.driver_version));
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for result in summary.results.iter().take(20) {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} elements", result.workload_size));
-                        ui.label(format!("{:.3} ms avg", result.avg_latency_ms));
-                        ui.label(format!("p95: {:.3} ms", result.percentile_95_ms));
-                        ui.label(format!("p99: {:.3} ms", result.percentile_99_ms));
-                        ui.label(format!("{:.1} GOPS", result.throughput_geops));
-                    });
-                }
-            });
+            for result in summary.results.iter().take(20) {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} elements", result.workload_size));
+                    ui.label(format!("{:.3} ms avg", result.avg_latency_ms));
+                    ui.label(format!("p95: {:.3} ms", result.percentile_95_ms));
+                    ui.label(format!("p99: {:.3} ms", result.percentile_99_ms));
+                    ui.label(format!("{:.1} GOPS", result.throughput_geops));
+                });
+            }
         } else {
-            ui.label("No GPU results yet. Requires a Vulkan driver (a software driver such as lavapipe also works).");
+            ui.label("No GPU compute results yet. Requires a Vulkan driver (a software driver such as lavapipe also works).");
         }
+        ui.separator();
+        self.bench3d_panel(ui);
     }
 
     fn render_virtualization_tab(&mut self, ui: &mut Ui) {

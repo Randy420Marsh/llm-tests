@@ -47,7 +47,8 @@ crossbeam = "0.8"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bytemuck = "1.25.2"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"

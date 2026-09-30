@@ -74,6 +74,8 @@ pub struct SessionData<'a> {
     pub mouse_polling: &'a [crate::mouse_poll::MousePollResult],
     /// Reflex game results (`aim_game`)
     pub reflex_game: &'a [crate::aim_game::AimResult],
+    /// 3D graphics benchmark (`bench3d`)
+    pub gpu3d: Option<&'a crate::bench3d::Bench3dSummary>,
 }
 
 /// Timeline points kept in the saved record (a long run has tens of thousands of samples)
@@ -163,6 +165,10 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
     if scope.includes(Scope::Gpu) && !data.gpu.is_empty() {
         config.insert("gpu".into(), to_value(&data.gpu_config));
         results.insert("gpu".into(), json!({ "vulkan": data.gpu_vulkan, "results": data.gpu }));
+    }
+    if let Some(g) = data.gpu3d.filter(|g| scope.includes(Scope::Gpu) && !g.results.is_empty()) {
+        config.insert("gpu3d".into(), to_value(&g.config));
+        results.insert("gpu3d".into(), json!({ "adapter": g.adapter, "backend": g.backend, "driver": g.driver, "results": g.results }));
     }
     if scope.includes(Scope::Input) {
         if let Some(s) = data.input_suite {
@@ -290,6 +296,23 @@ pub fn csv_files(data: &SessionData) -> Vec<(String, String)> {
     add("memory.csv", data.memory.iter().map(to_value).collect());
     add("cpu.csv", data.cpu.iter().map(to_value).collect());
     add("gpu.csv", data.gpu.iter().map(to_value).collect());
+    add(
+        "gpu3d.csv",
+        data.gpu3d
+            .map(|g| {
+                g.results
+                    .iter()
+                    .map(|r| {
+                        let mut v = to_value(r);
+                        if let Some(o) = v.as_object_mut() {
+                            o.remove("frametimes_ms");
+                        }
+                        v
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
     add("input_timing.csv", data.input_suite.map(|s| s.results.iter().map(to_value).collect()).unwrap_or_default());
     let mut trials = Vec::new();
     for (i, (run, cal)) in data.trials.iter().enumerate() {

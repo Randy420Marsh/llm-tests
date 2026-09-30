@@ -20,18 +20,20 @@ pub(super) enum Dataset {
     Memory,
     Cpu,
     Gpu,
+    Gpu3d,
     Input,
     Sensors,
 }
 
 impl Dataset {
-    const ALL: [Dataset; 5] = [Dataset::Memory, Dataset::Cpu, Dataset::Gpu, Dataset::Input, Dataset::Sensors];
+    const ALL: [Dataset; 6] = [Dataset::Memory, Dataset::Cpu, Dataset::Gpu, Dataset::Gpu3d, Dataset::Input, Dataset::Sensors];
 
     fn name(self) -> &'static str {
         match self {
             Dataset::Memory => "Memory",
             Dataset::Cpu => "CPU",
             Dataset::Gpu => "GPU",
+            Dataset::Gpu3d => "3D",
             Dataset::Input => "Input",
             Dataset::Sensors => "Sensors over time",
         }
@@ -42,6 +44,7 @@ impl Dataset {
             Dataset::Memory => "mem",
             Dataset::Cpu => "cpu",
             Dataset::Gpu => "gpu",
+            Dataset::Gpu3d => "g3d",
             Dataset::Input => "inp",
             Dataset::Sensors => "sen",
         }
@@ -101,6 +104,17 @@ const GPU_METRICS: [Metric; 5] = [
     ("gops", "Throughput", "GOPS"),
     ("min_ms", "Best dispatch", "ms"),
 ];
+const GPU3D_METRICS: [Metric; 9] = [
+    ("fps_avg", "Average FPS", "FPS"),
+    ("fps_1pct", "1 % low", "FPS"),
+    ("fps_01pct", "0.1 % low", "FPS"),
+    ("ft_avg", "Frame time avg", "ms"),
+    ("ft_p99", "Frame time p99", "ms"),
+    ("ft_max", "Worst frame", "ms"),
+    ("lat_avg", "Latency (submit → done)", "ms"),
+    ("lat_p99", "Latency p99", "ms"),
+    ("gpu_ms", "GPU time per frame", "ms"),
+];
 const INPUT_METRICS: [Metric; 8] = [
     ("trial_ms", "Trial latency", "ms"),
     ("trial_corrected_ms", "Trial latency (rig-corrected)", "ms"),
@@ -117,6 +131,7 @@ pub(super) fn metrics_for(d: Dataset) -> Vec<Metric> {
         Dataset::Memory => &MEMORY_METRICS,
         Dataset::Cpu => &CPU_METRICS,
         Dataset::Gpu => &GPU_METRICS,
+        Dataset::Gpu3d => &GPU3D_METRICS,
         Dataset::Input => &INPUT_METRICS,
         Dataset::Sensors => &[],
     };
@@ -269,6 +284,29 @@ pub(super) fn gpu_rows(results: &[GpuBenchmarkResult]) -> Vec<Row> {
         .collect()
 }
 
+pub(super) fn gpu3d_rows(results: &[crate::bench3d::Bench3dResult]) -> Vec<Row> {
+    results
+        .iter()
+        .map(|r| {
+            let mut v = BTreeMap::new();
+            v.insert("fps_avg", r.fps_avg);
+            v.insert("fps_1pct", r.fps_1pct_low);
+            v.insert("fps_01pct", r.fps_01pct_low);
+            v.insert("ft_avg", r.frametime_avg_ms);
+            v.insert("ft_p99", r.frametime_p99_ms);
+            v.insert("ft_max", r.frametime_max_ms);
+            v.insert("lat_avg", r.latency_avg_ms);
+            v.insert("lat_p99", r.latency_p99_ms);
+            if let Some(g) = r.gpu_time_avg_ms {
+                v.insert("gpu_ms", g);
+            }
+            telemetry_values(&r.telemetry, &mut v);
+            let detail = r.detail.split(" (").next().unwrap_or(&r.detail);
+            Row { series: format!("{} · MSAA {}×", detail, r.msaa), x: r.height as f64, x_label: r.name.clone(), values: v }
+        })
+        .collect()
+}
+
 pub(super) fn input_rows(results: &[InputLatencyResult]) -> Vec<Row> {
     results
         .iter()
@@ -408,6 +446,9 @@ pub(super) fn find_anomalies(d: Dataset, rows: &[Row]) -> Vec<Anomaly> {
             }
             Dataset::Gpu if v("p99_ms") > 0.0 && v("avg_ms") > 0.0 && v("p99_ms") / v("avg_ms") > 2.0 => {
                 add(r, format!("p99 dispatch {:.1}× the average", v("p99_ms") / v("avg_ms")), v("p99_ms") / v("avg_ms") > 4.0)
+            }
+            Dataset::Gpu3d if v("ft_p99") > 0.0 && v("ft_avg") > 0.0 && v("ft_p99") / v("ft_avg") > 2.0 => {
+                add(r, format!("stutter: p99 frame {:.1}× the average frame", v("ft_p99") / v("ft_avg")), v("ft_p99") / v("ft_avg") > 4.0)
             }
             Dataset::Input if v("p99_ms") > 0.0 && v("avg_ms") > 0.0 && v("p99_ms") / v("avg_ms") > 1.5 && !r.x_label.starts_with("trial") => {
                 add(r, format!("p99 {:.1}× the average", v("p99_ms") / v("avg_ms")), v("p99_ms") / v("avg_ms") > 3.0)
@@ -670,6 +711,13 @@ impl LatencyTesterApp {
             Dataset::Memory => memory_rows(&self.mem_progress.lock().unwrap().completed),
             Dataset::Cpu => cpu_rows(&self.cpu_partial.lock().unwrap(), crate::topology::cached_core_kinds()),
             Dataset::Gpu => gpu_rows(&self.gpu_partial.lock().unwrap()),
+            Dataset::Gpu3d => {
+                let partial = self.bench3d.partial.lock().unwrap().clone();
+                match (&self.bench3d.last, partial.is_empty()) {
+                    (Some(s), true) => gpu3d_rows(&s.results),
+                    _ => gpu3d_rows(&partial),
+                }
+            }
             Dataset::Input => {
                 let mut rows = manual_rows(&self.input_test.runs);
                 rows.extend(self.last_input_result.as_ref().map(|s| input_rows(&s.results)).unwrap_or_default());

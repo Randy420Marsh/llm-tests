@@ -242,6 +242,22 @@ Notes on the numbers:
   file's signature status (valid / edited / signed by another key), the system info, per-test results, sweeps
   and the sensor timeline, with per-series toggles.
 
+## 3D graphics benchmark
+
+GPU tab → *3D graphics benchmark* (also a step of *Run all*): a lit scene of spinning, textured cubes (Low 4 096
+cubes … Ultra 64 000, and a procedural texture with a set number of noise octaves per pixel) rendered with wgpu,
+Vulkan first, at **720p, 1080p, 1440p and 4K** (16:9), with or without 4× MSAA. It renders off screen, so the
+window, the monitor's refresh rate and VSync do not cap it: the numbers are what the GPU and driver can do.
+
+- **Frame times / FPS:** frames rendered back to back with two in flight, like a game with one frame queued. The
+  frame time is the gap between two frames finishing: average FPS, **1 % and 0.1 % lows** (average of the slowest
+  1 % / 0.1 % of frames), p50 / p95 / p99 / worst frame, and a frame-by-frame chart where stutters show as spikes.
+- **Latency:** one frame at a time, from submitting it to the GPU having finished it, the render part of
+  click-to-photon; plus the GPU's own time per frame from timestamp queries where the device supports them.
+- The GPU's temperature, clocks and power while each resolution ran are recorded like every other test, and a
+  thumbnail of the rendered scene is shown. Saved in the session (`gpu3d.csv`); the report adds a *3D graphics* and
+  a frame-by-frame section.
+
 ## Mouse polling and the reflex game
 
 - **Mouse polling** (Input tab): move the mouse, fast circles work best, for a few seconds. Every report the mouse

@@ -35,6 +35,7 @@ mod mouse_poll;
 mod aim_game;
 mod sound;
 mod displays;
+mod bench3d;
 
 use anyhow::Result;
 use eframe::egui;
