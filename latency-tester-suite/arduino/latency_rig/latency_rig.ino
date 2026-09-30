@@ -23,7 +23,7 @@
  * map does not matter):
  *   D4  (PD4/ICP1)  LIGHT     digital output of the light-sensor comparator, HIGH = white
  *   A0  (PF7/ADC7)  LIGHT_A   analog output of the photodiode amplifier, 0..5 V (waveform mode)
- *   D9  (PB5)       OUT       -> 1 kOhm -> BC550 base (mouse)   or   -> MOSFET gate driver (solenoid)
+ *   D9  (PB5)       OUT       -> 1 kOhm -> BC550 base (mouse)   or   -> 1 kOhm -> TC4420 pin 2 (solenoid gate driver)
  *   D6  (PD7)       SENSE     contact feedback: mouse button node via 10 kOhm, or a reference switch to GND
  *   D10 (PB6)       CAL_LED   -> 330 Ohm -> LED aimed at the photodiode (calibration only)
  *   GND / VCC(5 V)

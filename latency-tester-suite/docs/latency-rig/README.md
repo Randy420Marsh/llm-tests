@@ -10,7 +10,8 @@ Micro / ATmega32U4, 5 V / 16 MHz).
 
 > **Safety.** Never solder on a mouse or keyboard that is plugged in. The mouse button is a 3.3–5 V logic
 > line, harmless, but keep the USB cable out while soldering. The solenoid runs from its own supply: never power
-> it from a Pro Micro pin or from the USB 5 V rail. Photodiode and comparator circuits are low-voltage only.
+> it from a Pro Micro pin or from the USB 5 V rail (the TC4420 driver runs from that same 12 V rail; its limit is
+> 18 V). Photodiode and comparator circuits are low-voltage only.
 > If you build a mains-powered supply for the solenoid, use a ready-made certified adapter, not your own.
 
 ---
@@ -54,7 +55,7 @@ Everything is available on eBay/AliExpress/Mouser or in a normal electronics dra
 | 1 | **BPW34S** photodiode (SMD; BPW34 through-hole is identical electrically) | Silicon PIN, ~100 ns rise; not an LDR (LDRs take 10–100 ms) |
 | 1 | LM393 (dual comparator, DIP-8) | Or LM339 (quad) if you want the optional edge-pulse outputs |
 | 1 | BC550 (or BC547/2N3904, any small NPN) | Mouse-button switch |
-| resistors | 47 kΩ (sensor load), 4.7 kΩ ×2, 1 kΩ ×2, 470 kΩ (hysteresis), 10 kΩ ×2, 330 Ω, 100 Ω | 1/4 W, 5 % is fine |
+| resistors | 47 kΩ (sensor load), 4.7 kΩ ×2, 1 kΩ ×2, 470 kΩ (hysteresis), 10 kΩ ×2, 330 Ω | 1/4 W, 5 % is fine |
 | 1 | 10 kΩ multi-turn trimmer | Comparator threshold |
 | 1 | 5 mm LED (any colour, white best) + the 330 Ω | Calibration light source |
 | – | breadboard / perfboard, hookup wire, Dupont leads, black heat-shrink | |
@@ -65,10 +66,13 @@ Everything is available on eBay/AliExpress/Mouser or in a normal electronics dra
 | Qty | Part | Notes |
 |---|---|---|
 | 1 | Push-type open-frame solenoid, 5–12 V, stroke 3–5 mm (e.g. "0520/0530" 12 V types) | Faster with a short stroke and light plunger |
-| 1 | **IRLZ44N** logic-level MOSFET (or IRLB8721, AO3400 for small solenoids) | Gate is driven straight from a 5 V pin |
-| 1 | Flyback diode: 1N5819 or 1N4007 | Across the solenoid |
-| 1 | Optional 24 V zener (1N5359 / BZX85C24) in series with the flyback diode | Faster release (see below) |
-| 1 | 100 Ω (gate), 10 kΩ (gate pull-down) | |
+| 1 | **TC4420** 6 A MOSFET gate driver, Microchip, DIP-8 (e.g. TC4420CPA / TC4420EPA) or SOIC-8 | Non-inverting, VDD 4.5–18 V. Same pinout in every package; see §6 |
+| 1 | N-channel power MOSFET: **IRLZ44N**, IRFZ44N or IRF540N (Vds ≥ 40 V, Id ≥ 5 A, Vgs(th) < 4 V) | The driver gives it a full 12 V gate, so a logic-level part is no longer required |
+| 1 | Flyback diode: 1N5819 or 1N4007 | Across the solenoid, cathode to +12 V |
+| 1 | Optional 24 V zener, 1.3 W or more (BZX85C24 / 1N5359) in series with the flyback diode | Faster release (see §6) |
+| 1 | **C1** 4.7 µF X7R ceramic, ≥ 25 V (optionally + 100 nF in parallel) | Right at the TC4420 supply pins (datasheet: at least 1 µF) |
+| 1 | **C2** 100 µF / 25 V electrolytic | Bulk capacitor on the 12 V rail near the driver |
+| 4 | **R1** 1 kΩ, **R2** 10 kΩ, **R3** 10 Ω, **R4** 100 kΩ | R1 limits the input clamp current, R2 input pull-down, R3 gate resistor, R4 gate pull-down |
 | 1 | 12 V, 1 A DC adapter | Own supply, common ground |
 | 1 | **Spare switch of the same type as your keyboard** (a loose Cherry MX / Gateron / Kailh) | Reference switch for calibration |
 | – | Rubber/foam tip for the plunger, a rigid clamp/3D-printed bracket | Repeatable gap over the key |
@@ -84,7 +88,7 @@ printed on the Pro Micro are:
 |---|---|---|---|
 | **D4** | PD4 (ICP1) | `LIGHT` | Comparator output (HIGH = white). Timer1 captures its edges |
 | **A0** | PF7 (ADC7) | `LIGHT_A` | Analog photodiode node, 0–5 V (waveform mode) |
-| **D9** | PB5 | `OUT` | → 1 kΩ → BC550 base (mouse) **or** → 100 Ω → MOSFET gate (solenoid) |
+| **D9** | PB5 | `OUT` | → 1 kΩ → BC550 base (mouse) **or** → R1 1 kΩ → TC4420 pin 2 IN (solenoid driver) |
 | **D6** | PD7 | `SENSE` | Contact feedback: mouse-button node via 10 kΩ, **or** the reference switch to GND |
 | **D10** | PB6 | `CAL_LED` | → 330 Ω → LED aimed at the photodiode (calibration only) |
 | VCC / GND | | | 5 V, ground |
@@ -209,30 +213,113 @@ double clicks while the light fades.
 
 ---
 
-## 6. Keyboard robot (solenoid)
+## 6. Keyboard robot (solenoid + TC4420 driver)
+
+![How the keyboard robot is wired](keyboard_robot_wiring.svg)
+
+### 6.1 Why a TC4420
+
+The solenoid is switched by an N-channel MOSFET. **Do not drive the MOSFET gate straight from the Pro Micro pin;
+put a Microchip TC4420 between them.** The TC4420 is a single-output, non-inverting, **6 A peak** MOSFET gate driver
+(4.5–18 V supply, TTL/CMOS input), so `D9` HIGH still means "solenoid on" and the firmware does not change.
+
+| | Pin → 100 Ω → gate (old design) | Pin → TC4420 → gate (recommended) |
+|---|---|---|
+| Load on the Pro Micro pin | 5 V into ≈ 100–125 Ω = 40–50 mA at every edge, at or above the ATmega32U4's 40 mA per-pin limit | microamps (input current ±10 µA) |
+| Gate voltage | 5 V: needs a logic-level MOSFET, only partly enhanced | the full 12 V: any standard MOSFET, lowest Rds(on) |
+| Gate edge | ≈ 1 µs (about 50 nC at 40 mA) | ≈ 0.1 µs (6 A peak; 25 ns typical rise/fall into 2.5 nF) |
+| Extra parts | none | TC4420, two capacitors, three resistors |
+
+Be realistic about the gain: the solenoid's mechanical delay (5–15 ms) dominates the keyboard robot, so the driver does not
+shave milliseconds off it. What it gives you is a clean, repeatable switching instant, a protected microcontroller pin
+and freedom in the choice of MOSFET (or a larger solenoid). Calibration (§7) absorbs the remaining delay as before.
+
+What the datasheet (Microchip DS21933B, TC4420M/TC4429M) guarantees, and what the design uses:
+
+| Datasheet item | Value | Used for |
+|---|---|---|
+| Peak output current | 6 A | 10 Ω gate resistor is enough, ≈ 1 A peak |
+| Supply (VDD) | 4.5 – 18 V, 20 V absolute maximum | fed from the 12 V rail |
+| Input thresholds | VIH ≥ 2.4 V, VIL ≤ 0.8 V, input current ±10 µA | driven straight from a 5 V pin |
+| Input voltage range | −5 V … VDD + 0.3 V; **input current ≤ 50 mA when VIN > VDD** | R1 = 1 kΩ (5 V / 1 kΩ = 5 mA) |
+| Rise / fall / delay | 25 ns / 25 ns / 55 ns typical (35 / 35 / 75 max), 2.5 nF load | gate edge ≈ 0.1 µs |
+| Output resistance | 1.5 Ω (low) to 2.1 Ω (high) typical | gate current = 12 V / (10 Ω + ≈ 2.5 Ω) |
+| Supply current | 0.45 mA typical with input high, 55 µA with input low | negligible |
+| Latch-up | withstands > 1.5 A reverse output current | no clamp diodes needed at the output |
+| Input edges | has a speed-up capacitor: **slow input edges can double-pulse the output** | no RC filter on IN, R1 stays small |
+| Bypass | local ceramic capacitor on VDD, at least 1 µF | C1 = 4.7 µF X7R at the pins |
+| Pins | **duplicate pins must both be connected** | tie 1 + 8, 4 + 5, 6 + 7; pin 3 is NC |
+
+DS21933B covers the **TC4420M** (−55 … +125 °C, CERDIP). For this build buy the ordinary commercial or industrial
+TC4420 in DIP-8 or SOIC-8 (the ordering codes are in Microchip's TC4420/TC4429 datasheet DS21419, which the M datasheet
+points to): it is the same 6 A, 4.5–18 V driver with the same pinout. Do not buy the **TC4429**: it is the inverting
+version and the robot would fire while the sensor is dark.
+
+### 6.2 Schematic
+
+![Solenoid driver schematic](solenoid_driver.svg)
+
+The same circuit as text, plus the exact connections (TC4420 in DIP-8, pin numbers as on the chip):
 
 ```
-   +12 V ──────────┬───────────────────┐
-                   │                   │
-                   │              ┌────┴────┐
-                   │              │ SOLENOID│      flyback: diode across the coil,
-                   │              └────┬────┘      cathode to +12 V (banded end up)
-                   │    1N5819 ▲       │
-                   └────────────┘      │ drain
-   Pro Micro D9 ── 100 Ω ──┬── gate  IRLZ44N
-                          10k        source
-                           │          │
-                          GND ────────┴──── Pro Micro GND (shared) ── 12 V supply GND
+                     TC4420
+                  ┌───────────┐
+   +12 V ── 1 VDD│           │VDD 8 ── +12 V
+                  │           │
+ D9 ─ R1 1k ─┬── 2 IN         OUT 7 ─┬─ R3 10 Ω ─┬─ gate ┐
+             │   │           │       │           │       │  Q1  N-channel MOSFET
+             │  3 NC         OUT 6 ─┘          R4 100k   │  drain ── L1 solenoid ── +12 V
+            R2 10k│           │                   │      │  source ── GND
+             │  4 GND        GND 5               GND     ┘
+            GND   └───────────┘                          D1 across L1: anode = drain, cathode = +12 V
+                   (4, 5 → GND)                          (optional Z1 in series with D1, see below)
 ```
 
+| Connection | Goes to |
+|---|---|
+| Pro Micro `D9` | R1 (1 kΩ) → TC4420 pin 2; that node also through R2 (10 kΩ) to GND |
+| TC4420 pins 1 **and** 8 | +12 V; C1 (4.7 µF) and C2 (100 µF) from +12 V to GND right there |
+| TC4420 pins 4 **and** 5 | GND (short wire to the adapter minus) |
+| TC4420 pins 6 **and** 7 | tied together → R3 (10 Ω) → Q1 gate; R4 (100 kΩ) from the gate to GND |
+| TC4420 pin 3 | not connected |
+| Q1 source | GND |
+| Q1 drain | one solenoid terminal and D1 anode |
+| Solenoid other terminal | +12 V |
+| D1 cathode | +12 V (or Z1 cathode, with Z1 anode to +12 V) |
+
+* Tie **both** VDD pins (1 and 8) to +12 V, **both** GND pins (4 and 5) to ground and **both** OUT pins (6 and 7)
+  together. Pin 3 is not connected.
+* D1 conducts only when the MOSFET turns off: its anode goes to the drain, its cathode to +12 V (banded end up). With the
+  optional zener (Z1) the cathode of D1 goes to the cathode of Z1 and the anode of Z1 to +12 V.
+* Put **C1 (4.7 µF ceramic) as close as you can to pins 1/8 and 4/5**, and keep the short loop TC4420 → R3 → gate →
+  source → ground pin tight (a few centimetres). The ground pins must have very short traces or wires to the supply
+  return (datasheet §3.4): return the coil current there, not through the Pro Micro's ground lead.
 * **Faster release:** put a 24 V zener *in series with the flyback diode* (diode + zener across the coil). The coil
-  current then collapses in a few ms instead of tens of ms; the MOSFET sees 12 V + 24 V = 36 V, inside the IRLZ44N's
-  55 V rating.
+  current then collapses in a few ms instead of tens of ms; the MOSFET sees 12 V + 24 V + 0.4 V ≈ 36 V, inside the
+  55 V rating of the IRLZ44N / IRFZ44N (IRF540N: 100 V).
+* **Supply above 18 V:** the TC4420's VDD must stay ≤ 18 V (20 V absolute maximum). With a 24 V solenoid supply, feed pins
+  1 and 8 from a separate 12 V source (for example a 7812 regulator from the 24 V rail) and keep all grounds common; with the
+  zener the drain then sees 24 V + 24 V, so use a 100 V MOSFET (IRF540N).
 * **Overdrive:** a 12 V coil rated 5 V pulls in about twice as fast; the sketch's `M<ms>` (default **300 ms**) hard-limits
   how long the output may stay on so the coil cannot burn out if something hangs. Lower it: `M50`, then `S`.
+* R2 keeps the driver input low while the Pro Micro resets or is being programmed, so the solenoid cannot fire at
+  power-up. R4 keeps the gate low if the driver ever has no supply. Do not put a capacitor or RC filter on the input.
 * Mount the solenoid on a bracket so the plunger sits **~0.5–1 mm above the keycap** with a foam/rubber tip,
   pressing the key straight down; a repeatable gap matters more than raw power.
 * Use a key that does nothing harmful (Scroll Lock, F13). The app's press test accepts any key.
+
+### 6.3 Bring-up in five steps (before the solenoid is connected)
+
+1. Build the driver board **without the solenoid and MOSFET**. Power it from the 12 V adapter with the Pro Micro on USB and
+   the grounds joined. Measure pin 1/8 = 12 V and pin 6/7 = 0 V (D9 is low, R2 holds the input low).
+2. Flash the sketch and type `c` with the CAL LED aimed at the photodiode. Every calibration trial pulses D9: on a scope or
+   a multimeter with min/max hold, pin 6/7 swings between 0 V and ≈ 12 V and the input (pin 2) between 0 V and 5 V.
+3. Fit R3, R4 and the MOSFET. With **no solenoid connected**, the gate (measured to ground) now follows the pulses, and the
+   MOSFET drain sits at 12 V or near 0 V depending on what you connect as a test load (for example a 12 V lamp).
+4. Fit D1 (and Z1). Check the polarity twice: with the coil connected, the diode must be reverse-biased while the MOSFET
+   is on.
+5. Connect the solenoid, run `c` again and read `ROBOT_DELAY_MS`; typical 5–15 ms (§7). If the driver or the MOSFET runs
+   warm, check the gate resistor and the ground return first.
 
 ### Reference switch (used for calibration)
 
@@ -294,6 +381,10 @@ prints trigger→light. This is a poor man's LDAT: it includes USB, OS, the app 
 | `SENSE never went low` | Check the 10 kΩ / pull-up setting (`u` toggles it): pull-up **on** for a reference switch to GND, **off** for the mouse node |
 | Double clicks | Increase hysteresis, `H<ms>` (minimum hold) and `R<ms>` (re-arm) then `S` |
 | Solenoid too slow / weak | Raise the supply, shorten the gap, use the zener release, add a lighter plunger tip |
+| Solenoid twitches at power-up or while uploading | R2 (10 kΩ, TC4420 pin 2 to ground) missing, or the TC4420 supply is up before the Pro Micro pin state is defined |
+| Solenoid fires twice per trial | Something slows the driver input (an RC filter, a long thin wire): the TC4420 double-pulses on slow edges; drive pin 2 through R1 only |
+| TC4420 runs hot or the output rings | C1 not at pins 1/8 and 4/5, long ground return, R3 too small (use 10 – 22 Ω), or the MOSFET gate is oscillating |
+| Nothing happens at the solenoid | Pins 1 **and** 8 to +12 V, pins 4 **and** 5 to ground, pins 6 **and** 7 to R3 (the datasheet: duplicate pins must both be connected); MOSFET pin order (G-D-S varies) |
 | Serial monitor shows nothing | 115200 baud, "Newline"; the Pro Micro's serial port re-appears after a reset |
 
 ---

@@ -288,19 +288,21 @@ impl ResultLogger {
         })
     }
 
-    fn write_result(&self, result: &VerifiedResult) -> Result<()> {
-        std::fs::create_dir_all(&self.output_dir)?;
-        
-        // Create filename with timestamp and test type
-        let timestamp = &result.header.timestamp;
-        let test_type = &result.payload.test_type;
-        let filename = format!("{}_{}_{}.json", 
-            timestamp.replace(':', "-").replace('.', "-"),
-            test_type,
+    /// Where `log_result` saved (or will save) `result`
+    pub fn result_path(&self, result: &VerifiedResult) -> std::path::PathBuf {
+        // filename = timestamp + test type + start of the nonce
+        let filename = format!("{}_{}_{}.json",
+            result.header.timestamp.replace(':', "-").replace('.', "-"),
+            result.payload.test_type,
             &result.header.nonce[..8]
         );
-        
-        let filepath = Path::new(&self.output_dir).join(filename);
+        Path::new(&self.output_dir).join(filename)
+    }
+
+    fn write_result(&self, result: &VerifiedResult) -> Result<()> {
+        std::fs::create_dir_all(&self.output_dir)?;
+
+        let filepath = self.result_path(result);
         
         // Write as JSON (human readable)
         let json = serde_json::to_string_pretty(result)?;

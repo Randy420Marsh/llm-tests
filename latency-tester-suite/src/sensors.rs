@@ -619,7 +619,9 @@ impl Sampler {
                 }
                 if let Ok(mut v) = samples.lock() {
                     if v.len() >= MAX_SAMPLES {
-                        v.remove(0);
+                        // keep the whole run at half the resolution instead of forgetting its start
+                        let mut i = 0;
+                        v.retain(|_| { i += 1; i % 2 == 0 });
                     }
                     v.push(snap);
                 }
@@ -830,6 +832,18 @@ mod tests {
     fn write(dir: &Path, file: &str, content: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(file), content).unwrap();
+    }
+
+    #[test]
+    fn full_sample_buffer_is_thinned_not_truncated() {
+        // the same rule the sampler thread applies at MAX_SAMPLES
+        let mut v: Vec<u64> = (0..MAX_SAMPLES as u64).collect();
+        let mut i = 0;
+        v.retain(|_| { i += 1; i % 2 == 0 });
+        v.push(MAX_SAMPLES as u64);
+        assert_eq!(v.len(), MAX_SAMPLES / 2 + 1);
+        assert!(v[0] <= 1, "the start of the run is still covered");
+        assert!(v.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

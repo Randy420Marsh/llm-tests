@@ -67,7 +67,25 @@ pub struct GpuBenchmarkSummary {
     pub system_info: crate::system_info::SystemInfo,
     pub timestamp: String,
     pub vulkan_info: VulkanInfo,
+    /// Sizes this device cannot run (bigger than its dispatch or storage-buffer limits); the others still ran
+    #[serde(default)]
+    pub skipped_sizes: Vec<u64>,
 }
+
+/// The device cannot run a workload of this size (its limits are too small)
+#[derive(Debug)]
+pub struct SizeUnsupported {
+    pub size: u64,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for SizeUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Workload of {} elements exceeds {}", self.size, self.reason)
+    }
+}
+
+impl std::error::Error for SizeUnsupported {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VulkanInfo {
@@ -344,6 +362,7 @@ impl GpuBenchmark {
         let system_info = crate::system_info::collect_system_info()?;
         let vulkan_info = self.get_vulkan_info()?;
         let mut results = Vec::new();
+        let mut skipped_sizes = Vec::new();
 
         let total = self.config.workload_sizes.len();
         progress::update(&self.progress, |p| {
@@ -358,7 +377,19 @@ impl GpuBenchmark {
                 }
                 p.detail = "creating pipeline and buffer, then timing dispatches".into();
             });
-            let r = self.run_compute_workload(size)?;
+            let r = match self.run_compute_workload(size) {
+                Ok(r) => r,
+                Err(e) if e.downcast_ref::<SizeUnsupported>().is_some() => {
+                    // A small or software device: leave this size out and carry on with the rest
+                    skipped_sizes.push(size);
+                    progress::update(&self.progress, |p| {
+                        p.done += 1;
+                        p.detail = format!("{}; skipped", e);
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             progress::update(&self.progress, |p| p.done += 1);
             if let Some(partial) = &self.partial {
                 partial.lock().unwrap().push(r.clone());
@@ -372,6 +403,7 @@ impl GpuBenchmark {
             system_info,
             timestamp: chrono::Utc::now().to_rfc3339(),
             vulkan_info,
+            skipped_sizes,
         })
     }
 
@@ -394,13 +426,13 @@ impl GpuBenchmark {
         let gx = groups.min(limits.max_compute_work_group_count[0] as u64).min(65535);
         let gy = groups.div_ceil(gx);
         if gy > limits.max_compute_work_group_count[1] as u64 {
-            return Err(anyhow!("Workload of {} elements exceeds device dispatch limits", size));
+            return Err(SizeUnsupported { size, reason: "device dispatch limits" }.into());
         }
         let elements = gx * gy * SHADER_LOCAL_SIZE as u64;
         let row_stride = (gx * SHADER_LOCAL_SIZE as u64) as u32;
         let bytes = elements * 4;
         if bytes > limits.max_storage_buffer_range as u64 {
-            return Err(anyhow!("Workload of {} elements exceeds max storage buffer range", size));
+            return Err(SizeUnsupported { size, reason: "max storage buffer range" }.into());
         }
 
         let mut r = Resources {
@@ -761,6 +793,22 @@ mod tests {
         // 5 tiny dispatches take microseconds; the run must have been stretched to keep the GPU busy
         assert!(t.elapsed() >= std::time::Duration::from_millis(400), "took {:?}", t.elapsed());
         assert!(s.results[0].avg_latency_ms > 0.0);
+    }
+
+    #[test]
+    fn test_sizes_the_device_cannot_run_are_skipped_not_fatal() {
+        let mut bench = match GpuBenchmark::new(GpuBenchmarkConfig {
+            workload_sizes: vec![1 << 16, 1u64 << 45, 1 << 17],
+            iterations: 3,
+            warmup_iterations: 0,
+            min_sample_ms: 0,
+        }) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let s = bench.run().expect("one impossible size must not fail the whole run");
+        assert_eq!(s.results.len(), 2, "the two sizes that fit ran");
+        assert_eq!(s.skipped_sizes, vec![1u64 << 45]);
     }
 
     #[test]

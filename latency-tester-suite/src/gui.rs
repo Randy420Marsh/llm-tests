@@ -13,6 +13,7 @@ mod core_select;
 mod input_ui;
 mod memory_ui;
 mod results_ui;
+mod run_all_ui;
 mod suites_ui;
 
 use crate::cancel::{self, CancelFlag};
@@ -57,6 +58,10 @@ pub struct LatencyTesterApp {
     last_mem_config: Option<MemoryBenchmarkConfig>,
     last_cpu_config: Option<crate::cpu_benchmark::CpuBenchmarkConfig>,
     last_gpu_config: Option<GpuBenchmarkConfig>,
+    /// Further passes of a combined "run all" (each core on its own, ...)
+    mem_extra_configs: Vec<MemoryBenchmarkConfig>,
+    cpu_extra_configs: Vec<crate::cpu_benchmark::CpuBenchmarkConfig>,
+    run_all: run_all_ui::RunAllUi,
     
     // Running task (completed tasks are stored in pending)
     running: Arc<std::sync::Mutex<Option<RunningTaskState>>>,
@@ -103,6 +108,16 @@ pub struct LatencyTesterApp {
     results_dir_path: std::path::PathBuf,
 }
 
+/// See `LatencyTesterApp::session_snapshot`
+struct SessionSnapshot {
+    mem: Vec<crate::memory_benchmark::MemoryBenchmarkResult>,
+    mem_planned: usize,
+    cpu: Vec<crate::cpu_benchmark::CpuBenchmarkResult>,
+    gpu: Vec<crate::gpu_benchmark::GpuBenchmarkResult>,
+    trials: Vec<(crate::input_test::RunSummary, crate::rig::RigCalibration)>,
+    virtualization: Option<serde_json::Value>,
+}
+
 #[allow(dead_code)] // kept for display/diagnostics
 struct RunningTaskState {
     kind: String,
@@ -113,22 +128,27 @@ impl LatencyTesterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Setup egui fonts and visuals
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        
+
         // Keep results next to the exe so the app stays portable (falls back to the working dir)
         let config_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("latency_results")))
             .filter(|d| std::fs::create_dir_all(d).is_ok())
             .unwrap_or_else(|| std::path::PathBuf::from("latency_results"));
+        Self::with_results_dir(config_dir)
+    }
+
+    /// The app without a window, saving into `config_dir` (also used by the tests)
+    fn with_results_dir(config_dir: std::path::PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&config_dir);
-        
+
         let logger = ResultLogger::new(
             env!("CARGO_PKG_VERSION").to_string(),
             config_dir.to_string_lossy().to_string(),
         ).ok();
-        
+
         let core_kinds = crate::topology::detect_core_kinds();
-        
+
         Self {
             tab: Tab::Dashboard,
             system_info: None,
@@ -145,6 +165,9 @@ impl LatencyTesterApp {
             last_mem_config: None,
             last_cpu_config: None,
             last_gpu_config: None,
+            mem_extra_configs: Vec::new(),
+            cpu_extra_configs: Vec::new(),
+            run_all: run_all_ui::RunAllUi::new(),
             running: Arc::new(std::sync::Mutex::new(None)),
             cancel: cancel::new_flag(),
             quick_mem_result: None,
@@ -378,49 +401,76 @@ impl LatencyTesterApp {
 
     /// Sign and save the current session (or one suite of it) as a single record
     fn log_session(&mut self, scope: crate::session::Scope) {
-        use crate::session::{self, SessionData};
-        let Some(logger) = &self.logger else {
-            self.log("No result logger available");
-            return;
-        };
-        let Some(sys_info) = &self.system_info else {
-            self.log("No system info collected yet");
-            return;
-        };
+        self.log_session_from(scope, 0, None);
+    }
 
+    /// Copies of what a session record is built from, so no lock is held while it is signed
+    fn session_snapshot(&self, skip_trials: usize) -> SessionSnapshot {
         let (mem, mem_planned) = {
             let p = self.mem_progress.lock().unwrap();
             (p.completed.clone(), p.total_tests)
         };
-        let cpu = self.cpu_partial.lock().unwrap().clone();
-        let gpu = self.gpu_partial.lock().unwrap().clone();
-        let trials: Vec<_> = self.input_test.runs.iter().map(|r| (r.summary.clone(), r.cal.clone())).collect();
-        let virtualization = self.virt_status.as_ref().and_then(|v| serde_json::to_value(v).ok());
-        let data = SessionData {
+        SessionSnapshot {
+            mem,
+            mem_planned,
+            cpu: self.cpu_partial.lock().unwrap().clone(),
+            gpu: self.gpu_partial.lock().unwrap().clone(),
+            trials: self.input_test.runs.iter().skip(skip_trials).map(|r| (r.summary.clone(), r.cal.clone())).collect(),
+            virtualization: self.virt_status.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+        }
+    }
+
+    fn session_data<'a>(&'a self, snap: &'a SessionSnapshot, run_info: Option<serde_json::Value>) -> crate::session::SessionData<'a> {
+        crate::session::SessionData {
             memory_config: self.last_mem_config.as_ref(),
-            memory: &mem,
-            memory_planned: mem_planned,
+            memory: &snap.mem,
+            memory_planned: snap.mem_planned,
             cpu_config: self.last_cpu_config.as_ref(),
             cpu_topology: self.last_cpu_result.as_ref().map(|s| &s.core_topology),
-            cpu: &cpu,
+            cpu: &snap.cpu,
             gpu_config: self.last_gpu_config.as_ref(),
             gpu_vulkan: self.last_gpu_result.as_ref().map(|s| &s.vulkan_info),
-            gpu: &gpu,
+            gpu: &snap.gpu,
             input_suite: self.last_input_result.as_ref(),
-            trials: &trials,
+            trials: &snap.trials,
             timeline: &self.last_timeline,
             sensor_notes: &self.sensor_notes,
-            virtualization,
+            virtualization: snap.virtualization.clone(),
             calibration: Some(&self.input_test.cal),
+            memory_extra_configs: &self.mem_extra_configs,
+            cpu_extra_configs: &self.cpu_extra_configs,
+            run_info,
+        }
+    }
+
+    /// Like `log_session`, leaving out the first `skip_trials` manual click / key runs. Returns the
+    /// signed record and the file it was saved to.
+    fn log_session_from(
+        &mut self,
+        scope: crate::session::Scope,
+        skip_trials: usize,
+        run_info: Option<serde_json::Value>,
+    ) -> Option<(VerifiedResult, std::path::PathBuf)> {
+        use crate::session;
+        let Some(logger) = &self.logger else {
+            self.log("No result logger available");
+            return None;
         };
+        let Some(sys_info) = &self.system_info else {
+            self.log("No system info collected yet");
+            return None;
+        };
+        let snap = self.session_snapshot(skip_trials);
+        let data = self.session_data(&snap, run_info);
         if !session::has_data(&data, scope) {
             self.log("Nothing to log yet: run a test first");
-            return;
+            return None;
         }
         let (config, results) = session::build(&data, scope);
         match logger.log_result(scope.test_type(), sys_info, &config, &results, HashMap::new()) {
             Ok(verified) => {
                 let verification = logger.verify_result(&verified);
+                let path = logger.result_path(&verified);
                 let parts: Vec<String> = results.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
                 self.last_logged = Some((verified.clone(), verification.clone()));
                 self.log(&format!(
@@ -430,12 +480,24 @@ impl LatencyTesterApp {
                     verification.message,
                     &verified.signature.sig[..16]
                 ));
+                Some((verified, path))
             }
-            Err(e) => self.log(&format!("Failed to log result: {}", e)),
+            Err(e) => {
+                self.log(&format!("Failed to log result: {}", e));
+                None
+            }
         }
     }
 
     fn render_dashboard(&mut self, ui: &mut Ui) {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            self.render_run_all(ui);
+            ui.add_space(8.0);
+            self.render_dashboard_body(ui);
+        });
+    }
+
+    fn render_dashboard_body(&mut self, ui: &mut Ui) {
         ui.heading("System Dashboard");
         ui.separator();
         
@@ -882,6 +944,7 @@ impl LatencyTesterApp {
 impl eframe::App for LatencyTesterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_completed_tasks();
+        self.run_all_tick();
 
         // Poll for finished background work even when the user is idle
         ctx.request_repaint_after(Duration::from_millis(200));
@@ -904,10 +967,19 @@ impl eframe::App for LatencyTesterApp {
                     if ui.button("🔄 Refresh Info").clicked() {
                         self.refresh_system_info();
                     }
+                    if ui
+                        .add_enabled(!self.is_running(), egui::Button::new(RichText::new("▶ Run all tests…").strong()))
+                        .on_hover_text("Opens the Dashboard with the plan for running every test")
+                        .clicked()
+                    {
+                        self.tab = Tab::Dashboard;
+                    }
                 });
             });
         });
         
+        self.run_all_bar(ctx);
+
         egui::TopBottomPanel::bottom("bottom")
             .resizable(true)
             .min_height(70.0)
@@ -941,6 +1013,7 @@ impl eframe::App for LatencyTesterApp {
                 Tab::Results => self.render_results_tab(ui),
             }
         });
+        self.run_all_overlay(ctx);
     }
 }
 

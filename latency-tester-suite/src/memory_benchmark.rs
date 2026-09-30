@@ -35,6 +35,23 @@ pub struct MemoryBenchmarkConfig {
     pub per_core: bool,
 }
 
+/// Every buffer size the app offers, 4 KB to 1 GB
+pub const SIZE_PRESETS: [usize; 18] = [
+    4 << 10, 16 << 10, 32 << 10, 64 << 10, 128 << 10, 256 << 10, 512 << 10,
+    1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20,
+    128 << 20, 256 << 20, 512 << 20, 1 << 30,
+];
+/// Thread counts offered as presets (the number of logical CPUs is added on top)
+pub const THREAD_PRESETS: [usize; 8] = [1, 2, 4, 8, 12, 16, 24, 32];
+
+/// Rough RAM needed to run `patterns` on one `size` buffer: the data, a second buffer for the
+/// STREAM patterns and the pointer-chase table
+pub fn memory_needed_for(size: usize, patterns: &[AccessPattern]) -> usize {
+    let aux = patterns.iter().any(|p| matches!(p, AccessPattern::StreamCopy | AccessPattern::StreamAdd | AccessPattern::StreamTriad));
+    let chase = patterns.iter().any(|p| matches!(p, AccessPattern::PointerChase));
+    size + if aux { size } else { 0 } + if chase { size + size / 8 } else { 0 }
+}
+
 /// Fewest measured runs a test does before the time budget may cut it short
 const MIN_ITERATIONS: usize = 3;
 
@@ -87,7 +104,7 @@ impl Default for MemoryBenchmarkConfig {
             use_huge_pages: false,
             core_ids: Vec::new(),
             core_label: "All cores (OS scheduled)".to_string(),
-            time_budget_ms: default_time_budget_ms(),
+            time_budget_ms: 5000,
             per_core: false,
         }
     }
@@ -266,6 +283,9 @@ pub fn new_progress() -> ProgressHandle {
 
 pub struct MemoryBenchmark {
     progress: Option<ProgressHandle>,
+    /// Keep the results already in the progress handle and add this run's to them (several passes
+    /// of one combined "run all" show as a single list)
+    carry_over: bool,
     sensors: Option<Arc<Sampler>>,
     /// Cores worker threads are pinned to right now (one group of `config.core_groups()`)
     active_cores: Vec<usize>,
@@ -316,6 +336,7 @@ impl MemoryBenchmark {
             rng: StdRng::seed_from_u64(0xDEADBEEF_CAFEBABE),
             cancel: cancel::new_flag(),
             progress: None,
+            carry_over: false,
             sensors: None,
             active_cores: Vec::new(),
             active_label: String::new(),
@@ -331,6 +352,12 @@ impl MemoryBenchmark {
     /// Publish live progress to `handle`
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
+        self
+    }
+
+    /// Add this run's results after those already in the progress handle instead of replacing them
+    pub fn carry_over(mut self, yes: bool) -> Self {
+        self.carry_over = yes;
         self
     }
 
@@ -365,11 +392,19 @@ impl MemoryBenchmark {
         let groups = self.config.core_groups();
         let total = self.config.test_count();
         let label = self.config.core_label.clone();
+        let carry = self.carry_over;
         self.update_progress(|p| {
+            let (done, planned, completed, started) = if carry {
+                (p.done_tests, p.total_tests, std::mem::take(&mut p.completed), p.started)
+            } else {
+                (0, 0, Vec::new(), None)
+            };
             *p = MemProgress {
-                total_tests: total,
+                total_tests: planned + total,
+                done_tests: done,
+                completed,
                 cores: label.clone(),
-                started: Some(std::time::Instant::now()),
+                started: started.or_else(|| Some(std::time::Instant::now())),
                 ..Default::default()
             }
         });
@@ -1040,6 +1075,29 @@ mod tests {
         assert!(started.elapsed().as_secs_f64() < 5.0, "budget ignored: {:?}", started.elapsed());
         let n = s.results[0].iterations;
         assert!(n >= 3 && n < 100_000, "iterations = {}", n);
+    }
+
+    #[test]
+    fn test_carry_over_accumulates_two_passes() {
+        let handle = new_progress();
+        let cfg = MemoryBenchmarkConfig {
+            sizes: vec![64 * 1024],
+            patterns: vec![AccessPattern::SequentialRead],
+            iterations: 3,
+            warmup_iterations: 0,
+            thread_counts: vec![1],
+            time_budget_ms: 0,
+            ..MemoryBenchmarkConfig::default()
+        };
+        MemoryBenchmark::new(cfg.clone()).with_progress(handle.clone()).run().unwrap();
+        assert_eq!(handle.lock().unwrap().completed.len(), 1);
+        // a plain second run replaces the first...
+        MemoryBenchmark::new(cfg.clone()).with_progress(handle.clone()).run().unwrap();
+        assert_eq!(handle.lock().unwrap().completed.len(), 1);
+        // ...a carried-over one adds to it and keeps the totals consistent
+        MemoryBenchmark::new(cfg).with_progress(handle.clone()).carry_over(true).run().unwrap();
+        let p = handle.lock().unwrap();
+        assert_eq!((p.completed.len(), p.done_tests, p.total_tests), (2, 2, 2));
     }
 
     #[test]

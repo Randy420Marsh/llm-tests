@@ -271,6 +271,7 @@ pub fn run(args: &[String]) -> Result<()> {
         sensor_notes: &notes,
         virtualization,
         calibration: None,
+        ..Default::default()
     };
     let mut failures = Vec::new();
     if session::has_data(&data, Scope::Everything) {

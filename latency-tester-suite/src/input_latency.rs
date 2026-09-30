@@ -512,6 +512,57 @@ pub struct TimerResolutionInfo {
     pub min_measurable_interval_ns: u64,
 }
 
+/// Run the suite once per entry of `passes` (`None` = unpinned, `Some(core)` = pinned to that core) and
+/// merge the results
+pub fn run_passes(
+    base: InputLatencyConfig,
+    passes: Vec<Option<usize>>,
+    cancel_flag: crate::cancel::CancelFlag,
+    prog: SharedProgress,
+    sampler: std::sync::Arc<Sampler>,
+) -> anyhow::Result<InputLatencySummary> {
+    let total = passes.len() * base.test_modes.len();
+    let started = std::time::Instant::now();
+    let mut merged: Option<InputLatencySummary> = None;
+    for (i, core) in passes.iter().enumerate() {
+        crate::cancel::check(&cancel_flag)?;
+        let inner = progress::new();
+        let cfg = InputLatencyConfig { pin_core: *core, ..base.clone() };
+        // Run on a fresh thread so the pin does not leak into the caller
+        let (c2, p2, s2) = (cancel_flag.clone(), inner.clone(), sampler.clone());
+        let outer = prog.clone();
+        let done_before = i * base.test_modes.len();
+        let watcher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ws = watcher_stop.clone();
+        let inner_watch = inner.clone();
+        let watcher = std::thread::spawn(move || {
+            while !ws.load(std::sync::atomic::Ordering::Relaxed) {
+                if let (Ok(mut o), Ok(i)) = (outer.lock(), inner_watch.lock()) {
+                    o.total = total;
+                    o.done = done_before + i.done;
+                    o.title = i.title.clone();
+                    o.detail = i.detail.clone();
+                    o.started = Some(started);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        let summary = std::thread::spawn(move || {
+            InputLatencyTester::new(cfg).with_cancel(c2).with_progress(p2).with_sensors(s2).run()
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("input test thread panicked"))?;
+        watcher_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = watcher.join();
+        let summary = summary?;
+        match merged.as_mut() {
+            Some(m) => m.results.extend(summary.results),
+            None => merged = Some(summary),
+        }
+    }
+    merged.ok_or_else(|| anyhow::anyhow!("no input passes to run"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

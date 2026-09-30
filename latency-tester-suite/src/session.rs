@@ -60,6 +60,12 @@ pub struct SessionData<'a> {
     pub sensor_notes: &'a [String],
     pub virtualization: Option<Value>,
     pub calibration: Option<&'a RigCalibration>,
+    /// Configs of further memory / CPU passes of a combined run (e.g. "each core on its own"); the
+    /// results of all passes are in `memory` / `cpu` and say which cores they ran on
+    pub memory_extra_configs: &'a [MemoryBenchmarkConfig],
+    pub cpu_extra_configs: &'a [CpuBenchmarkConfig],
+    /// How a "run all tests" run was set up and how it ended
+    pub run_info: Option<Value>,
 }
 
 /// Timeline points kept in the saved record (a long run has tens of thousands of samples)
@@ -112,6 +118,9 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
 
     if scope.includes(Scope::Memory) && !data.memory.is_empty() {
         config.insert("memory".into(), to_value(&data.memory_config));
+        if !data.memory_extra_configs.is_empty() {
+            config.insert("memory_extra_passes".into(), to_value(&data.memory_extra_configs));
+        }
         results.insert(
             "memory".into(),
             json!({
@@ -124,6 +133,9 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
     }
     if scope.includes(Scope::Cpu) && !data.cpu.is_empty() {
         config.insert("cpu".into(), to_value(&data.cpu_config));
+        if !data.cpu_extra_configs.is_empty() {
+            config.insert("cpu_extra_passes".into(), to_value(&data.cpu_extra_configs));
+        }
         results.insert("cpu".into(), json!({ "core_topology": data.cpu_topology, "results": data.cpu }));
     }
     if scope.includes(Scope::Gpu) && !data.gpu.is_empty() {
@@ -166,6 +178,9 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
         );
     }
     if scope == Scope::Everything {
+        if let Some(v) = &data.run_info {
+            config.insert("run_all".into(), v.clone());
+        }
         if let Some(v) = &data.virtualization {
             results.insert("virtualization".into(), v.clone());
         }
@@ -177,6 +192,85 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
 pub fn has_data(data: &SessionData, scope: Scope) -> bool {
     let (_, r) = build(data, scope);
     r.as_object().map_or(false, |o| o.keys().any(|k| k != "virtualization"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// CSV export
+// ---------------------------------------------------------------------------------------------
+
+/// Flatten nested objects into `a.b.c` columns; arrays are written as compact JSON text
+fn flatten(prefix: &str, v: &Value, out: &mut Vec<(String, String)>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                let key = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                flatten(&key, x, out);
+            }
+        }
+        Value::Null => out.push((prefix.to_string(), String::new())),
+        Value::String(s) => out.push((prefix.to_string(), s.clone())),
+        Value::Array(a) if a.is_empty() => out.push((prefix.to_string(), String::new())),
+        other => out.push((prefix.to_string(), other.to_string())),
+    }
+}
+
+/// One CSV: a column for every field that appears in any row, in first-seen order
+pub fn rows_to_csv(rows: &[Value]) -> String {
+    let flat: Vec<Vec<(String, String)>> = rows
+        .iter()
+        .map(|r| {
+            let mut o = Vec::new();
+            flatten("", r, &mut o);
+            o
+        })
+        .collect();
+    let mut cols: Vec<String> = Vec::new();
+    for row in &flat {
+        for (k, _) in row {
+            if !cols.contains(k) {
+                cols.push(k.clone());
+            }
+        }
+    }
+    let mut w = csv::Writer::from_writer(Vec::new());
+    let _ = w.write_record(&cols);
+    for row in &flat {
+        let rec: Vec<&str> = cols.iter().map(|c| row.iter().find(|(k, _)| k == c).map_or("", |(_, v)| v.as_str())).collect();
+        let _ = w.write_record(&rec);
+    }
+    String::from_utf8(w.into_inner().unwrap_or_default()).unwrap_or_default()
+}
+
+/// (file name, contents) for every suite that has data: memory, cpu, gpu, input_timing, input_trials, sensors
+pub fn csv_files(data: &SessionData) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let mut add = |name: &str, rows: Vec<Value>| {
+        if !rows.is_empty() {
+            files.push((name.to_string(), rows_to_csv(&rows)));
+        }
+    };
+    add("memory.csv", data.memory.iter().map(to_value).collect());
+    add("cpu.csv", data.cpu.iter().map(to_value).collect());
+    add("gpu.csv", data.gpu.iter().map(to_value).collect());
+    add("input_timing.csv", data.input_suite.map(|s| s.results.iter().map(to_value).collect()).unwrap_or_default());
+    let mut trials = Vec::new();
+    for (i, (run, cal)) in data.trials.iter().enumerate() {
+        for (n, ms) in run.samples_ms.iter().enumerate() {
+            let c = cal.correct(run.kind, run.robot, *ms);
+            trials.push(json!({
+                "run": i + 1,
+                "kind": run.kind.label(),
+                "robot": run.robot,
+                "trial": n + 1,
+                "latency_ms": ms,
+                "minus_robot_ms": c.minus_robot_ms,
+                "minus_robot_and_display_ms": c.minus_robot_and_display_ms,
+            }));
+        }
+    }
+    add("input_trials.csv", trials);
+    add("sensors.csv", downsample_timeline(data.timeline, data.timeline.len().max(1)));
+    files
 }
 
 #[cfg(test)]
@@ -277,6 +371,51 @@ mod tests {
         // sensors
         assert_eq!(res["sensors"]["core_peak_temps_c"][1][0], 1);
         assert_eq!(res["sensors"]["timeline"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn extra_passes_and_run_info_are_recorded() {
+        let mem = vec![mem_result(1 << 20)];
+        let extra = [MemoryBenchmarkConfig::default()];
+        let data = SessionData {
+            memory: &mem,
+            memory_extra_configs: &extra,
+            run_info: Some(json!({ "cancelled": false })),
+            ..Default::default()
+        };
+        let (cfg, _) = build(&data, Scope::Everything);
+        assert_eq!(cfg["memory_extra_passes"].as_array().unwrap().len(), 1);
+        assert_eq!(cfg["run_all"]["cancelled"], false);
+        let (cfg, _) = build(&data, Scope::Memory);
+        assert!(cfg.get("run_all").is_none(), "run info only belongs to the whole-session record");
+    }
+
+    #[test]
+    fn csv_export_has_a_column_per_field_and_a_row_per_result() {
+        let mem = vec![mem_result(1 << 20), mem_result(1 << 22)];
+        let cpu = vec![cpu_result()];
+        let trials = vec![(summarize(InputKind::KeyPress, false, &[180.0, 200.0], 0, 0, (500.0, 2000.0)), RigCalibration::default())];
+        let timeline: Vec<Snapshot> = (0..3).map(|i| snap(i * 500)).collect();
+        let data = SessionData { memory: &mem, cpu: &cpu, trials: &trials, timeline: &timeline, ..Default::default() };
+        let files = csv_files(&data);
+        let names: Vec<&str> = files.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(names, vec!["memory.csv", "cpu.csv", "input_trials.csv", "sensors.csv"], "only suites with data");
+        let memory = &files[0].1;
+        let mut rd = csv::Reader::from_reader(memory.as_bytes());
+        let header: Vec<String> = rd.headers().unwrap().iter().map(String::from).collect();
+        assert!(header.contains(&"size".to_string()) && header.contains(&"telemetry.cpu_temp_max_c".to_string()), "{:?}", header);
+        let rows: Vec<csv::StringRecord> = rd.records().map(|r| r.unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        let col = |name: &str| header.iter().position(|h| h == name).unwrap();
+        assert_eq!(&rows[1][col("size")], "4194304");
+        assert_eq!(&rows[0][col("telemetry.cpu_temp_max_c")], "61.0");
+        assert_eq!(files[2].1.lines().count(), 3, "header + 2 trials");
+        assert_eq!(files[3].1.lines().count(), 4, "header + 3 samples");
+        // quoting keeps commas in values from shifting columns
+        assert_eq!(rows_to_csv(&[json!({"a": "x,y", "b": 1})]).lines().nth(1), Some("\"x,y\",1"));
+        // a field that only some rows have still gets a column
+        let csv = rows_to_csv(&[json!({"a": 1}), json!({"a": 2, "b": 3})]);
+        assert_eq!(csv.lines().collect::<Vec<_>>(), vec!["a,b", "1,", "2,3"]);
     }
 
     #[test]

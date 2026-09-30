@@ -25,6 +25,7 @@ mod report;
 mod server;
 mod sensors;
 mod progress;
+mod run_all;
 
 use anyhow::Result;
 use eframe::egui;
