@@ -22,7 +22,16 @@ pub struct GpuBenchmarkConfig {
     pub workload_sizes: Vec<u64>,
     pub iterations: u32,
     pub warmup_iterations: u32,
+    /// Keep dispatching for at least this long per workload size (after `iterations` are done).
+    /// One dispatch takes microseconds, so 100 of them finish inside a single sensor sample and the
+    /// GPU would read ~0 % load; sustained work is what lets GPU load, clocks, power and temperature
+    /// show up. 0 = stop after `iterations`.
+    #[serde(default)]
+    pub min_sample_ms: u64,
 }
+
+/// Upper bound on timed dispatches per size so a very fast device cannot run out of memory
+const MAX_TIMED_DISPATCHES: usize = 1_000_000;
 
 impl Default for GpuBenchmarkConfig {
     fn default() -> Self {
@@ -30,6 +39,7 @@ impl Default for GpuBenchmarkConfig {
             workload_sizes: vec![1 << 20, 1 << 22, 1 << 24], // 1M, 4M, 16M elements
             iterations: 100,
             warmup_iterations: 10,
+            min_sample_ms: 2000,
         }
     }
 }
@@ -57,7 +67,25 @@ pub struct GpuBenchmarkSummary {
     pub system_info: crate::system_info::SystemInfo,
     pub timestamp: String,
     pub vulkan_info: VulkanInfo,
+    /// Sizes this device cannot run (bigger than its dispatch or storage-buffer limits); the others still ran
+    #[serde(default)]
+    pub skipped_sizes: Vec<u64>,
 }
+
+/// The device cannot run a workload of this size (its limits are too small)
+#[derive(Debug)]
+pub struct SizeUnsupported {
+    pub size: u64,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for SizeUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Workload of {} elements exceeds {}", self.size, self.reason)
+    }
+}
+
+impl std::error::Error for SizeUnsupported {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VulkanInfo {
@@ -334,6 +362,7 @@ impl GpuBenchmark {
         let system_info = crate::system_info::collect_system_info()?;
         let vulkan_info = self.get_vulkan_info()?;
         let mut results = Vec::new();
+        let mut skipped_sizes = Vec::new();
 
         let total = self.config.workload_sizes.len();
         progress::update(&self.progress, |p| {
@@ -343,9 +372,24 @@ impl GpuBenchmark {
             cancel::check(&self.cancel)?;
             progress::update(&self.progress, |p| {
                 p.title = format!("{} elements · {} dispatches", size, self.config.iterations);
+                if self.config.min_sample_ms > 0 {
+                    p.title.push_str(&format!(" (and more for at least {:.1} s so GPU load shows)", self.config.min_sample_ms as f64 / 1000.0));
+                }
                 p.detail = "creating pipeline and buffer, then timing dispatches".into();
             });
-            let r = self.run_compute_workload(size)?;
+            let r = match self.run_compute_workload(size) {
+                Ok(r) => r,
+                Err(e) if e.downcast_ref::<SizeUnsupported>().is_some() => {
+                    // A small or software device: leave this size out and carry on with the rest
+                    skipped_sizes.push(size);
+                    progress::update(&self.progress, |p| {
+                        p.done += 1;
+                        p.detail = format!("{}; skipped", e);
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             progress::update(&self.progress, |p| p.done += 1);
             if let Some(partial) = &self.partial {
                 partial.lock().unwrap().push(r.clone());
@@ -359,6 +403,7 @@ impl GpuBenchmark {
             system_info,
             timestamp: chrono::Utc::now().to_rfc3339(),
             vulkan_info,
+            skipped_sizes,
         })
     }
 
@@ -381,13 +426,13 @@ impl GpuBenchmark {
         let gx = groups.min(limits.max_compute_work_group_count[0] as u64).min(65535);
         let gy = groups.div_ceil(gx);
         if gy > limits.max_compute_work_group_count[1] as u64 {
-            return Err(anyhow!("Workload of {} elements exceeds device dispatch limits", size));
+            return Err(SizeUnsupported { size, reason: "device dispatch limits" }.into());
         }
         let elements = gx * gy * SHADER_LOCAL_SIZE as u64;
         let row_stride = (gx * SHADER_LOCAL_SIZE as u64) as u32;
         let bytes = elements * 4;
         if bytes > limits.max_storage_buffer_range as u64 {
-            return Err(anyhow!("Workload of {} elements exceeds max storage buffer range", size));
+            return Err(SizeUnsupported { size, reason: "max storage buffer range" }.into());
         }
 
         let mut r = Resources {
@@ -572,14 +617,19 @@ impl GpuBenchmark {
             self.submit_and_wait(&res)?;
         }
 
-        let iterations = self.config.iterations.max(1);
-        let mut times = Vec::with_capacity(iterations as usize);
-        for _ in 0..iterations {
+        let iterations = self.config.iterations.max(1) as usize;
+        let min_run = std::time::Duration::from_millis(self.config.min_sample_ms);
+        let loop_start = std::time::Instant::now();
+        let mut times = Vec::with_capacity(iterations);
+        loop {
             cancel::check(&self.cancel)?;
             let start = self.timer.now_ticks();
             self.submit_and_wait(&res)?;
             let end = self.timer.now_ticks();
             times.push(self.timer.ticks_to_ms_f64(end - start));
+            if times.len() >= MAX_TIMED_DISPATCHES || (times.len() >= iterations && loop_start.elapsed() >= min_run) {
+                break;
+            }
         }
 
         times.sort_by(|a, b| a.total_cmp(b));
@@ -663,6 +713,7 @@ pub fn quick_gpu_test() -> Result<f64> {
         workload_sizes: vec![1 << 20],
         iterations: 20,
         warmup_iterations: 3,
+        min_sample_ms: 0,
     };
     let mut benchmark = GpuBenchmark::new(config)?;
     let summary = benchmark.run()?;
@@ -716,6 +767,7 @@ mod tests {
             workload_sizes: vec![1 << 16],
             iterations: 5,
             warmup_iterations: 1,
+            min_sample_ms: 0,
         }) {
             Ok(b) => b,
             Err(_) => return,
@@ -723,5 +775,45 @@ mod tests {
         let s = bench.run().unwrap();
         assert_eq!(s.results.len(), 1);
         assert!(s.results[0].avg_latency_ms > 0.0);
+    }
+
+    #[test]
+    fn test_gpu_keeps_dispatching_for_min_sample_ms() {
+        let mut bench = match GpuBenchmark::new(GpuBenchmarkConfig {
+            workload_sizes: vec![1 << 16],
+            iterations: 5,
+            warmup_iterations: 1,
+            min_sample_ms: 400,
+        }) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let t = std::time::Instant::now();
+        let s = bench.run().unwrap();
+        // 5 tiny dispatches take microseconds; the run must have been stretched to keep the GPU busy
+        assert!(t.elapsed() >= std::time::Duration::from_millis(400), "took {:?}", t.elapsed());
+        assert!(s.results[0].avg_latency_ms > 0.0);
+    }
+
+    #[test]
+    fn test_sizes_the_device_cannot_run_are_skipped_not_fatal() {
+        let mut bench = match GpuBenchmark::new(GpuBenchmarkConfig {
+            workload_sizes: vec![1 << 16, 1u64 << 45, 1 << 17],
+            iterations: 3,
+            warmup_iterations: 0,
+            min_sample_ms: 0,
+        }) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let s = bench.run().expect("one impossible size must not fail the whole run");
+        assert_eq!(s.results.len(), 2, "the two sizes that fit ran");
+        assert_eq!(s.skipped_sizes, vec![1u64 << 45]);
+    }
+
+    #[test]
+    fn old_saved_configs_without_min_sample_ms_still_load() {
+        let c: GpuBenchmarkConfig = serde_json::from_str(r#"{"workload_sizes":[1024],"iterations":10,"warmup_iterations":2}"#).unwrap();
+        assert_eq!(c.min_sample_ms, 0);
     }
 }

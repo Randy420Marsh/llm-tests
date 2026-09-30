@@ -90,7 +90,10 @@ $cs = Get-CimInstance -ClassName Win32_ComputerSystem
 $names = 'Microsoft-Hyper-V-All','VirtualMachinePlatform','HypervisorPlatform','Microsoft-Windows-Subsystem-Linux'
 $feat = @(Get-CimInstance -ClassName Win32_OptionalFeature | Where-Object { $names -contains $_.Name } | ForEach-Object { @{ n = $_.Name; s = [int]$_.InstallState } })
 $sb = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State').UEFISecureBootEnabled
+# Win32_Tpm only answers to administrators, so a normal run always saw "no TPM". The PnP entry for the
+# TPM ("Trusted Platform Module 2.0", class SecurityDevices) is readable by any user.
 $tpm = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftTpm -ClassName Win32_Tpm
+$tpmdev = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPClass='SecurityDevices'" | Where-Object { $_.Name -match 'Trusted Platform Module|TPM' -and $_.ConfigManagerErrorCode -eq 0 })
 [pscustomobject]@{
   vbs = [int]$dg.VirtualizationBasedSecurityStatus
   running = @($dg.SecurityServicesRunning)
@@ -99,6 +102,7 @@ $tpm = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftTpm -ClassName Wi
   feat = $feat
   secureboot = [int]$sb
   tpm = [bool]$tpm
+  tpmdev = ($tpmdev.Count -gt 0)
 } | ConvertTo-Json -Compress -Depth 4
 "#;
 
@@ -136,7 +140,7 @@ pub fn parse_win_facts(json: &str) -> Option<WinFacts> {
         feature_hypervisor_platform: feature("HypervisorPlatform"),
         feature_wsl: feature("Microsoft-Windows-Subsystem-Linux"),
         secure_boot: v["secureboot"].as_i64() == Some(1),
-        tpm_present: v["tpm"].as_bool().unwrap_or(false),
+        tpm_present: v["tpm"].as_bool().unwrap_or(false) || v["tpmdev"].as_bool().unwrap_or(false),
         raw: json.trim().to_string(),
     })
 }
@@ -659,6 +663,18 @@ mod tests {
         assert_eq!(f.services_running, vec![2]);
         assert_eq!(f.available_props, vec![3]);
         assert!(f.feature_vm_platform && !f.feature_wsl && f.tpm_present && !f.secure_boot);
+    }
+
+    #[test]
+    fn tpm_is_found_without_admin_rights() {
+        // Not elevated: Win32_Tpm returns nothing (tpm=false) but the TPM's PnP device is present
+        let out = r#"{"vbs":2,"running":[],"avail":[],"hv":true,"feat":[],"secureboot":1,"tpm":false,"tpmdev":true}"#;
+        assert!(parse_win_facts(out).unwrap().tpm_present);
+        // Neither source sees one (or an older script without the field)
+        let none = r#"{"vbs":0,"running":[],"avail":[],"hv":false,"feat":[],"secureboot":0,"tpm":false,"tpmdev":false}"#;
+        assert!(!parse_win_facts(none).unwrap().tpm_present);
+        let old = r#"{"vbs":0,"running":[],"avail":[],"hv":false,"feat":[],"secureboot":0,"tpm":false}"#;
+        assert!(!parse_win_facts(old).unwrap().tpm_present);
     }
 
     #[test]

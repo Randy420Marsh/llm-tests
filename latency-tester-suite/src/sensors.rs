@@ -189,6 +189,16 @@ pub fn read_amd_vram(drm_root: &Path) -> Option<(f32, f32)> {
     None
 }
 
+/// AMD GPU load in percent from `/sys/class/drm/card*/device/gpu_busy_percent`
+pub fn read_amd_busy(drm_root: &Path) -> Option<f32> {
+    for card in std::fs::read_dir(drm_root).ok()?.flatten() {
+        if let Some(v) = read_trim(&card.path().join("device").join("gpu_busy_percent")).and_then(|v| v.parse::<f32>().ok()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------------------------
 // nvidia-smi
 // ---------------------------------------------------------------------------------------------
@@ -251,7 +261,12 @@ pub struct WinSensors {
     pub core_freq_mhz: Vec<f32>,
     /// "LibreHardwareMonitor", "OpenHardwareMonitor" or "ACPI thermal zone"
     pub source: String,
+    /// Every ACPI thermal zone in °C (only filled for the ACPI fallback). Many boards have zones
+    /// that never change, so the hottest one is not always the useful one, see [`ZonePicker`].
+    pub zones_c: Vec<f32>,
 }
+
+const ACPI_SOURCE: &str = "ACPI thermal zone";
 
 /// Parse one JSON line printed by [`WIN_STREAM_SCRIPT`]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -303,13 +318,25 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
         w.source = if src.contains("Libre") { "LibreHardwareMonitor" } else { "OpenHardwareMonitor" }.to_string();
     }
     if w.package_c.is_none() && w.cores.is_empty() {
-        // Thermal-zone counters are Kelvin; the hottest zone is the best package stand-in
-        let z = as_list(&v["tz"]).iter().filter_map(|k| k.as_f64()).map(|k| if k > 200.0 { k - 273.15 } else { k } as f32)
-            .filter(|c| (1.0..150.0).contains(c))
-            .fold(None, |m: Option<f32>, c| Some(m.map_or(c, |m| m.max(c))));
-        if let Some(c) = z {
-            w.package_c = Some(c);
-            w.source = "ACPI thermal zone".to_string();
+        // Thermal-zone counters are Kelvin ("Temperature": whole K, "High Precision Temperature":
+        // tenths of K, so slow changes are not hidden by 1 K steps)
+        let zones = |key: &str, div: f64| -> Vec<f32> {
+            as_list(&v[key])
+                .iter()
+                .filter_map(|k| k.as_f64())
+                .map(|k| k / div)
+                .map(|k| if k > 200.0 { k - 273.15 } else { k } as f32)
+                .filter(|c| (1.0..150.0).contains(c))
+                .collect()
+        };
+        let mut z = zones("tzh", 10.0);
+        if z.is_empty() {
+            z = zones("tz", 1.0);
+        }
+        if let Some(hottest) = max(z.iter().copied()) {
+            w.package_c = Some(hottest);
+            w.zones_c = z;
+            w.source = ACPI_SOURCE.to_string();
         }
     }
     (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty()).then_some(w)
@@ -319,6 +346,12 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
 const WIN_STREAM_SCRIPT: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $base = (Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1).MaxClockSpeed
+$hp = '\Thermal Zone Information(*)\High Precision Temperature'
+$tzc = '\Thermal Zone Information(*)\Temperature'
+$pf = '\Processor Information(*)\% Processor Performance'
+# A counter set that does not exist on this PC (no ACPI zones, older Windows) fails the whole call,
+# so fall back to smaller sets instead of losing the clocks as well
+$sets = @(@($hp, $tzc, $pf), @($tzc, $pf), @($pf))
 while ($true) {
   $ns = $null; $s = $null
   foreach ($n in 'root/LibreHardwareMonitor', 'root/OpenHardwareMonitor') {
@@ -326,53 +359,128 @@ while ($true) {
     if ($s) { $ns = $n; break }
   }
   $t = @(); if ($s) { $t = @($s | ForEach-Object { @{ n = $_.Name; v = [double]$_.Value } }) }
-  $tz = @(); $perf = @()
-  try {
-    $samples = (Get-Counter -Counter '\Thermal Zone Information(*)\Temperature', '\Processor Information(*)\% Processor Performance' -ErrorAction Stop).CounterSamples
-    $tz = @($samples | Where-Object { $_.Path -like '*thermal zone*' } | ForEach-Object { [double]$_.CookedValue })
+  $tz = @(); $tzh = @(); $perf = @(); $samples = $null
+  foreach ($set in $sets) {
+    try { $samples = (Get-Counter -Counter $set -ErrorAction Stop).CounterSamples; break } catch {}
+  }
+  if ($samples) {
+    $tzh = @($samples | Where-Object { $_.Path -like '*\high precision temperature' } | ForEach-Object { [double]$_.CookedValue })
+    $tz = @($samples | Where-Object { $_.Path -like '*thermal zone*' -and $_.Path -like '*\temperature' } | ForEach-Object { [double]$_.CookedValue })
     $perf = @($samples | Where-Object { $_.Path -like '*processor performance*' -and $_.InstanceName -notmatch '_total' } | ForEach-Object { @{ n = $_.InstanceName; v = [double]$_.CookedValue } })
-  } catch {}
-  [pscustomobject]@{ src = $ns; t = $t; tz = $tz; perf = $perf; base = $base } | ConvertTo-Json -Compress -Depth 4
+  }
+  [pscustomobject]@{ src = $ns; t = $t; tz = $tz; tzh = $tzh; perf = $perf; base = $base } | ConvertTo-Json -Compress -Depth 4
   Start-Sleep -Milliseconds 500
 }
 "#;
 
-/// Long-running PowerShell child that prints one JSON line of sensor data per second
+/// What the PowerShell reader thread has seen so far
+#[derive(Default)]
+struct WinShared {
+    reading: Option<WinSensors>,
+    /// When `reading` was parsed
+    reading_at: Option<Instant>,
+    /// When the child last printed anything at all (even a line without usable sensors)
+    line_at: Option<Instant>,
+}
+
+impl WinShared {
+    /// The last reading, unless it is older than `max_age`. A hung or dead helper must not keep
+    /// feeding its last value into every new snapshot, that is what a "stuck" temperature looks like.
+    fn fresh(&self, now: Instant, max_age: Duration) -> Option<&WinSensors> {
+        let at = self.reading_at?;
+        if now.saturating_duration_since(at) <= max_age {
+            self.reading.as_ref()
+        } else {
+            None
+        }
+    }
+}
+
+/// Readings older than this are dropped (the helper prints one about every 1.5 s)
+const WIN_STALE: Duration = Duration::from_secs(6);
+/// The helper is restarted after this long without any output, or as soon as it exits
+const WIN_HUNG: Duration = Duration::from_secs(12);
+
+/// Long-running PowerShell child that prints one JSON line of sensor data every second or two
 struct WinStream {
-    latest: Arc<Mutex<Option<WinSensors>>>,
+    shared: Arc<Mutex<WinShared>>,
     child: Option<std::process::Child>,
+    spawned: Instant,
 }
 
 impl WinStream {
-    #[cfg(target_os = "windows")]
     fn start() -> Self {
+        let shared = Arc::new(Mutex::new(WinShared::default()));
+        let child = Self::spawn(&shared);
+        Self { shared, child, spawned: Instant::now() }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn(shared: &Arc<Mutex<WinShared>>) -> Option<std::process::Child> {
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
-        let latest = Arc::new(Mutex::new(None));
-        let child = hidden_command("powershell")
+        let mut child = hidden_command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WIN_STREAM_SCRIPT])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
             .spawn()
-            .ok();
-        let mut child = child;
-        if let Some(stdout) = child.as_mut().and_then(|c| c.stdout.take()) {
-            let latest = latest.clone();
+            .ok()?;
+        if let Some(stdout) = child.stdout.take() {
+            let shared = shared.clone();
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if let Some(w) = parse_win_sensor_line(&line) {
-                        *latest.lock().unwrap() = Some(w);
+                    let now = Instant::now();
+                    let parsed = parse_win_sensor_line(&line);
+                    if let Ok(mut sh) = shared.lock() {
+                        sh.line_at = Some(now);
+                        if let Some(w) = parsed {
+                            sh.reading = Some(w);
+                            sh.reading_at = Some(now);
+                        }
                     }
                 }
             });
         }
-        Self { latest, child }
+        Some(child)
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn start() -> Self {
-        Self { latest: Arc::new(Mutex::new(None)), child: None }
+    fn spawn(_shared: &Arc<Mutex<WinShared>>) -> Option<std::process::Child> {
+        None
+    }
+
+    /// The latest reading if it is recent enough to still be true
+    fn fresh(&self) -> Option<WinSensors> {
+        self.shared.lock().ok()?.fresh(Instant::now(), WIN_STALE).cloned()
+    }
+
+    /// Has the helper ever delivered a usable reading?
+    fn ever_delivered(&self) -> bool {
+        self.shared.lock().map_or(false, |s| s.reading_at.is_some())
+    }
+
+    /// Seconds since the helper was (re)started
+    fn age_s(&self) -> f32 {
+        self.spawned.elapsed().as_secs_f32()
+    }
+
+    /// Restart the helper if it exited or went silent (a hung `Get-Counter`, a killed process)
+    fn revive(&mut self) {
+        let exited = match self.child.as_mut() {
+            Some(c) => !matches!(c.try_wait(), Ok(None)),
+            None => true,
+        };
+        let last_output = self.shared.lock().ok().and_then(|s| s.line_at).unwrap_or(self.spawned);
+        let silent = last_output.elapsed() > WIN_HUNG;
+        if (exited || silent) && self.spawned.elapsed() > Duration::from_secs(5) {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            self.child = Self::spawn(&self.shared);
+            self.spawned = Instant::now();
+        }
     }
 }
 
@@ -382,6 +490,90 @@ impl Drop for WinStream {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+/// Chooses which ACPI thermal zone stands in for the CPU temperature. Boards commonly expose zones
+/// that are fixed numbers (e.g. 27.8 °C) next to one that moves, and the hottest zone can be a fixed one,
+/// so prefer the zone that has actually changed recently and only fall back to the hottest.
+#[derive(Default)]
+struct ZonePicker {
+    history: Vec<std::collections::VecDeque<f32>>,
+}
+
+impl ZonePicker {
+    const KEEP: usize = 60;
+    /// Smaller changes than this are treated as no movement
+    const MOVED: f32 = 0.05;
+
+    fn pick(&mut self, zones: &[f32]) -> Option<f32> {
+        if zones.is_empty() {
+            self.history.clear();
+            return None;
+        }
+        if self.history.len() != zones.len() {
+            self.history = vec![Default::default(); zones.len()];
+        }
+        for (h, &z) in self.history.iter_mut().zip(zones) {
+            if h.len() >= Self::KEEP {
+                h.pop_front();
+            }
+            h.push_back(z);
+        }
+        let range = |h: &std::collections::VecDeque<f32>| {
+            let lo = h.iter().copied().fold(f32::MAX, f32::min);
+            let hi = h.iter().copied().fold(f32::MIN, f32::max);
+            hi - lo
+        };
+        let mut best: Option<(f32, f32)> = None; // (range, current temperature)
+        for (h, &z) in self.history.iter().zip(zones) {
+            let r = range(h);
+            if r > Self::MOVED && best.map_or(true, |(br, bt)| r > br || (r == br && z > bt)) {
+                best = Some((r, z));
+            }
+        }
+        best.map(|b| b.1).or_else(|| max(zones.iter().copied()))
+    }
+}
+
+/// Spots a temperature series that never moves while the CPU is busy. On a working sensor a loaded CPU
+/// changes by at least a degree within seconds, so a dead-flat line is almost always a fixed
+/// value (a static ACPI zone, a stuck helper) rather than the real temperature.
+#[derive(Default)]
+struct FlatlineWatch {
+    /// (t_ms, temperature, busiest core %)
+    samples: std::collections::VecDeque<(u64, f32, f32)>,
+}
+
+impl FlatlineWatch {
+    const WINDOW_MS: u64 = 20_000;
+    const MIN_SPAN_MS: u64 = 15_000;
+    const MIN_SAMPLES: usize = 8;
+    const MIN_LOAD_PCT: f32 = 50.0;
+    const MOVED: f32 = 0.05;
+
+    fn push(&mut self, t_ms: u64, temp: Option<f32>, busiest_core_pct: f32) {
+        let Some(temp) = temp else {
+            self.samples.clear();
+            return;
+        };
+        self.samples.push_back((t_ms, temp, busiest_core_pct));
+        while self.samples.front().map_or(false, |f| t_ms.saturating_sub(f.0) > Self::WINDOW_MS) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Seconds the value has been dead flat under load, once that is long enough to matter
+    fn flat_for_s(&self) -> Option<u64> {
+        let (first, last) = (self.samples.front()?, self.samples.back()?);
+        let span = last.0.saturating_sub(first.0);
+        if span < Self::MIN_SPAN_MS || self.samples.len() < Self::MIN_SAMPLES {
+            return None;
+        }
+        let lo = self.samples.iter().map(|s| s.1).fold(f32::MAX, f32::min);
+        let hi = self.samples.iter().map(|s| s.1).fold(f32::MIN, f32::max);
+        let load = self.samples.iter().map(|s| s.2).sum::<f32>() / self.samples.len() as f32;
+        (hi - lo <= Self::MOVED && load >= Self::MIN_LOAD_PCT).then_some(span / 1000)
     }
 }
 
@@ -427,7 +619,9 @@ impl Sampler {
                 }
                 if let Ok(mut v) = samples.lock() {
                     if v.len() >= MAX_SAMPLES {
-                        v.remove(0);
+                        // keep the whole run at half the resolution instead of forgetting its start
+                        let mut i = 0;
+                        v.retain(|_| { i += 1; i % 2 == 0 });
                     }
                     v.push(snap);
                 }
@@ -476,6 +670,9 @@ struct Collector {
     drm_root: std::path::PathBuf,
     nvidia_ok: Option<bool>,
     win: Option<WinStream>,
+    zones: ZonePicker,
+    flat: FlatlineWatch,
+    began: Instant,
     notes: Vec<String>,
     warmup: u32,
 }
@@ -490,6 +687,9 @@ impl Collector {
             drm_root: "/sys/class/drm".into(),
             nvidia_ok: None,
             win: if cfg!(target_os = "windows") { Some(WinStream::start()) } else { None },
+            zones: ZonePicker::default(),
+            flat: FlatlineWatch::default(),
+            began: Instant::now(),
             notes: Vec::new(),
             warmup: 0,
         }
@@ -513,41 +713,79 @@ impl Collector {
 
         // CPU temperatures
         let hw = read_hwmon(&self.hwmon_root);
+        let mut cpu_source = String::new();
         if hw.package_c.is_some() || !hw.cores.is_empty() {
             snap.cpu_package_c = hw.package_c;
             snap.core_temps_c = hw.cores.clone();
+            cpu_source = "Linux hwmon".into();
             notes.push(format!(
                 "CPU temperature: Linux hwmon ({} per-core sensor{})",
                 hw.cores.len(),
                 if hw.cores.len() == 1 { "" } else { "s" }
             ));
         }
+        if let Some(win) = self.win.as_mut() {
+            win.revive();
+        }
         if let Some(win) = &self.win {
-            if let Some(w) = win.latest.lock().unwrap().clone() {
-                if snap.cpu_package_c.is_none() && snap.core_temps_c.is_empty() {
-                    snap.cpu_package_c = w.package_c;
-                    snap.core_temps_c = w.cores.clone();
+            match win.fresh() {
+                Some(w) => {
+                    if snap.cpu_package_c.is_none() && snap.core_temps_c.is_empty() {
+                        snap.cpu_package_c = if w.source == ACPI_SOURCE && !w.zones_c.is_empty() {
+                            self.zones.pick(&w.zones_c)
+                        } else {
+                            w.package_c
+                        };
+                        snap.core_temps_c = w.cores.clone();
+                        cpu_source = w.source.clone();
+                    }
+                    if w.cores.is_empty() {
+                        notes.push(format!(
+                            "CPU temperature: {} (package only). Per-core temperatures need LibreHardwareMonitor or OpenHardwareMonitor running.",
+                            w.source
+                        ));
+                    } else {
+                        notes.push(format!("CPU temperature: {} ({} per-core sensors)", w.source, w.cores.len()));
+                    }
+                    if w.core_freq_mhz.len() >= snap.core_freq_mhz.len().min(1) && !w.core_freq_mhz.is_empty() {
+                        // real clocks instead of sysinfo's nominal values
+                        let n = snap.core_freq_mhz.len().max(w.core_freq_mhz.len());
+                        snap.core_freq_mhz = (0..n).map(|i| w.core_freq_mhz.get(i).copied().unwrap_or(0.0)).collect();
+                    }
+                    if let Some(g) = w.gpu_c {
+                        snap.gpu = Some(GpuSensors { name: "GPU".into(), temp_c: Some(g), ..Default::default() });
+                    }
                 }
-                if w.cores.is_empty() {
-                    notes.push(format!(
-                        "CPU temperature: {} (package only). Per-core temperatures need LibreHardwareMonitor or OpenHardwareMonitor running.",
-                        w.source
-                    ));
-                } else {
-                    notes.push(format!("CPU temperature: {} ({} per-core sensors)", w.source, w.cores.len()));
-                }
-                if w.core_freq_mhz.len() >= snap.core_freq_mhz.len().min(1) && !w.core_freq_mhz.is_empty() {
-                    // real clocks instead of sysinfo's nominal values
-                    let n = snap.core_freq_mhz.len().max(w.core_freq_mhz.len());
-                    snap.core_freq_mhz = (0..n).map(|i| w.core_freq_mhz.get(i).copied().unwrap_or(0.0)).collect();
-                }
-                if let Some(g) = w.gpu_c {
-                    snap.gpu = Some(GpuSensors { name: "GPU".into(), temp_c: Some(g), ..Default::default() });
-                }
+                None if win.ever_delivered() => notes.push(
+                    "CPU temperature: the Windows sensor helper stopped updating, so old readings are being discarded (restarting it)".into(),
+                ),
+                None if win.age_s() < 10.0 => notes.push("CPU temperature: waiting for the Windows sensor helper to start".into()),
+                None => {}
             }
         }
         if snap.cpu_package_c.is_none() && snap.core_temps_c.is_empty() {
-            notes.push("CPU temperature: no sensor available (Windows: run LibreHardwareMonitor for per-core values)".into());
+            let starting = self.win.as_ref().map_or(false, |w| !w.ever_delivered() && w.age_s() < 10.0);
+            if !starting && !notes.iter().any(|n| n.contains("stopped updating")) {
+                notes.push("CPU temperature: no sensor available (Windows: run LibreHardwareMonitor for per-core values)".into());
+            }
+        }
+
+        // A CPU temperature that does not move at all while the CPU is busy is not a real reading
+        let headline = snap.cpu_package_c.or_else(|| max(snap.core_temps_c.iter().map(|c| c.1)));
+        let busiest = max(snap.core_usage_pct.iter().copied()).unwrap_or(0.0);
+        self.flat.push(self.began.elapsed().as_millis() as u64, headline, busiest);
+        if let Some(secs) = self.flat.flat_for_s() {
+            notes.push(if cpu_source == ACPI_SOURCE {
+                format!(
+                    "CPU temperature has not changed for {} s while the CPU was busy: this PC's ACPI thermal zone reports a fixed value, not the real CPU temperature. Run LibreHardwareMonitor (or OpenHardwareMonitor) for live readings.",
+                    secs
+                )
+            } else {
+                format!(
+                    "CPU temperature has not changed for {} s while the CPU was busy: the sensor may be stuck, compare it with another monitoring tool.",
+                    secs
+                )
+            });
         }
 
         // GPU
@@ -567,6 +805,7 @@ impl Collector {
                 snap.gpu = Some(GpuSensors {
                     name: "AMD GPU".into(),
                     temp_c: Some(temp),
+                    util_pct: read_amd_busy(&self.drm_root),
                     vram_used_mb: used,
                     vram_total_mb: total,
                     ..Default::default()
@@ -574,8 +813,10 @@ impl Collector {
                 notes.push("GPU: Linux amdgpu sysfs".into());
             }
         }
-        if snap.gpu.is_none() {
-            notes.push("GPU/VRAM: no supported sensor (NVIDIA needs nvidia-smi on PATH)".into());
+        match &snap.gpu {
+            None => notes.push("GPU/VRAM: no supported sensor (NVIDIA needs nvidia-smi on PATH)".into()),
+            Some(g) if g.util_pct.is_none() => notes.push("GPU load: this sensor source does not report it".into()),
+            Some(_) => {}
         }
 
         self.notes = notes;
@@ -591,6 +832,18 @@ mod tests {
     fn write(dir: &Path, file: &str, content: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(file), content).unwrap();
+    }
+
+    #[test]
+    fn full_sample_buffer_is_thinned_not_truncated() {
+        // the same rule the sampler thread applies at MAX_SAMPLES
+        let mut v: Vec<u64> = (0..MAX_SAMPLES as u64).collect();
+        let mut i = 0;
+        v.retain(|_| { i += 1; i % 2 == 0 });
+        v.push(MAX_SAMPLES as u64);
+        assert_eq!(v.len(), MAX_SAMPLES / 2 + 1);
+        assert!(v[0] <= 1, "the start of the run is still covered");
+        assert!(v.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
@@ -683,6 +936,102 @@ mod tests {
         assert_eq!(w.package_c, Some(40.0));
         assert!(parse_win_sensor_line(r#"{"src":null,"t":[],"tz":[]}"#).is_none());
         assert!(parse_win_sensor_line("not json").is_none());
+    }
+
+    #[test]
+    fn windows_high_precision_zone_temps_and_all_zones_kept() {
+        // tenths of Kelvin: 3011 = 301.1 K = 27.95 °C; preferred over the whole-Kelvin counter
+        let w = parse_win_sensor_line(r#"{"src":null,"t":[],"tz":[301,331],"tzh":[3011,3315]}"#).unwrap();
+        assert_eq!(w.source, "ACPI thermal zone");
+        assert_eq!(w.zones_c.len(), 2);
+        assert!((w.zones_c[0] - 27.95).abs() < 0.01, "{:?}", w.zones_c);
+        assert!((w.package_c.unwrap() - 58.35).abs() < 0.01);
+        // helper without the high precision counter: whole-Kelvin values are used
+        let w = parse_win_sensor_line(r#"{"src":null,"t":[],"tz":[301],"tzh":[]}"#).unwrap();
+        assert!((w.zones_c[0] - 27.85).abs() < 0.01);
+    }
+
+    #[test]
+    fn stale_windows_reading_is_dropped() {
+        let now = Instant::now();
+        let reading = WinSensors { package_c: Some(45.0), ..Default::default() };
+        let mut sh = WinShared { reading: Some(reading), reading_at: now.checked_sub(Duration::from_secs(2)), line_at: None };
+        assert_eq!(sh.fresh(now, WIN_STALE).and_then(|w| w.package_c), Some(45.0));
+        // the helper hung 30 s ago: the old value must not keep being reported
+        sh.reading_at = now.checked_sub(Duration::from_secs(30));
+        assert!(sh.fresh(now, WIN_STALE).is_none());
+        assert!(WinShared::default().fresh(now, WIN_STALE).is_none());
+    }
+
+    #[test]
+    fn zone_picker_prefers_the_zone_that_moves() {
+        let mut p = ZonePicker::default();
+        // zone 0 is a fixed 60 °C, zone 1 is the real one and reads cooler
+        assert_eq!(p.pick(&[60.0, 41.0]), Some(60.0)); // nothing has moved yet: hottest
+        p.pick(&[60.0, 43.5]);
+        assert_eq!(p.pick(&[60.0, 47.0]), Some(47.0));
+        // a different number of zones starts over
+        assert_eq!(p.pick(&[30.0]), Some(30.0));
+        assert_eq!(p.pick(&[]), None);
+    }
+
+    #[test]
+    fn flatline_is_reported_only_for_a_busy_cpu_with_a_dead_flat_temperature() {
+        let feed = |temps: &dyn Fn(u64) -> f32, load: f32| {
+            let mut w = FlatlineWatch::default();
+            for i in 0..40u64 {
+                w.push(i * 500, Some(temps(i)), load);
+            }
+            w.flat_for_s()
+        };
+        // busy and never moving for 20 s: flagged
+        assert!(feed(&|_| 27.8, 90.0).is_some());
+        // same value on an idle CPU is normal
+        assert!(feed(&|_| 27.8, 3.0).is_none());
+        // a moving temperature is fine
+        assert!(feed(&|i| 40.0 + (i / 4) as f32, 90.0).is_none());
+        // too little history to judge
+        let mut short = FlatlineWatch::default();
+        for i in 0..6u64 {
+            short.push(i * 500, Some(27.8), 90.0);
+        }
+        assert!(short.flat_for_s().is_none());
+        // losing the sensor clears the history
+        let mut w = FlatlineWatch::default();
+        for i in 0..40u64 {
+            w.push(i * 500, Some(27.8), 90.0);
+        }
+        w.push(20_000, None, 90.0);
+        assert!(w.flat_for_s().is_none());
+    }
+
+    #[test]
+    fn amd_busy_percent() {
+        let root = tempfile::tempdir().unwrap();
+        write(&root.path().join("card0").join("device"), "gpu_busy_percent", "87\n");
+        assert_eq!(read_amd_busy(root.path()), Some(87.0));
+        assert_eq!(read_amd_busy(Path::new("/definitely/not/here")), None);
+    }
+
+    #[test]
+    fn collector_follows_hwmon_changes() {
+        // Guards against a cached / stale read: every collect() must reflect the file as it is now
+        let root = tempfile::tempdir().unwrap();
+        let d = root.path().join("hwmon0");
+        write(&d, "name", "coretemp");
+        write(&d, "temp1_label", "Package id 0");
+        write(&d, "temp2_label", "Core 0");
+        let mut c = Collector::new();
+        c.hwmon_root = root.path().to_path_buf();
+        c.win = None;
+        let mut seen = Vec::new();
+        for milli in [41000, 55000, 68000] {
+            write(&d, "temp1_input", &milli.to_string());
+            write(&d, "temp2_input", &(milli - 3000).to_string());
+            let s = c.collect();
+            seen.push((s.cpu_package_c.unwrap(), s.core_temps_c[0].1));
+        }
+        assert_eq!(seen, vec![(41.0, 38.0), (55.0, 52.0), (68.0, 65.0)]);
     }
 
     fn snap(t: u64, pkg: Option<f32>, cores: &[(usize, f32)], gpu_t: Option<f32>, vram: Option<f32>) -> Snapshot {

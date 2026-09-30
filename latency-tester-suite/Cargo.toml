@@ -69,6 +69,9 @@ windows = { version = "0.58", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.28", features = ["sched"] }
 
+[build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 tempfile = "3"
 

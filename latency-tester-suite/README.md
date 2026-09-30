@@ -29,6 +29,10 @@ One step (needs [Rust](https://rustup.rs)):
 | Windows | `build.bat` → `dist\LatencyTester.exe` | double-click the exe, or `run.bat` |
 | Linux   | `./build.sh` → `dist/latency-tester` | `./run.sh` |
 
+The exe carries its own icon and version info (`assets/icon.svg` is the source, `assets/icon.ico` is embedded by
+`build.rs`; the resource compiler `rc.exe` comes with the Windows SDK that the Rust MSVC toolchain needs anyway, and
+without it the build simply continues without the icon).
+
 The exe is self-contained: the MSVC runtime is linked statically, the Vulkan loader is
 optional (loaded at run time; the GPU suite reports "no device" without it), and results are
 written to a `latency_results` folder next to the exe. Copy the single file anywhere to use it.
@@ -42,6 +46,32 @@ latency-tester --cli --skip gpu --out ./my_results
 
 Linux GUI needs `libxkbcommon`, X11/Wayland and OpenGL. The GPU suite needs a Vulkan driver
 (software drivers such as Mesa lavapipe work: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`).
+
+## Run all tests
+
+**▶ Run all tests…** in the title bar opens the plan on the Dashboard; **▶ Run all tests** starts it. The app then
+
+1. collects the system data and waits 10 s (a prompt tells you the first test needs you),
+2. runs the **mouse-click and key-press trials first**: wait for the screen to turn green, click / press (10 trials
+   each, about a minute). Everything after that runs by itself, so you can walk away. *Skip the click / key tests* in the
+   bar above skips them,
+3. runs the input timing tests (timer, jitter, polling; unpinned and on every core), then **memory** (all 18 buffer
+   sizes, all 14 access patterns, every thread count up to your logical CPUs, 10 runs, 1 warm-up run, 5 s limit per
+   test), **CPU** (all 12 workloads on all cores, 10 s runs × 10 with 10 s warm-up, then each core on its own) and
+   **GPU** (six sizes, each dispatched for at least 2 s so the load registers),
+4. signs and saves one record (`latency_results/…_session_….json`), writes a folder
+   `latency_results/run_all_<date_time>/` with `memory.csv`, `cpu.csv`, `gpu.csv`, `input_timing.csv`,
+   `input_trials.csv`, `sensors.csv`, a self-contained `report.html` and a short `summary.txt`, and shows everything in
+   **Results & Graphs**.
+
+The full profile takes **hours** (the panel shows a typical and a worst-case time before you start; the per-core CPU
+test alone is one run per workload per core). Use **Quick check** for a few-minute pass, untick parts, or change any
+number in the panel. *Every core on its own* for memory is off by default because it adds thousands of tests. **Stop**
+ends the run early and still saves and exports what finished; a step that fails (for example no Vulkan device) is
+noted and the run carries on.
+
+The manual tabs use the same defaults (memory: 10 runs, 1 warm-up, 5 s limit; CPU: 10 s runs × 10, 10 s warm-up, all
+workloads), and every suite can still be run and saved by hand.
 
 ## Choosing what to test
 
@@ -69,6 +99,18 @@ The **Results & Graphs** tab charts every value, and each line or column can be 
 
 The Dashboard lists which sensors were found. Windows itself does not expose per-core CPU temperatures
 to normal programs, so without a helper such as LibreHardwareMonitor those columns stay empty.
+
+Notes on the numbers:
+
+- The ACPI thermal-zone fallback is not a CPU sensor on every PC: many boards report a fixed value (or a
+  whole-degree value that rarely changes). When the app sees a CPU temperature that has not moved for
+  ~15 s while the CPU is busy it says so in the sensor notes; run LibreHardwareMonitor for real readings.
+  Of several ACPI zones, the one that actually changes is used rather than simply the hottest.
+- If the Windows sensor helper stops updating, its old readings are discarded (and it is restarted)
+  instead of being repeated as if they were live.
+- Each GPU size keeps dispatching for at least 2 s so GPU load, clocks, power and temperature have time to
+  register; a single dispatch takes microseconds and would read as ~0 % load. GPU load comes from
+  `nvidia-smi` or, on Linux/AMD, `gpu_busy_percent`.
 
 ## Logging and viewing results
 

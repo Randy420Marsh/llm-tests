@@ -68,6 +68,19 @@ impl InputTestUi {
         self.clock.now_ns() as f64 / 1e6
     }
 
+    /// Show the `kind` sub-tab and start a fresh run of trials (same as pressing Start)
+    pub fn begin_run(&mut self, kind: InputKind) {
+        self.sub = match kind {
+            InputKind::MouseClick => SubTab::Mouse,
+            InputKind::KeyPress => SubTab::Keyboard,
+        };
+        self.cfg.kind = kind;
+        self.engine = Engine::new(self.cfg.clone(), None);
+        self.recorded = false;
+        let now = self.now_ms();
+        self.engine.start(now);
+    }
+
     fn kind(&self) -> Option<InputKind> {
         match self.sub {
             SubTab::Mouse => Some(InputKind::MouseClick),
@@ -185,11 +198,7 @@ impl LatencyTesterApp {
             if !active {
                 let label = if self.input_test.cfg.robot { "▶ Start automated run" } else { "▶ Start test" };
                 if ui.button(RichText::new(label).strong()).clicked() {
-                    let cfg = self.input_test.cfg.clone();
-                    self.input_test.engine = Engine::new(cfg, None);
-                    self.input_test.recorded = false;
-                    let now = self.input_test.now_ms();
-                    self.input_test.engine.start(now);
+                    self.input_test.begin_run(kind);
                     self.log(&format!("Started {} test ({} trials)", kind.label(), self.input_test.cfg.trials));
                 }
             } else if ui.button(RichText::new("⏹ Abort").color(Color32::from_rgb(255, 120, 120))).clicked() {

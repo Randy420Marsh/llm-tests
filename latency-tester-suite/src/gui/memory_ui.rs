@@ -8,16 +8,10 @@ use std::time::Instant;
 use super::core_select::CoreSelector;
 use super::{human_size, LatencyTesterApp, RunningTaskState};
 use crate::memory_benchmark::{
-    AccessPattern, MemProgress, MemoryBenchmark, MemoryBenchmarkConfig, MemoryBenchmarkResult,
+    memory_needed_for, AccessPattern, MemProgress, MemoryBenchmark, MemoryBenchmarkConfig, MemoryBenchmarkResult,
+    SIZE_PRESETS, THREAD_PRESETS,
 };
 use crate::topology::CoreKind;
-
-const SIZE_PRESETS: [usize; 18] = [
-    4 << 10, 16 << 10, 32 << 10, 64 << 10, 128 << 10, 256 << 10, 512 << 10,
-    1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20,
-    128 << 20, 256 << 20, 512 << 20, 1 << 30,
-];
-const THREAD_PRESETS: [usize; 8] = [1, 2, 4, 8, 12, 16, 24, 32];
 
 /// Everything the user can tweak on the Memory tab
 pub(super) struct MemUi {
@@ -87,12 +81,7 @@ fn fmt_duration(secs: f64) -> String {
 
 /// Rough RAM needed by the largest selected buffer (data + optional second buffer + chase table)
 fn memory_needed(cfg: &MemoryBenchmarkConfig) -> usize {
-    let max = cfg.sizes.iter().copied().max().unwrap_or(0);
-    let aux = cfg.patterns.iter().any(|p| {
-        matches!(p, AccessPattern::StreamCopy | AccessPattern::StreamAdd | AccessPattern::StreamTriad)
-    });
-    let chase = cfg.patterns.iter().any(|p| matches!(p, AccessPattern::PointerChase));
-    max + if aux { max } else { 0 } + if chase { max + max / 8 } else { 0 }
+    memory_needed_for(cfg.sizes.iter().copied().max().unwrap_or(0), &cfg.patterns)
 }
 
 impl LatencyTesterApp {
@@ -349,7 +338,7 @@ impl LatencyTesterApp {
     }
 
     /// Live "what is being tested right now" panel
-    fn mem_progress_panel(&mut self, ui: &mut Ui) {
+    pub(super) fn mem_progress_panel(&mut self, ui: &mut Ui) {
         let p: MemProgress = self.mem_progress.lock().unwrap().clone();
         if p.total_tests == 0 {
             return;

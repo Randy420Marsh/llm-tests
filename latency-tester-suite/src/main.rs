@@ -25,6 +25,7 @@ mod report;
 mod server;
 mod sensors;
 mod progress;
+mod run_all;
 
 use anyhow::Result;
 use eframe::egui;
@@ -61,14 +62,15 @@ fn main() -> Result<()> {
     // VSync off by default: input timestamps are taken once per frame, so a fast unsynchronised frame
     // loop keeps that quantisation to ~1 ms. `--vsync` restores normal presentation.
     let vsync = args.iter().any(|a| a == "--vsync");
-    let options = eframe::NativeOptions {
-        vsync,
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 900.0])
-            .with_min_inner_size([800.0, 600.0])
-            .with_title("Latency Tester Suite v1.0"),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 900.0])
+        .with_min_inner_size([800.0, 600.0])
+        .with_title("Latency Tester Suite v1.0");
+    // Window / taskbar icon (the exe's file icon is embedded by build.rs)
+    if let Ok(icon) = window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+    let options = eframe::NativeOptions { vsync, viewport, ..Default::default() };
 
     eframe::run_native(
         "Latency Tester Suite",
@@ -79,6 +81,11 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+/// The application icon (assets/icon.svg rendered at 256 px)
+fn window_icon() -> Result<egui::IconData, String> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon_256.png")).map_err(|e| e.to_string())
+}
+
 /// The Windows release exe has no console of its own; attach to the launching terminal
 /// so `--cli` / `--help` output is visible there.
 #[cfg(all(windows, not(debug_assertions)))]
@@ -91,3 +98,16 @@ fn attach_parent_console() {
 
 #[cfg(not(all(windows, not(debug_assertions))))]
 fn attach_parent_console() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_window_icon_decodes() {
+        let icon = super::window_icon().expect("assets/icon_256.png must be a valid PNG");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        // rounded tile: the corner is transparent, the middle is not
+        assert_eq!(icon.rgba[3], 0);
+        assert!(icon.rgba[(128 * 256 + 128) * 4 + 3] > 200);
+    }
+}

@@ -623,7 +623,7 @@ impl LatencyTesterApp {
                 let color = color_for(i);
                 plot_ui.line(Line::new(PlotPoints::from(pts.clone())).name(s).color(color));
                 if show_points {
-                    plot_ui.points(Points::new(PlotPoints::from(pts)).name(s).color(color).radius(3.5));
+                    plot_ui.points(Points::new(PlotPoints::from(pts)).name(s).color(color).radius(3.5_f32));
                 }
             }
         });

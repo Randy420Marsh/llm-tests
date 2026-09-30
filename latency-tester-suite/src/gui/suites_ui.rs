@@ -8,15 +8,14 @@ use std::time::{Duration, Instant};
 
 use super::core_select::CoreSelector;
 use super::{LatencyTesterApp, RunningTaskState};
-use crate::cancel;
 use crate::cpu_benchmark::{AffinityMode, CpuBenchmark, CpuBenchmarkConfig, CpuBenchmarkResult, WorkloadType};
 use crate::gpu_benchmark::{GpuBenchmark, GpuBenchmarkResult};
-use crate::input_latency::{InputLatencyConfig, InputLatencySummary, InputLatencyTester, InputTestMode};
-use crate::progress::{self, RunProgress, SharedProgress};
+use crate::input_latency::{InputLatencyConfig, InputTestMode};
+use crate::progress::RunProgress;
 use crate::sensors::Sampler;
 use crate::topology::CoreKind;
 
-const WORKLOADS: [(&str, &str, WorkloadType); 12] = [
+pub(super) const WORKLOADS: [(&str, &str, WorkloadType); 12] = [
     ("Game Sim", "physics + collision + AI decisions", WorkloadType::GameSim),
     ("Compilation Sim", "allocation, pointer chasing, branching", WorkloadType::CompilationSim),
     ("Mixed", "int/float/branch mix", WorkloadType::MixedWorkload),
@@ -45,12 +44,13 @@ impl CpuUi {
     pub fn new(kinds: Option<Vec<CoreKind>>) -> Self {
         Self {
             cores: CoreSelector::new(kinds, "cpu"),
-            workloads: WORKLOADS.iter().map(|w| (w.2, w.2 == WorkloadType::GameSim)).collect(),
+            // Same profile as "Run all tests": every workload on all cores, 10 s runs x 10, 10 s warmup
+            workloads: WORKLOADS.iter().map(|w| (w.2, true)).collect(),
             threads: num_cpus::get(),
             threads_all: true,
-            duration_s: 3,
-            warmup_s: 1,
-            iterations: 2,
+            duration_s: 10,
+            warmup_s: 10,
+            iterations: 10,
         }
     }
 
@@ -169,7 +169,7 @@ impl LatencyTesterApp {
         }
     }
 
-    fn mark_running(&mut self, kind: &str, status: &str) {
+    pub(super) fn mark_running(&mut self, kind: &str, status: &str) {
         self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         *self.running.lock().unwrap() = Some(RunningTaskState { kind: kind.to_string(), started: Instant::now() });
         self.task_status = status.to_string();
@@ -446,7 +446,7 @@ impl LatencyTesterApp {
 
         let running = self.running.clone();
         std::thread::spawn(move || {
-            let result = run_input_passes(base, passes, cancel_flag, prog, sampler);
+            let result = crate::input_latency::run_passes(base, passes, cancel_flag, prog, sampler);
             super::COMPLETE_INPUT_RESULT.lock().unwrap().replace(result);
             if let Ok(mut guard) = running.lock() {
                 *guard = None;
@@ -472,54 +472,4 @@ impl LatencyTesterApp {
         let prog = self.input_progress.lock().unwrap().clone();
         progress_panel(ui, &prog, self.is_running());
     }
-}
-
-/// Run the suite once per requested core and merge the results
-fn run_input_passes(
-    base: InputLatencyConfig,
-    passes: Vec<Option<usize>>,
-    cancel_flag: cancel::CancelFlag,
-    prog: SharedProgress,
-    sampler: Arc<Sampler>,
-) -> anyhow::Result<InputLatencySummary> {
-    let total = passes.len() * base.test_modes.len();
-    let started = Instant::now();
-    let mut merged: Option<InputLatencySummary> = None;
-    for (i, core) in passes.iter().enumerate() {
-        cancel::check(&cancel_flag)?;
-        let inner = progress::new();
-        let cfg = InputLatencyConfig { pin_core: *core, ..base.clone() };
-        // Run on a fresh thread so the pin does not leak into the caller
-        let (c2, p2, s2) = (cancel_flag.clone(), inner.clone(), sampler.clone());
-        let outer = prog.clone();
-        let done_before = i * base.test_modes.len();
-        let watcher_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ws = watcher_stop.clone();
-        let inner_watch = inner.clone();
-        let watcher = std::thread::spawn(move || {
-            while !ws.load(std::sync::atomic::Ordering::Relaxed) {
-                if let (Ok(mut o), Ok(i)) = (outer.lock(), inner_watch.lock()) {
-                    o.total = total;
-                    o.done = done_before + i.done;
-                    o.title = i.title.clone();
-                    o.detail = i.detail.clone();
-                    o.started = Some(started);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
-        let summary = std::thread::spawn(move || {
-            InputLatencyTester::new(cfg).with_cancel(c2).with_progress(p2).with_sensors(s2).run()
-        })
-        .join()
-        .map_err(|_| anyhow::anyhow!("input test thread panicked"))?;
-        watcher_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = watcher.join();
-        let summary = summary?;
-        match merged.as_mut() {
-            Some(m) => m.results.extend(summary.results),
-            None => merged = Some(summary),
-        }
-    }
-    merged.ok_or_else(|| anyhow::anyhow!("no input passes to run"))
 }

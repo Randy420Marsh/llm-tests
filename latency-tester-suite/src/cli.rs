@@ -204,7 +204,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
     if run_suite("gpu") {
         println!("== GPU (Vulkan compute) ==");
-        let cfg = GpuBenchmarkConfig { workload_sizes: vec![1 << 18, 1 << 20], iterations: 20, warmup_iterations: 3 };
+        let cfg = GpuBenchmarkConfig { workload_sizes: vec![1 << 18, 1 << 20], iterations: 20, warmup_iterations: 3, min_sample_ms: 1000 };
         match GpuBenchmark::new(cfg.clone()) {
             Ok(bench) => {
                 let mut bench = bench.with_sensors(sampler.clone());
@@ -271,6 +271,7 @@ pub fn run(args: &[String]) -> Result<()> {
         sensor_notes: &notes,
         virtualization,
         calibration: None,
+        ..Default::default()
     };
     let mut failures = Vec::new();
     if session::has_data(&data, Scope::Everything) {
