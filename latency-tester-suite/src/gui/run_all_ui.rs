@@ -128,6 +128,7 @@ impl LatencyTesterApp {
         self.last_gpu_result = None;
         self.last_input_result = None;
         self.last_timeline.clear();
+        self.last_phases.clear();
         self.sensor_notes.clear();
         self.mem_extra_configs.clear();
         self.cpu_extra_configs.clear();
@@ -234,10 +235,13 @@ impl LatencyTesterApp {
     /// The worker asked for a mouse / keyboard trial run: put the trial screen up, start it, and
     /// tell the worker when it is over
     fn run_all_drive_trials(&mut self, kind: InputKind) {
-        self.tab = Tab::Input;
         if self.run_all.finished_kinds.contains(&kind) {
-            return; // already answered, the worker is about to move on
+            // Already answered; the worker notices within ~100 ms. Do not touch the tab meanwhile,
+            // or the switch to the Dashboard after the last trial is undone.
+            return;
         }
+        // The trials only advance while the trial screen is drawn, so keep it in front for now
+        self.tab = Tab::Input;
         let answer = |app: &mut Self| {
             run_all::finish_user_step(&app.run_all.status);
             app.run_all.finished_kinds.push(kind);
@@ -491,7 +495,15 @@ impl LatencyTesterApp {
                     ui.add(egui::DragValue::new(&mut plan.cpu_runs).range(1..=1000));
                     ui.label(RichText::new("warmup").weak());
                     ui.add(egui::DragValue::new(&mut plan.cpu_warmup_s).range(0..=600).suffix(" s"));
-                    ui.checkbox(&mut plan.cpu_each_core, "and every core on its own");
+                    ui.checkbox(&mut plan.cpu_each_core, "and every core on its own:");
+                    ui.add_enabled_ui(plan.cpu_each_core, |ui| {
+                        ui.add(egui::DragValue::new(&mut plan.cpu_core_run_s).range(1..=600).suffix(" s"))
+                            .on_hover_text("Run length per core. The per-core pass is workloads × cores tests, so keep it short");
+                        ui.label(RichText::new("×").weak());
+                        ui.add(egui::DragValue::new(&mut plan.cpu_core_runs).range(1..=1000));
+                        ui.label(RichText::new("warmup").weak());
+                        ui.add(egui::DragValue::new(&mut plan.cpu_core_warmup_s).range(0..=600).suffix(" s"));
+                    });
                 });
                 ui.end_row();
 
@@ -499,6 +511,13 @@ impl LatencyTesterApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("six sizes, each dispatched for at least").weak());
                     ui.add(egui::DragValue::new(&mut plan.gpu_min_sample_ms).range(0..=60_000).suffix(" ms"));
+                });
+                ui.end_row();
+
+                ui.label("Per-core order");
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut plan.core_by_core, false, "rotate cores between tests (cooler)");
+                    ui.radio_value(&mut plan.core_by_core, true, "all tests on one core, then the next");
                 });
                 ui.end_row();
 
@@ -759,6 +778,7 @@ mod tests {
                         duration_seconds: 1,
                         warmup_seconds: 0,
                         iterations: 1,
+                        core_by_core: false,
                     },
                 },
             ],

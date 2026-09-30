@@ -12,6 +12,33 @@ pub struct RunProgress {
     /// Extra detail, e.g. "measuring run 2/3"
     pub detail: String,
     pub started: Option<Instant>,
+    /// Set when the suite ended (finished, stopped or failed): the panel stops counting and says so
+    pub finished: Option<Instant>,
+}
+
+impl RunProgress {
+    /// Still going (not every test done and not marked finished)
+    pub fn active(&self) -> bool {
+        self.finished.is_none() && self.done < self.total
+    }
+
+    /// Seconds from the start to now, or to the end once finished
+    pub fn elapsed_s(&self) -> f64 {
+        match (self.started, self.finished) {
+            (Some(s), Some(f)) => f.saturating_duration_since(s).as_secs_f64(),
+            (Some(s), None) => s.elapsed().as_secs_f64(),
+            _ => 0.0,
+        }
+    }
+}
+
+/// Mark the suite behind `handle` as ended
+pub fn finish(handle: &SharedProgress) {
+    if let Ok(mut g) = handle.lock() {
+        if g.finished.is_none() {
+            g.finished = Some(Instant::now());
+        }
+    }
 }
 
 pub type SharedProgress = Arc<Mutex<RunProgress>>;

@@ -186,6 +186,7 @@ pub fn run(args: &[String]) -> Result<()> {
             duration_seconds: 1,
             warmup_seconds: 1,
             iterations: 2,
+            core_by_core: false,
         };
         let summary = CpuBenchmark::new(cfg.clone())?.with_sensors(sampler.clone()).run()?;
         for r in &summary.results {
@@ -249,6 +250,7 @@ pub fn run(args: &[String]) -> Result<()> {
     sampler.stop();
     let timeline = sampler.timeline();
     let notes = sampler.notes();
+    let phases = sampler.phases();
     for n in &notes {
         println!("  sensor: {}", n);
     }
@@ -269,6 +271,7 @@ pub fn run(args: &[String]) -> Result<()> {
         trials: &[],
         timeline: &timeline,
         sensor_notes: &notes,
+        phases: &phases,
         virtualization,
         calibration: None,
         ..Default::default()

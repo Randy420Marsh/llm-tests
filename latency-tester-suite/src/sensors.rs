@@ -29,6 +29,75 @@ pub struct GpuSensors {
     pub clock_mhz: Option<f32>,
 }
 
+/// What an extra sensor measures
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SensorKind {
+    Temp,
+    Fan,
+    Power,
+    Voltage,
+    Current,
+}
+
+impl SensorKind {
+    pub fn unit(self) -> &'static str {
+        match self {
+            SensorKind::Temp => "°C",
+            SensorKind::Fan => "RPM",
+            SensorKind::Power => "W",
+            SensorKind::Voltage => "V",
+            SensorKind::Current => "A",
+        }
+    }
+
+    /// Readings outside this range are sensor glitches or unconnected inputs
+    fn plausible(self, v: f32) -> bool {
+        v.is_finite()
+            && match self {
+                SensorKind::Temp => (-40.0..150.0).contains(&v) && v != 0.0,
+                SensorKind::Fan => (0.0..30_000.0).contains(&v),
+                SensorKind::Power => (0.0..5_000.0).contains(&v),
+                SensorKind::Voltage => (0.0..60.0).contains(&v),
+                SensorKind::Current => (0.0..500.0).contains(&v),
+            }
+    }
+
+    fn from_lhm(s: &str) -> Option<Self> {
+        Some(match s {
+            "Temperature" => SensorKind::Temp,
+            "Fan" => SensorKind::Fan,
+            "Power" => SensorKind::Power,
+            "Voltage" => SensorKind::Voltage,
+            "Current" => SensorKind::Current,
+            _ => return None,
+        })
+    }
+}
+
+/// One reading of any other sensor the machine exposes: board / VRM / DIMM / drive temperatures,
+/// fans, power draw (CPU package, memory, PSU), voltages and currents
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SensorReading {
+    /// "nct6798: VRM MOS", "RAPL: package-0", "Corsair HX1000i: Total power" ...
+    pub name: String,
+    pub kind: SensorKind,
+    pub value: f32,
+}
+
+/// Most extra readings kept per sample (a large board exposes about a hundred)
+const MAX_EXTRA_SENSORS: usize = 256;
+
+/// One test while the sampler ran: drawn as a coloured band on the timeline
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Phase {
+    /// "memory", "cpu", "gpu", "input"
+    pub kind: String,
+    pub label: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Milliseconds since the sampler started
@@ -42,6 +111,22 @@ pub struct Snapshot {
     pub ram_used_mb: f32,
     pub ram_total_mb: f32,
     pub gpu: Option<GpuSensors>,
+    /// Every other sensor found (see [`SensorReading`])
+    #[serde(default)]
+    pub sensors: Vec<SensorReading>,
+}
+
+impl Snapshot {
+    /// CPU package power: RAPL on Linux, the "CPU Package" power sensor of LibreHardwareMonitor on Windows
+    pub fn cpu_package_power_w(&self) -> Option<f32> {
+        self.sensors
+            .iter()
+            .find(|r| {
+                let n = r.name.to_lowercase();
+                r.kind == SensorKind::Power && n.contains("package") && !n.contains("gpu")
+            })
+            .map(|r| r.value)
+    }
 }
 
 /// Summary of the samples taken during one test
@@ -52,6 +137,12 @@ pub struct Telemetry {
     pub cpu_temp_max_c: Option<f32>,
     /// Peak temperature per core during the test
     pub core_temp_max_c: Vec<(usize, f32)>,
+    /// Average of every per-core reading during the test (all cores, all samples)
+    #[serde(default)]
+    pub core_temp_avg_c: Option<f32>,
+    /// Average CPU package power during the test, when a power sensor exists
+    #[serde(default)]
+    pub cpu_power_avg_w: Option<f32>,
     pub cpu_freq_avg_mhz: Option<f32>,
     /// Average clock per logical CPU during the test
     pub core_freq_avg_mhz: Vec<f32>,
@@ -72,6 +163,24 @@ fn avg(v: impl Iterator<Item = f32>) -> Option<f32> {
 
 fn max(v: impl Iterator<Item = f32>) -> Option<f32> {
     v.fold(None, |m: Option<f32>, x| Some(m.map_or(x, |m| m.max(x))))
+}
+
+impl Telemetry {
+    /// (core, peak °C) of the core that got hottest
+    pub fn hottest_core(&self) -> Option<(usize, f32)> {
+        self.core_temp_max_c.iter().copied().fold(None, |m, c| match m {
+            Some(x) if x.1 >= c.1 => Some(x),
+            _ => Some(c),
+        })
+    }
+
+    /// (core, peak °C) of the core that stayed coolest
+    pub fn coolest_core(&self) -> Option<(usize, f32)> {
+        self.core_temp_max_c.iter().copied().fold(None, |m, c| match m {
+            Some(x) if x.1 <= c.1 => Some(x),
+            _ => Some(c),
+        })
+    }
 }
 
 /// Reduce samples to one [`Telemetry`]
@@ -97,6 +206,8 @@ pub fn summarize(samples: &[Snapshot]) -> Telemetry {
         }
     }
     t.core_temp_max_c = per_core.into_iter().collect();
+    t.core_temp_avg_c = avg(samples.iter().flat_map(|s| s.core_temps_c.iter().map(|c| c.1)));
+    t.cpu_power_avg_w = avg(samples.iter().filter_map(|s| s.cpu_package_power_w()));
 
     t.cpu_freq_avg_mhz = avg(samples.iter().filter_map(|s| avg(s.core_freq_mhz.iter().copied().filter(|f| *f > 0.0))));
     let n_cpu = samples.iter().map(|s| s.core_freq_mhz.len()).max().unwrap_or(0);
@@ -176,6 +287,85 @@ pub fn read_hwmon(root: &Path) -> HwmonReading {
     out
 }
 
+/// Every temperature / fan / power / voltage / current input under `root` (normally `/sys/class/hwmon`):
+/// board chips (VRM, chipset, system temps, fans, Vcore), DIMM sensors (spd5118, jc42), drives (nvme,
+/// drivetemp), PSUs with a hwmon driver (corsair-psu, nzxt), ... CPU core / package temperatures are
+/// reported separately and are skipped here.
+pub fn read_hwmon_all(root: &Path) -> Vec<SensorReading> {
+    let mut out = Vec::new();
+    let Ok(dirs) = std::fs::read_dir(root) else { return out };
+    let mut dirs: Vec<_> = dirs.flatten().map(|d| d.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let chip = read_trim(&dir.join("name")).unwrap_or_else(|| "hwmon".into());
+        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<String> = files.flatten().map(|f| f.file_name().to_string_lossy().to_string()).collect();
+        files.sort();
+        for fname in files {
+            // (prefix, suffix, kind, scale to the unit)
+            let spec = [
+                ("temp", "_input", SensorKind::Temp, 1e-3),
+                ("fan", "_input", SensorKind::Fan, 1.0),
+                ("power", "_input", SensorKind::Power, 1e-6),
+                ("power", "_average", SensorKind::Power, 1e-6),
+                ("in", "_input", SensorKind::Voltage, 1e-3),
+                ("curr", "_input", SensorKind::Current, 1e-3),
+            ];
+            let Some((prefix, idx, kind, scale)) = spec.iter().find_map(|(p, suf, k, sc)| {
+                fname.strip_prefix(p).and_then(|r| r.strip_suffix(suf)).filter(|i| i.chars().all(|c| c.is_ascii_digit()) && !i.is_empty()).map(|i| (*p, i.to_string(), *k, *sc))
+            }) else { continue };
+            if kind == SensorKind::Temp && matches!(chip.as_str(), "coretemp" | "k10temp" | "zenpower") {
+                continue;
+            }
+            let Some(raw) = read_trim(&dir.join(&fname)).and_then(|v| v.parse::<f64>().ok()) else { continue };
+            let value = (raw * scale) as f32;
+            if !kind.plausible(value) {
+                continue;
+            }
+            let label = read_trim(&dir.join(format!("{}{}_label", prefix, idx))).unwrap_or_else(|| format!("{}{}", prefix, idx));
+            out.push(SensorReading { name: format!("{}: {}", chip, label), kind, value });
+            if out.len() >= MAX_EXTRA_SENSORS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// CPU package / core / DRAM power from the RAPL energy counters (`/sys/class/powercap/intel-rapl*`,
+/// also used for AMD Zen). Power = energy difference between two samples / time. The counters are
+/// root-only on many distributions; then nothing is reported.
+#[derive(Default)]
+struct Rapl {
+    last: std::collections::HashMap<std::path::PathBuf, (Instant, u64)>,
+}
+
+impl Rapl {
+    fn read(&mut self, root: &Path) -> Vec<SensorReading> {
+        let mut out = Vec::new();
+        let Ok(dirs) = std::fs::read_dir(root) else { return out };
+        let now = Instant::now();
+        let mut dirs: Vec<_> = dirs.flatten().map(|d| d.path()).filter(|p| p.to_string_lossy().contains("rapl:")).collect();
+        dirs.sort();
+        for dir in dirs {
+            let Some(energy) = read_trim(&dir.join("energy_uj")).and_then(|v| v.parse::<u64>().ok()) else { continue };
+            let name = read_trim(&dir.join("name")).unwrap_or_else(|| "domain".into());
+            let range = read_trim(&dir.join("max_energy_range_uj")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(u64::MAX);
+            if let Some((t, e)) = self.last.insert(dir.clone(), (now, energy)) {
+                let dt = now.duration_since(t).as_secs_f64();
+                let de = if energy >= e { energy - e } else { range.saturating_sub(e) + energy }; // counter wrapped
+                if dt > 0.05 {
+                    let w = (de as f64 / 1e6 / dt) as f32;
+                    if SensorKind::Power.plausible(w) {
+                        out.push(SensorReading { name: format!("RAPL: {}", name), kind: SensorKind::Power, value: w });
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// AMD VRAM (used, total) in MB from `/sys/class/drm/card*/device/mem_info_vram_*`
 pub fn read_amd_vram(drm_root: &Path) -> Option<(f32, f32)> {
     for card in std::fs::read_dir(drm_root).ok()?.flatten() {
@@ -223,7 +413,7 @@ pub fn parse_nvidia_smi(out: &str) -> Option<GpuSensors> {
     })
 }
 
-fn hidden_command(program: &str) -> std::process::Command {
+pub(crate) fn hidden_command(program: &str) -> std::process::Command {
     #[allow(unused_mut)]
     let mut c = std::process::Command::new(program);
     #[cfg(target_os = "windows")]
@@ -264,6 +454,8 @@ pub struct WinSensors {
     /// Every ACPI thermal zone in °C (only filled for the ACPI fallback). Many boards have zones
     /// that never change, so the hottest one is not always the useful one, see [`ZonePicker`].
     pub zones_c: Vec<f32>,
+    /// Every LibreHardwareMonitor temperature, fan, power, voltage and current sensor
+    pub extra: Vec<SensorReading>,
 }
 
 const ACPI_SOURCE: &str = "ACPI thermal zone";
@@ -315,7 +507,21 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
         w.core_freq_mhz = freqs.into_iter().map(|f| f.1).collect();
     }
     if let Some(src) = v["src"].as_str().filter(|s| !s.is_empty()) {
-        w.source = if src.contains("Libre") { "LibreHardwareMonitor" } else { "OpenHardwareMonitor" }.to_string();
+        w.source = if src == "lib" {
+            "LibreHardwareMonitor library"
+        } else if src.contains("Libre") {
+            "LibreHardwareMonitor"
+        } else {
+            "OpenHardwareMonitor"
+        }
+        .to_string();
+    }
+    for x in as_list(&v["x"]) {
+        let (Some(name), Some(kind), Some(val)) = (x["n"].as_str(), x["k"].as_str().and_then(SensorKind::from_lhm), x["v"].as_f64()) else { continue };
+        let val = val as f32;
+        if kind.plausible(val) && w.extra.len() < MAX_EXTRA_SENSORS {
+            w.extra.push(SensorReading { name: name.to_string(), kind, value: val });
+        }
     }
     if w.package_c.is_none() && w.cores.is_empty() {
         // Thermal-zone counters are Kelvin ("Temperature": whole K, "High Precision Temperature":
@@ -339,7 +545,7 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
             w.source = ACPI_SOURCE.to_string();
         }
     }
-    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty()).then_some(w)
+    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty() || !w.extra.is_empty()).then_some(w)
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -352,13 +558,51 @@ $pf = '\Processor Information(*)\% Processor Performance'
 # A counter set that does not exist on this PC (no ACPI zones, older Windows) fails the whole call,
 # so fall back to smaller sets instead of losing the clocks as well
 $sets = @(@($hp, $tzc, $pf), @($tzc, $pf), @($pf))
-while ($true) {
-  $ns = $null; $s = $null
-  foreach ($n in 'root/LibreHardwareMonitor', 'root/OpenHardwareMonitor') {
-    $s = Get-CimInstance -Namespace $n -ClassName Sensor | Where-Object { $_.SensorType -eq 'Temperature' }
-    if ($s) { $ns = $n; break }
+# 1) LibreHardwareMonitor's own library next to the exe ($env:LTS_LHM_DIR): no separate app needed.
+#    Without administrator rights it cannot load its driver, so CPU / board / memory sensors stay empty.
+$computer = $null
+$lhm = $env:LTS_LHM_DIR
+if ($lhm -and (Test-Path (Join-Path $lhm 'LibreHardwareMonitorLib.dll'))) {
+  try {
+    Get-ChildItem $lhm -Filter *.dll | ForEach-Object { try { [void][Reflection.Assembly]::LoadFrom($_.FullName) } catch {} }
+    $computer = New-Object LibreHardwareMonitor.Hardware.Computer
+    foreach ($p in 'IsCpuEnabled','IsGpuEnabled','IsMemoryEnabled','IsMotherboardEnabled','IsControllerEnabled','IsPsuEnabled','IsStorageEnabled','IsBatteryEnabled') {
+      try { $computer.$p = $true } catch {}
+    }
+    $computer.Open()
+  } catch { $computer = $null }
+}
+function Read-Lhm($hw, $out) {
+  try { $hw.Update() } catch {}
+  foreach ($sub in $hw.SubHardware) { Read-Lhm $sub $out }
+  foreach ($s in $hw.Sensors) {
+    if ($s.Value -ne $null) { $out.Add(@{ h = [string]$hw.Name; n = [string]$s.Name; k = [string]$s.SensorType; v = [double]$s.Value }) }
   }
-  $t = @(); if ($s) { $t = @($s | ForEach-Object { @{ n = $_.Name; v = [double]$_.Value } }) }
+}
+while ($true) {
+  $ns = $null; $all = $null; $s = $null; $x = @(); $t = @()
+  if ($computer) {
+    $list = New-Object System.Collections.ArrayList
+    foreach ($hw in $computer.Hardware) { Read-Lhm $hw $list }
+    $ns = 'lib'
+    $t = @($list | Where-Object { $_.k -eq 'Temperature' } | ForEach-Object { @{ n = $_.n; v = $_.v } })
+    $x = @($list | Where-Object { 'Temperature','Fan','Power','Voltage','Current' -contains $_.k } | ForEach-Object { @{ n = "$($_.h): $($_.n)"; k = $_.k; v = $_.v } })
+  } else {
+  # 2) the LibreHardwareMonitor / OpenHardwareMonitor app, if it runs, through WMI
+  foreach ($n in 'root/LibreHardwareMonitor', 'root/OpenHardwareMonitor') {
+    $all = Get-CimInstance -Namespace $n -ClassName Sensor
+    if ($all) { $ns = $n; break }
+  }
+  }
+  if ($all) {
+    $s = $all | Where-Object { $_.SensorType -eq 'Temperature' }
+    # every sensor with its hardware's name: "Nuvoton NCT6798D: VRM MOS", "DIMM #1: Temperature", "Corsair HX1000i: Total"
+    $hw = @{}; Get-CimInstance -Namespace $ns -ClassName Hardware | ForEach-Object { $hw[[string]$_.Identifier] = $_.Name }
+    $x = @($all | Where-Object { 'Temperature','Fan','Power','Voltage','Current' -contains $_.SensorType } | ForEach-Object {
+      $h = $hw[[string]$_.Parent]; if (-not $h) { $h = [string]$_.Parent }
+      @{ n = "$($h): $($_.Name)"; k = [string]$_.SensorType; v = [double]$_.Value } })
+  }
+  if ($s) { $t = @($s | ForEach-Object { @{ n = $_.Name; v = [double]$_.Value } }) }
   $tz = @(); $tzh = @(); $perf = @(); $samples = $null
   foreach ($set in $sets) {
     try { $samples = (Get-Counter -Counter $set -ErrorAction Stop).CounterSamples; break } catch {}
@@ -368,7 +612,7 @@ while ($true) {
     $tz = @($samples | Where-Object { $_.Path -like '*thermal zone*' -and $_.Path -like '*\temperature' } | ForEach-Object { [double]$_.CookedValue })
     $perf = @($samples | Where-Object { $_.Path -like '*processor performance*' -and $_.InstanceName -notmatch '_total' } | ForEach-Object { @{ n = $_.InstanceName; v = [double]$_.CookedValue } })
   }
-  [pscustomobject]@{ src = $ns; t = $t; tz = $tz; tzh = $tzh; perf = $perf; base = $base } | ConvertTo-Json -Compress -Depth 4
+  [pscustomobject]@{ src = $ns; t = $t; x = $x; tz = $tz; tzh = $tzh; perf = $perf; base = $base } | ConvertTo-Json -Compress -Depth 4
   Start-Sleep -Milliseconds 500
 }
 "#;
@@ -421,6 +665,7 @@ impl WinStream {
         use std::process::Stdio;
         let mut child = hidden_command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WIN_STREAM_SCRIPT])
+            .env("LTS_LHM_DIR", crate::lhm::dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_default())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
@@ -449,6 +694,31 @@ impl WinStream {
     fn spawn(_shared: &Arc<Mutex<WinShared>>) -> Option<std::process::Child> {
         None
     }
+
+    /// Pin the helper process to `core` (None = every core)
+    #[cfg(target_os = "windows")]
+    fn set_affinity(&self, core: Option<usize>) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask, SetProcessAffinityMask};
+        let Some(child) = self.child.as_ref() else { return };
+        unsafe {
+            let mask = match core {
+                Some(c) if c < 64 => 1usize << c,
+                _ => {
+                    let (mut p, mut s) = (0usize, 0usize);
+                    if GetProcessAffinityMask(GetCurrentProcess(), &mut p, &mut s).is_err() || p == 0 {
+                        return;
+                    }
+                    p
+                }
+            };
+            let _ = SetProcessAffinityMask(HANDLE(child.as_raw_handle()), mask);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn set_affinity(&self, _core: Option<usize>) {}
 
     /// The latest reading if it is recent enough to still be true
     fn fresh(&self) -> Option<WinSensors> {
@@ -588,6 +858,7 @@ pub struct Sampler {
     start: Instant,
     samples: Arc<Mutex<Vec<Snapshot>>>,
     notes: Arc<Mutex<Vec<String>>>,
+    phases: Arc<Mutex<Vec<Phase>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -603,12 +874,16 @@ impl Sampler {
             start: Instant::now(),
             samples: Arc::new(Mutex::new(Vec::new())),
             notes: Arc::new(Mutex::new(Vec::new())),
+            phases: Arc::new(Mutex::new(Vec::new())),
             stop: Arc::new(AtomicBool::new(false)),
         });
         let (samples, notes, stop, start) = (s.samples.clone(), s.notes.clone(), s.stop.clone(), s.start);
         std::thread::spawn(move || {
             let mut collector = Collector::new();
             while !stop.load(Ordering::Relaxed) {
+                // stay on the app's reserved core, away from the core being measured
+                crate::app_core::apply_helper();
+                collector.follow_app_core();
                 let began = Instant::now();
                 let mut snap = collector.collect();
                 snap.t_ms = start.elapsed().as_millis() as u64;
@@ -654,6 +929,20 @@ impl Sampler {
         nearest.map(|s| summarize(std::slice::from_ref(s))).unwrap_or_default()
     }
 
+    /// Record that a test of `kind` ("memory", "cpu", "gpu", "input") ran in `[from_ms, to_ms]` and
+    /// return the summary of the samples taken meanwhile
+    pub fn record(&self, kind: &str, label: String, from_ms: u64, to_ms: u64) -> Telemetry {
+        if let Ok(mut p) = self.phases.lock() {
+            p.push(Phase { kind: kind.to_string(), label, start_ms: from_ms, end_ms: to_ms });
+        }
+        self.window(from_ms, to_ms)
+    }
+
+    /// Every test recorded so far, in order
+    pub fn phases(&self) -> Vec<Phase> {
+        self.phases.lock().unwrap().clone()
+    }
+
     pub fn timeline(&self) -> Vec<Snapshot> {
         self.samples.lock().unwrap().clone()
     }
@@ -675,6 +964,9 @@ struct Collector {
     began: Instant,
     notes: Vec<String>,
     warmup: u32,
+    helper_core: Option<usize>,
+    rapl: Rapl,
+    powercap_root: std::path::PathBuf,
 }
 
 impl Collector {
@@ -692,7 +984,22 @@ impl Collector {
             began: Instant::now(),
             notes: Vec::new(),
             warmup: 0,
+            helper_core: None,
+            rapl: Rapl::default(),
+            powercap_root: "/sys/class/powercap".into(),
         }
+    }
+
+    /// Keep the Windows sensor helper process on the app's core as well
+    fn follow_app_core(&mut self) {
+        // re-applied every sample: cheap, and covers a helper that was restarted meanwhile
+        let want = crate::app_core::current();
+        if want.is_some() || self.helper_core.is_some() {
+            if let Some(win) = &self.win {
+                win.set_affinity(want);
+            }
+        }
+        self.helper_core = want;
     }
 
     fn collect(&mut self) -> Snapshot {
@@ -788,6 +1095,27 @@ impl Collector {
             });
         }
 
+        // Everything else the machine exposes
+        snap.sensors = read_hwmon_all(&self.hwmon_root);
+        snap.sensors.extend(self.rapl.read(&self.powercap_root));
+        if let Some(w) = self.win.as_ref().and_then(|w| w.fresh()) {
+            snap.sensors.extend(w.extra);
+        }
+        snap.sensors.truncate(MAX_EXTRA_SENSORS);
+        if !snap.sensors.is_empty() {
+            let count = |k: SensorKind| snap.sensors.iter().filter(|r| r.kind == k).count();
+            notes.push(format!(
+                "Other sensors: {} temperatures, {} fans, {} power, {} voltages, {} currents",
+                count(SensorKind::Temp),
+                count(SensorKind::Fan),
+                count(SensorKind::Power),
+                count(SensorKind::Voltage),
+                count(SensorKind::Current)
+            ));
+        } else if cfg!(target_os = "windows") {
+            notes.push("Board, memory, VRM, fan and power sensors: run LibreHardwareMonitor to have them logged".into());
+        }
+
         // GPU
         if self.nvidia_ok != Some(false) {
             match query_nvidia_smi() {
@@ -844,6 +1172,90 @@ mod tests {
         assert_eq!(v.len(), MAX_SAMPLES / 2 + 1);
         assert!(v[0] <= 1, "the start of the run is still covered");
         assert!(v.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn hwmon_all_reads_board_memory_fans_power_and_voltages() {
+        let root = tempfile::tempdir().unwrap();
+        let board = root.path().join("hwmon2");
+        write(&board, "name", "nct6798");
+        write(&board, "temp1_label", "VRM MOS");
+        write(&board, "temp1_input", "61500");
+        write(&board, "fan2_input", "1180");
+        write(&board, "in0_label", "Vcore");
+        write(&board, "in0_input", "1236");
+        write(&board, "temp9_input", "0"); // unconnected input: dropped
+        let dimm = root.path().join("hwmon5");
+        write(&dimm, "name", "spd5118");
+        write(&dimm, "temp1_input", "44250");
+        let psu = root.path().join("hwmon7");
+        write(&psu, "name", "corsairpsu");
+        write(&psu, "power1_label", "power total");
+        write(&psu, "power1_input", "412000000");
+        write(&psu, "curr1_input", "33500");
+        let cpu = root.path().join("hwmon0");
+        write(&cpu, "name", "coretemp");
+        write(&cpu, "temp1_input", "70000"); // CPU temps are reported elsewhere
+        let r = read_hwmon_all(root.path());
+        let get = |n: &str| r.iter().find(|x| x.name == n).map(|x| (x.kind, x.value));
+        assert_eq!(get("nct6798: VRM MOS"), Some((SensorKind::Temp, 61.5)));
+        assert_eq!(get("nct6798: fan2"), Some((SensorKind::Fan, 1180.0)));
+        assert!((get("nct6798: Vcore").unwrap().1 - 1.236).abs() < 1e-4);
+        assert_eq!(get("spd5118: temp1"), Some((SensorKind::Temp, 44.25)));
+        assert_eq!(get("corsairpsu: power total"), Some((SensorKind::Power, 412.0)));
+        assert_eq!(get("corsairpsu: curr1"), Some((SensorKind::Current, 33.5)));
+        assert!(get("nct6798: temp9").is_none() && !r.iter().any(|x| x.name.starts_with("coretemp")));
+        assert!(read_hwmon_all(Path::new("/definitely/not/here")).is_empty());
+    }
+
+    #[test]
+    fn rapl_turns_energy_counters_into_watts_and_survives_a_wrap() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("intel-rapl:0");
+        write(&pkg, "name", "package-0");
+        write(&pkg, "max_energy_range_uj", "1000000000");
+        write(&pkg, "energy_uj", "999000000");
+        let mut rapl = Rapl::default();
+        assert!(rapl.read(root.path()).is_empty(), "the first sample only sets the baseline");
+        // pretend the first sample was 0.5 s ago, then the counter wrapped past the range
+        for v in rapl.last.values_mut() {
+            v.0 -= Duration::from_millis(500);
+        }
+        write(&pkg, "energy_uj", "39000000"); // +1 J to the wrap, +39 J after it = 40 J
+        let r = rapl.read(root.path());
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].name, "RAPL: package-0");
+        assert!((r[0].value - 80.0).abs() < 2.0, "40 J in 0.5 s = 80 W, got {}", r[0].value);
+    }
+
+    #[test]
+    fn windows_lhm_extra_sensors_and_package_power() {
+        let line = r#"{"src":"root/LibreHardwareMonitor","t":[{"n":"CPU Package","v":55.0}],"x":[
+            {"n":"Nuvoton NCT6798D: VRM MOS","k":"Temperature","v":58.0},
+            {"n":"DIMM #1: Temperature","k":"Temperature","v":41.5},
+            {"n":"Nuvoton NCT6798D: CPU Fan","k":"Fan","v":1320.0},
+            {"n":"Intel Core Ultra 7 270K Plus: CPU Package","k":"Power","v":125.5},
+            {"n":"Corsair HX1000i: Total","k":"Power","v":402.0},
+            {"n":"Nuvoton NCT6798D: Vcore","k":"Voltage","v":1.25},
+            {"n":"Something: Load","k":"Load","v":50.0},
+            {"n":"Nuvoton NCT6798D: Temperature #6","k":"Temperature","v":-128.0}],"tz":[]}"#;
+        let w = parse_win_sensor_line(line).unwrap();
+        assert_eq!(w.extra.len(), 6, "loads and impossible readings are dropped: {:?}", w.extra);
+        let snap = Snapshot { sensors: w.extra, ..Default::default() };
+        assert_eq!(snap.cpu_package_power_w(), Some(125.5));
+        assert_eq!(summarize(&[snap]).cpu_power_avg_w, Some(125.5));
+    }
+
+    #[test]
+    fn tests_are_recorded_as_phases() {
+        let s = Sampler::start(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(80));
+        let t = s.record("cpu", "CPU · IntegerAdd".into(), 0, s.now_ms());
+        assert!(t.samples >= 1);
+        let p = s.phases();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].kind.as_str(), p[0].label.as_str(), p[0].start_ms), ("cpu", "CPU · IntegerAdd", 0));
+        assert!(p[0].end_ms >= 80);
     }
 
     #[test]
@@ -1044,6 +1456,7 @@ mod tests {
             ram_used_mb: 1000.0 + t as f32,
             ram_total_mb: 64000.0,
             gpu: gpu_t.map(|t| GpuSensors { name: "g".into(), temp_c: Some(t), vram_used_mb: vram, vram_total_mb: Some(16000.0), ..Default::default() }),
+            sensors: Vec::new(),
         }
     }
 
@@ -1057,6 +1470,10 @@ mod tests {
         assert_eq!(t.cpu_temp_avg_c, Some(55.0));
         assert_eq!(t.cpu_temp_max_c, Some(60.0));
         assert_eq!(t.core_temp_max_c, vec![(0, 58.0), (1, 55.0)]);
+        // (48 + 55 + 58 + 52) / 4
+        assert_eq!(t.core_temp_avg_c, Some(53.25));
+        assert_eq!(t.hottest_core(), Some((0, 58.0)));
+        assert_eq!(t.coolest_core(), Some((1, 55.0)));
         assert_eq!(t.cpu_freq_avg_mhz, Some(4500.0));
         assert_eq!(t.core_freq_avg_mhz, vec![4000.0, 5000.0]);
         assert_eq!(t.gpu_temp_max_c, Some(45.0));

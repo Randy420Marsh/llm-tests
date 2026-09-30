@@ -52,6 +52,7 @@ impl MemUi {
         cfg.core_ids = core_ids;
         cfg.core_label = core_label;
         cfg.per_core = self.cores.sweep;
+        cfg.core_by_core = self.cores.core_by_core;
         cfg.sizes = self.sizes.iter().filter(|(_, on)| *on).map(|(s, _)| *s).collect();
         cfg.patterns = self.patterns.iter().filter(|(_, on)| *on).map(|(p, _)| *p).collect();
         let max = self.cores.max_threads();
@@ -343,11 +344,15 @@ impl LatencyTesterApp {
         if p.total_tests == 0 {
             return;
         }
-        let running = self.is_running();
+        let running = self.is_running() && p.finished.is_none() && p.done_tests < p.total_tests;
         ui.add_space(6.0);
         ui.group(|ui| {
             let frac = p.done_tests as f32 / p.total_tests as f32;
-            let elapsed = p.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let elapsed = match (p.started, p.finished) {
+                (Some(s), Some(f)) => f.saturating_duration_since(s).as_secs_f64(),
+                (Some(s), None) => s.elapsed().as_secs_f64(),
+                _ => 0.0,
+            };
             let eta = if p.done_tests > 0 && running {
                 format!(" · ETA ~{}", fmt_duration(elapsed / p.done_tests as f64 * (p.total_tests - p.done_tests) as f64))
             } else {

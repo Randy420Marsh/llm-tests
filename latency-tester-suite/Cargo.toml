@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 # GUI and windowing (eframe pulls in winit + glow)
-eframe = { version = "0.29", default-features = true }
+eframe = { version = "0.29", default-features = true, features = ["wgpu"] }
 egui = "0.29"
 egui_extras = { version = "0.29", features = ["default"] }
 egui_plot = "0.29"

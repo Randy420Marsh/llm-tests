@@ -26,6 +26,11 @@ mod server;
 mod sensors;
 mod progress;
 mod run_all;
+mod app_core;
+mod timer_info;
+mod pattern_window;
+mod render_setup;
+mod lhm;
 
 use anyhow::Result;
 use eframe::egui;
@@ -57,6 +62,10 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--cli") {
         return cli::run(&args);
     }
+    // Precise VSync-locked display pattern in its own window (started from the Input tab)
+    if args.iter().any(|a| a == "--pattern") {
+        return pattern_window::run(&args);
+    }
 
     // Run the GUI application
     // VSync off by default: input timestamps are taken once per frame, so a fast unsynchronised frame
@@ -70,14 +79,12 @@ fn main() -> Result<()> {
     if let Ok(icon) = window_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
-    let options = eframe::NativeOptions { vsync, viewport, ..Default::default() };
-
-    eframe::run_native(
-        "Latency Tester Suite",
-        options,
-        Box::new(|cc| Ok(Box::new(LatencyTesterApp::new(cc)))),
-    )
-    .map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;
+    // Vulkan (wgpu, low-latency presentation) when available, OpenGL otherwise; --renderer overrides
+    render_setup::run_with_fallback("Latency Tester Suite", render_setup::parse(&args), vsync, viewport, |cc| {
+        let mut app = LatencyTesterApp::new(cc);
+        app.set_renderer(render_setup::describe(cc, vsync));
+        Box::new(app)
+    })?;
 
     Ok(())
 }

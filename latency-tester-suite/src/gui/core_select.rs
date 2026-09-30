@@ -25,12 +25,14 @@ pub(super) struct CoreSelector {
     pub kinds: Option<Vec<CoreKind>>,
     /// Run each resolved core on its own instead of all together
     pub sweep: bool,
+    /// With `sweep`: every test on one core before the next core (false = rotate the cores between tests)
+    pub core_by_core: bool,
     id: &'static str,
 }
 
 impl CoreSelector {
     pub fn new(kinds: Option<Vec<CoreKind>>, id: &'static str) -> Self {
-        Self { mode: CoreMode::All, specific: vec![false; num_cpus::get()], kinds, sweep: false, id }
+        Self { mode: CoreMode::All, specific: vec![false; num_cpus::get()], kinds, sweep: false, core_by_core: false, id }
     }
 
     pub fn logical(&self) -> usize {
@@ -148,6 +150,16 @@ impl CoreSelector {
         }
         ui.checkbox(&mut self.sweep, "Test each core on its own (finds slow, hot or faulty cores)")
             .on_hover_text("Runs the test once per core, pinned to just that core. With \"All\" it sweeps every core.");
+        if self.sweep {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Order:");
+                ui.radio_value(&mut self.core_by_core, false, "rotate cores between tests")
+                    .on_hover_text("Test 1 on core 0, 1, 2 …, then test 2 on every core: the heat is spread evenly");
+                ui.radio_value(&mut self.core_by_core, true, "all tests on one core, then the next")
+                    .on_hover_text("Core 0 runs every selected test, then core 1, …: each core is measured in one go");
+            });
+            ui.label(RichText::new("The app's own threads are moved off the tested core (and its hyper-threading sibling) before each test.").weak().small());
+        }
         let (_, label) = self.resolve();
         let extra = if self.sweep { String::new() } else { format!(" — up to {} thread(s)", self.max_threads()) };
         ui.label(RichText::new(format!("{}{}", label, extra)).weak());
