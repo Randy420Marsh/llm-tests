@@ -240,8 +240,8 @@ pub fn run(args: &[String]) -> Result<()> {
         .run()?;
         for r in &summary.results {
             println!(
-                "  {:<10} avg {:.4} ms  p99 {:.4} ms  jitter {:.4} ms",
-                format!("{:?}", r.mode), r.avg_latency_ms, r.percentile_99_ms, r.jitter_ms
+                "  {:<26} avg {:.4} ms  p99 {:.4} ms  jitter {:.4} ms",
+                r.mode.label(), r.avg_latency_ms, r.percentile_99_ms, r.jitter_ms
             );
         }
         input_summary = Some(summary);

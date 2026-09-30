@@ -201,7 +201,7 @@ const KINDS = {
   },
   gpu3d: {
     title: '3D graphics (wgpu, rendered off screen)',
-    metrics: [['fps_avg','Average FPS','FPS'],['fps_1pct','1 % low','FPS'],['fps_01pct','0.1 % low','FPS'],['ft_avg','Frame time avg','time'],['ft_p99','Frame time p99','time'],['ft_max','Worst frame','time'],['lat_avg','Latency (submit → done)','time'],['lat_p99','Latency p99','time'],['gpu_ms','GPU time per frame','time']].concat(TELEMETRY),
+    metrics: [['fps_avg','Average FPS','FPS'],['fps_1pct','1 % low','FPS'],['fps_01pct','0.1 % low','FPS'],['ft_avg','Frame time avg','time'],['ft_p99','Frame time p99','time'],['ft_max','Worst frame','time'],['lat_avg','Latency (submit to done)','time'],['lat_p99','Latency p99','time'],['gpu_ms','GPU time per frame','time']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map(r => ({
       series: `${String(r.detail || '').split(' (')[0]} · MSAA ${r.msaa}×`, x: r.height, xLabel: r.name,
       values: Object.assign({ fps_avg: r.fps_avg, fps_1pct: r.fps_1pct_low, fps_01pct: r.fps_01pct_low, ft_avg: r.frametime_avg_ms * 1e6, ft_p99: r.frametime_p99_ms * 1e6, ft_max: r.frametime_max_ms * 1e6, lat_avg: r.latency_avg_ms * 1e6, lat_p99: r.latency_p99_ms * 1e6 }, r.gpu_time_avg_ms != null ? { gpu_ms: r.gpu_time_avg_ms * 1e6 } : {}, telemetryValues(r.telemetry)),

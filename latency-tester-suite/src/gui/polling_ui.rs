@@ -72,9 +72,9 @@ impl PollingUi {
         if self.first_report.is_none() && c.count() > 0 {
             self.first_report = Some(Instant::now());
         }
-        let done = self.first_report.map_or(false, |t| t.elapsed().as_secs_f32() >= self.duration_s);
+        let done = self.first_report.is_some_and(|t| t.elapsed().as_secs_f32() >= self.duration_s);
         // nobody moved the mouse for 30 s: give up
-        let idle = self.first_report.is_none() && self.started.map_or(false, |t| t.elapsed().as_secs() >= 30);
+        let idle = self.first_report.is_none() && self.started.is_some_and(|t| t.elapsed().as_secs() >= 30);
         if idle {
             self.capture = None;
             self.note = "no mouse movement seen for 30 s, stopped".into();

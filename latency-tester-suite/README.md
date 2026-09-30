@@ -362,6 +362,17 @@ flowchart TD
   browser(("Browser")) --> server
 ```
 
+## Changes in 1.1
+
+- Sensors: LibreHardwareMonitor loads (the .NET Framework build, with PawnIO installed from the Dashboard),
+  P- and E-cores are told apart everywhere, other programs' CPU and GPU use is logged during the tests.
+- Memory and CPU tests measure the memory system and the core rather than the harness (see
+  "What the memory and CPU tests measure"): results are not comparable with 1.0.
+- New tests: 3D graphics benchmark, mouse polling, reflex game, ghosting patterns on a chosen display.
+- Results & Graphs: legend under the chart, grouped line switches, unusual values ringed, a shade per test
+  on the sensor timeline, measuring tools and Reset view (the same in the web report).
+- The input test area stays black while the rig waits.
+
 ## Tests
 
 ```sh

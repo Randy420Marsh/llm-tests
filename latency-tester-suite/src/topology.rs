@@ -59,7 +59,7 @@ pub fn detect_core_kinds() -> Option<Vec<CoreKind>> {
 }
 
 fn is_hybrid(k: &[CoreKind]) -> bool {
-    k.iter().any(|&c| c == CoreKind::Efficiency) && k.iter().any(|&c| c == CoreKind::Performance)
+    k.contains(&CoreKind::Efficiency) && k.contains(&CoreKind::Performance)
 }
 
 /// Kinds from per-core efficiency classes: the highest class is P, every lower one E
@@ -166,7 +166,7 @@ fn cpuid_core_kinds(n: usize) -> Option<Vec<CoreKind>> {
                         }
                     }
                 }
-                if current_cpu().map_or(false, |c| c != cpu) {
+                if current_cpu().is_some_and(|c| c != cpu) {
                     return None;
                 }
                 Some(kind_from_leaf_1a(__cpuid_count(0x1A, 0).eax))

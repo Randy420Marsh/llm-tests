@@ -1,11 +1,11 @@
 // Windows resources for LatencyTester.exe: the file icon and the version info shown in Explorer
-// (Properties > Details). Compiled by build.rs on Windows targets only.
+// (Properties > Details). Compiled by build.rs on Windows targets only; keep the versions in step with Cargo.toml.
 
 1 ICON "assets/icon.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -17,8 +17,8 @@ BEGIN
             VALUE "ProductName", "Latency Tester Suite"
             VALUE "InternalName", "latency-tester"
             VALUE "OriginalFilename", "LatencyTester.exe"
-            VALUE "FileVersion", "1.0.0.0"
-            VALUE "ProductVersion", "1.0.0"
+            VALUE "FileVersion", "1.1.0.0"
+            VALUE "ProductVersion", "1.1.0"
         END
     END
     BLOCK "VarFileInfo"

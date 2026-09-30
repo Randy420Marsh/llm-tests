@@ -79,7 +79,7 @@ fn main() -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 900.0])
         .with_min_inner_size([800.0, 600.0])
-        .with_title("Latency Tester Suite v1.0");
+        .with_title(concat!("Latency Tester Suite v", env!("CARGO_PKG_VERSION")));
     // Window / taskbar icon (the exe's file icon is embedded by build.rs)
     if let Ok(icon) = window_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));

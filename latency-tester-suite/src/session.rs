@@ -85,7 +85,7 @@ pub fn downsample_timeline(tl: &[Snapshot], max_points: usize) -> Vec<Value> {
     if tl.is_empty() || max_points == 0 {
         return Vec::new();
     }
-    let step = ((tl.len() + max_points - 1) / max_points).max(1);
+    let step = tl.len().div_ceil(max_points).max(1);
     tl.iter()
         .step_by(step)
         .map(|s| {
@@ -239,7 +239,7 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
 /// True if `build` would produce anything for this scope
 pub fn has_data(data: &SessionData, scope: Scope) -> bool {
     let (_, r) = build(data, scope);
-    r.as_object().map_or(false, |o| o.keys().any(|k| k != "virtualization"))
+    r.as_object().is_some_and(|o| o.keys().any(|k| k != "virtualization"))
 }
 
 // ---------------------------------------------------------------------------------------------

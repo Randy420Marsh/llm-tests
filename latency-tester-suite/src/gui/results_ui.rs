@@ -115,7 +115,7 @@ const GPU3D_METRICS: [Metric; 9] = [
     ("ft_avg", "Frame time avg", "ms"),
     ("ft_p99", "Frame time p99", "ms"),
     ("ft_max", "Worst frame", "ms"),
-    ("lat_avg", "Latency (submit → done)", "ms"),
+    ("lat_avg", "Latency (submit to done)", "ms"),
     ("lat_p99", "Latency p99", "ms"),
     ("gpu_ms", "GPU time per frame", "ms"),
 ];
@@ -512,7 +512,7 @@ pub(super) fn split_series(s: &str) -> (String, String) {
         let digits = x.chars().take_while(|c| c.is_ascii_digit()).count();
         digits > 0 && x[digits..].starts_with('T') && x[digits + 1..].chars().next().map_or(true, |c| c == ' ')
     };
-    match seg.iter().position(|x| is_threads(x)) {
+    match seg.iter().position(is_threads) {
         Some(k) => (seg.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, x)| *x).collect::<Vec<_>>().join(" · "), seg[k].to_string()),
         None => (s.to_string(), String::new()),
     }
@@ -533,7 +533,7 @@ fn legend_below<'a>(ui: &mut Ui, id: impl std::hash::Hash, items: impl Iterator<
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     ui.label(RichText::new(*name).small());
-                    ui.label(RichText::new("●").color(*color).small());
+                    ui.label(RichText::new("■").color(*color).small());
                 });
             }
         });
@@ -837,7 +837,7 @@ impl LatencyTesterApp {
 
             let anomalies = find_anomalies(d, &rows);
             if anomalies.is_empty() {
-                ui.label(RichText::new("✓ No unusual values: every point fits its neighbours and its runs agree.").weak().small());
+                ui.label(RichText::new("✔ No unusual values: every point fits its neighbours and its runs agree.").weak().small());
             } else {
                 let strong = anomalies.iter().filter(|a| a.strong).count();
                 let title = format!("⚠ {} unusual value{}{}: ringed on the chart", anomalies.len(), if anomalies.len() == 1 { "" } else { "s" }, if strong > 0 { format!(" ({} strong)", strong) } else { String::new() });
@@ -965,7 +965,7 @@ impl LatencyTesterApp {
                         match (0..series.len()).find(|&i| parts[i].0 == **b && parts[i].1 == **c) {
                             Some(i) => {
                                 let mut vis = !self.results_ui.series_hidden(d, &series[i]);
-                                if ui.checkbox(&mut vis, RichText::new("●").color(color_for(i))).on_hover_text(&series[i]).changed() {
+                                if ui.checkbox(&mut vis, RichText::new("■").color(color_for(i))).on_hover_text(&series[i]).changed() {
                                     self.results_ui.toggle_series(d, &series[i], vis);
                                 }
                             }

@@ -224,7 +224,7 @@ impl LatencyTesterApp {
                         let _ = h.join();
                     }
                     self.run_all_finalize(out);
-                } else if self.run_all.worker.as_ref().map_or(false, |h| h.is_finished()) {
+                } else if self.run_all.worker.as_ref().is_some_and(|h| h.is_finished()) {
                     // The worker ended without reporting: keep what finished
                     self.run_all.worker = None;
                     self.run_all_finalize(RunAllOutput {
@@ -360,7 +360,7 @@ impl LatencyTesterApp {
         }
         let mut html = None;
         if let Some(path) = json_path {
-            let entries = crate::report::load_files(&[path.clone()]);
+            let entries = crate::report::load_files(std::slice::from_ref(path));
             if entries.is_empty() {
                 notes.push("Run all: the saved record could not be read back for the HTML report".into());
             } else {

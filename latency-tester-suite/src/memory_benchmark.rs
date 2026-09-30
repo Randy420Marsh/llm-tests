@@ -1332,7 +1332,7 @@ mod tests {
         let s = b.run().unwrap();
         assert!(started.elapsed().as_secs_f64() < 5.0, "budget ignored: {:?}", started.elapsed());
         let n = s.results[0].iterations;
-        assert!(n >= 3 && n < 100_000, "iterations = {}", n);
+        assert!((3..100_000).contains(&n), "iterations = {}", n);
     }
 
     #[test]

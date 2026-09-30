@@ -1,7 +1,9 @@
 [package]
 name = "latency-tester"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
+# eframe 0.29 / wgpu 22 need about this much anyway; clippy then only suggests APIs this version has
+rust-version = "1.80"
 description = "Cross-platform latency testing suite for CPU, memory, GPU, and input latency"
 authors = ["Latency Tester Suite"]
 license = "MIT"

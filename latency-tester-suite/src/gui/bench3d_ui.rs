@@ -36,7 +36,7 @@ impl Bench3dUi {
 
     /// A finished run from elsewhere (Run all)
     pub fn set_result(&mut self, s: Option<Bench3dSummary>) {
-        self.preview_dirty = s.as_ref().map_or(false, |s| s.preview.is_some());
+        self.preview_dirty = s.as_ref().is_some_and(|s| s.preview.is_some());
         self.last = s;
     }
 }
@@ -183,7 +183,7 @@ impl LatencyTesterApp {
         });
         ui.horizontal_wrapped(|ui| {
             for (i, r) in results.iter().enumerate() {
-                ui.label(RichText::new(format!("● {}", r.name)).color(FRAME_COLORS[i % FRAME_COLORS.len()]).small());
+                ui.label(RichText::new(format!("■ {}", r.name)).color(FRAME_COLORS[i % FRAME_COLORS.len()]).small());
             }
         });
         // what was rendered

@@ -209,9 +209,11 @@ impl Telemetry {
     }
 }
 
-/// Average use of every other program over `samples`: (name, avg CPU %, max CPU %, avg GPU %, max GPU %),
-/// busiest first; None when programs were not sampled
-pub fn program_usage(samples: &[Snapshot]) -> Option<Vec<(String, f32, f32, f32, f32)>> {
+/// (name, average CPU %, peak CPU %, average GPU %, peak GPU %) of one program
+pub type ProgramUsage = (String, f32, f32, f32, f32);
+
+/// Average use of every other program over `samples`, busiest first; None when programs were not sampled
+pub fn program_usage(samples: &[Snapshot]) -> Option<Vec<ProgramUsage>> {
     let sampled: Vec<&Snapshot> = samples.iter().filter(|s| s.procs_sampled).collect();
     if sampled.is_empty() {
         return None;
@@ -227,7 +229,7 @@ pub fn program_usage(samples: &[Snapshot]) -> Option<Vec<(String, f32, f32, f32,
         }
     }
     let n = sampled.len() as f32;
-    let mut v: Vec<(String, f32, f32, f32, f32)> = by.into_iter().map(|(k, e)| (k.to_string(), e.0 / n, e.1, e.2 / n, e.3)).collect();
+    let mut v: Vec<ProgramUsage> = by.into_iter().map(|(k, e)| (k.to_string(), e.0 / n, e.1, e.2 / n, e.3)).collect();
     v.sort_by(|a, b| (b.1 + b.3).total_cmp(&(a.1 + a.3)));
     Some(v)
 }
@@ -353,7 +355,7 @@ pub fn read_hwmon(root: &Path) -> HwmonReading {
                 "k10temp" | "zenpower" => match label.as_str() {
                     "Tctl" | "Tdie" | "" => out.package_c = Some(out.package_c.map_or(c, |p: f32| p.max(c))),
                     l if l.starts_with("Tccd") => {
-                        if let Some(n) = l[4..].parse::<usize>().ok() {
+                        if let Ok(n) = l[4..].parse::<usize>() {
                             out.cores.push((n.saturating_sub(1), c));
                         }
                     }
@@ -588,7 +590,7 @@ pub fn parse_win_sensor_line_with(line: &str, map: &crate::topology::CoreMap) ->
     w.cores.sort_by_key(|c| c.0);
     w.cores.dedup_by_key(|c| c.0);
     let names: Vec<String> = as_list(&v["t"]).iter().filter_map(|t| t["n"].as_str().map(str::to_lowercase)).collect();
-    let count = |prefix: &str| names.iter().filter(|n| n.strip_prefix(prefix).map_or(false, |r| r.trim().parse::<usize>().is_ok())).count();
+    let count = |prefix: &str| names.iter().filter(|n| n.strip_prefix(prefix).is_some_and(|r| r.trim().parse::<usize>().is_ok())).count();
     let (pc, ec) = (count("p-core #"), count("e-core #"));
     if pc + ec > 0 {
         w.lhm_pe = Some((pc, ec));
@@ -964,7 +966,7 @@ impl WinStream {
 
     /// Has the helper ever delivered a usable reading?
     fn ever_delivered(&self) -> bool {
-        self.shared.lock().map_or(false, |s| s.reading_at.is_some())
+        self.shared.lock().is_ok_and(|s| s.reading_at.is_some())
     }
 
     /// Seconds since the helper was (re)started
@@ -1074,7 +1076,7 @@ impl FlatlineWatch {
             return;
         };
         self.samples.push_back((t_ms, temp, busiest_core_pct));
-        while self.samples.front().map_or(false, |f| t_ms.saturating_sub(f.0) > Self::WINDOW_MS) {
+        while self.samples.front().is_some_and(|f| t_ms.saturating_sub(f.0) > Self::WINDOW_MS) {
             self.samples.pop_front();
         }
     }
@@ -1341,9 +1343,13 @@ impl Collector {
             }
         }
         if snap.cpu_package_c.is_none() && snap.core_temps_c.is_empty() {
-            let starting = self.win.as_ref().map_or(false, |w| !w.ever_delivered() && w.age_s() < 10.0);
+            let starting = self.win.as_ref().is_some_and(|w| !w.ever_delivered() && w.age_s() < 10.0);
             if !starting && !notes.iter().any(|n| n.contains("stopped updating")) {
-                notes.push("CPU temperature: no sensor available (Windows: run LibreHardwareMonitor for per-core values)".into());
+                notes.push(if cfg!(target_os = "windows") {
+                    "CPU temperature: no sensor available (press Download LibreHardwareMonitor and Install PawnIO on the Dashboard, and run the app as administrator)".into()
+                } else {
+                    "CPU temperature: no sensor available (no coretemp / k10temp / zenpower hwmon driver loaded)".into()
+                });
             }
         }
 
@@ -1354,7 +1360,7 @@ impl Collector {
         if let Some(secs) = self.flat.flat_for_s() {
             notes.push(if cpu_source == ACPI_SOURCE {
                 format!(
-                    "CPU temperature has not changed for {} s while the CPU was busy: this PC's ACPI thermal zone reports a fixed value, not the real CPU temperature. Run LibreHardwareMonitor (or OpenHardwareMonitor) for live readings.",
+                    "CPU temperature has not changed for {} s while the CPU was busy: this PC's ACPI thermal zone reports a fixed value, not the real CPU temperature. For live readings press Download LibreHardwareMonitor and Install PawnIO on the Dashboard and run the app as administrator.",
                     secs
                 )
             } else {

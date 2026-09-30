@@ -244,7 +244,7 @@ impl LatencyTesterApp {
         let now = self.input_test.now_ms();
         let pressed = match kind {
             InputKind::MouseClick => ui.input(|i| {
-                i.pointer.primary_pressed() && i.pointer.interact_pos().map_or(false, |p| rect.contains(p))
+                i.pointer.primary_pressed() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p))
             }),
             InputKind::KeyPress => ui.input(|i| {
                 i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, repeat: false, .. }))
@@ -316,7 +316,7 @@ impl LatencyTesterApp {
                         let cal = &self.input_test.cal;
                         let c = cal.correct(kind, true, s.mean_ms);
                         ui.label(format!(
-                            "Robot run: raw {:.2} ms → minus robot delay ({:.2} ms) = {:.2} ms → minus display delay ({:.2} ms) = {:.2} ms",
+                            "Robot run: raw {:.2} ms, minus robot delay ({:.2} ms) = {:.2} ms, minus display delay ({:.2} ms) = {:.2} ms",
                             c.raw_ms, cal.robot_ms(kind), c.minus_robot_ms, cal.display_ms, c.minus_robot_and_display_ms
                         ));
                         ui.label(RichText::new("Only the subtractions enabled under Rig calibration are applied to the graphs and log.").weak().small());
@@ -405,8 +405,8 @@ impl LatencyTesterApp {
             });
             if let Some(m) = pat.motion.as_mut() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.radio_value(m, Motion::Vertical, "vertical line, left → right");
-                    ui.radio_value(m, Motion::Horizontal, "horizontal line, top → bottom");
+                    ui.radio_value(m, Motion::Vertical, "vertical line, left to right");
+                    ui.radio_value(m, Motion::Horizontal, "horizontal line, top to bottom");
                     ui.radio_value(m, Motion::Both, "both (they cross exactly at the centre)");
                     ui.radio_value(m, Motion::Square, "square");
                 });
@@ -516,7 +516,7 @@ impl LatencyTesterApp {
                 ui.label(format!("black shown for: min {:.2} · avg {:.2} · max {:.2} ms  ({} phases)", mn, av, mx, t.off_shown_ms.len()));
             }
             if let Some((mn, av, mx)) = stats(&t.trigger_to_frame_ms) {
-                ui.label(format!("trigger key → white frame (software part only): min {:.2} · avg {:.2} · max {:.2} ms  ({} triggers)", mn, av, mx, t.triggers));
+                ui.label(format!("trigger key to white frame (software part only): min {:.2} · avg {:.2} · max {:.2} ms  ({} triggers)", mn, av, mx, t.triggers));
             }
             ui.label(RichText::new("The rig (Arduino serial monitor) reports what the photodiode saw: rise/fall time, on-time, period and, in F13 mode, trigger-to-light latency.").weak().small());
         });
@@ -541,7 +541,7 @@ impl LatencyTesterApp {
                     ui.add(egui::DragValue::new(&mut cal.mouse_robot_ms).range(0.0..=100.0).speed(0.01).suffix(" ms"));
                     ui.label("Keyboard robot (solenoid, to actuation):");
                     ui.add(egui::DragValue::new(&mut cal.keyboard_robot_ms).range(0.0..=100.0).speed(0.05).suffix(" ms"));
-                    ui.label("Display (frame → light):");
+                    ui.label("Display (frame to light):");
                     ui.add(egui::DragValue::new(&mut cal.display_ms).range(0.0..=200.0).speed(0.05).suffix(" ms"));
                 });
                 ui.horizontal_wrapped(|ui| {

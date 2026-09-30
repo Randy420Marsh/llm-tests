@@ -575,7 +575,8 @@ impl LatencyTesterApp {
                 ui.end_row();
                 
                 ui.label("Features:");
-                ui.label(sys.cpu.features.join(", "));
+                // a long list: wrap at the window edge instead of running off it
+                ui.add(egui::Label::new(sys.cpu.features.join(", ")).wrap());
                 ui.end_row();
                 
                 ui.label("Memory:");
@@ -1150,14 +1151,14 @@ impl eframe::App for LatencyTesterApp {
         
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("⚡ Latency Tester Suite v1.0");
+                ui.heading(concat!("⚡ Latency Tester Suite v", env!("CARGO_PKG_VERSION")));
                 
                 if self.is_running() {
                     self.stop_button(ui);
                 }
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{}", self.task_status));
+                    ui.label(self.task_status.to_string());
                     if ui.button("🔄 Refresh Info").clicked() {
                         self.refresh_system_info();
                     }
@@ -1186,10 +1187,10 @@ impl eframe::App for LatencyTesterApp {
             ui.heading("Tabs:");
             ui.separator();
             if ui.button("📊 Dashboard").clicked() { self.tab = Tab::Dashboard; }
-            if ui.button("🧠 Memory").clicked() { self.tab = Tab::Memory; }
-            if ui.button("⚙️ CPU").clicked() { self.tab = Tab::Cpu; }
+            if ui.button("💾 Memory").clicked() { self.tab = Tab::Memory; }
+            if ui.button("⚙ CPU").clicked() { self.tab = Tab::Cpu; }
             if ui.button("🎮 GPU (Vulkan)").clicked() { self.tab = Tab::Gpu; }
-            if ui.button("🖱️ Input Latency").clicked() { self.tab = Tab::Input; }
+            if ui.button("🖱 Input Latency").clicked() { self.tab = Tab::Input; }
             if ui.button("🔒 Virtualization").clicked() { self.tab = Tab::Virtualization; }
             if ui.button("📈 Results & Graphs").clicked() { self.tab = Tab::Graphs; }
             if ui.button("📋 Signed Log & Verify").clicked() { self.tab = Tab::Results; }
@@ -1243,11 +1244,49 @@ pub(crate) static COMPLETE_GPU_RESULT: Mutex<Option<Result<crate::gpu_benchmark:
     Mutex::new(None);
 pub(crate) static COMPLETE_INPUT_RESULT: Mutex<Option<Result<crate::input_latency::InputLatencySummary, anyhow::Error>>> = 
     Mutex::new(None);
-static COMPLETE_SYSINFO: Mutex<
-    Option<(
-        Result<SystemInfo, anyhow::Error>,
-        Result<VirtualizationStatus, anyhow::Error>,
-    )>,
-> = Mutex::new(None);
+type SysinfoResult = (Result<SystemInfo, anyhow::Error>, Result<VirtualizationStatus, anyhow::Error>);
+static COMPLETE_SYSINFO: Mutex<Option<SysinfoResult>> = Mutex::new(None);
 static COMPLETE_QUICK_MEMORY: Mutex<Option<Result<QuickMemoryResult, anyhow::Error>>> = Mutex::new(None);
 static COMPLETE_PROBE: Mutex<Option<(Vec<String>, crate::sensors::Snapshot)>> = Mutex::new(None);
+
+#[cfg(test)]
+mod tests {
+    /// Every symbol the UI text uses must exist in egui's bundled fonts, or it shows as an empty box
+    #[test]
+    fn ui_symbols_exist_in_the_bundled_fonts() {
+        let sources = [
+            include_str!("gui.rs"),
+            include_str!("gui/aim_ui.rs"),
+            include_str!("gui/bench3d_ui.rs"),
+            include_str!("gui/core_select.rs"),
+            include_str!("gui/input_ui.rs"),
+            include_str!("gui/measure_ui.rs"),
+            include_str!("gui/memory_ui.rs"),
+            include_str!("gui/polling_ui.rs"),
+            include_str!("gui/results_ui.rs"),
+            include_str!("gui/run_all_ui.rs"),
+            include_str!("gui/suites_ui.rs"),
+        ];
+        let ctx = eframe::egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut missing = std::collections::BTreeSet::new();
+        for src in sources {
+            for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                // only text inside string literals reaches the screen
+                for (i, part) in line.split('"').enumerate() {
+                    if i % 2 == 0 {
+                        continue;
+                    }
+                    for c in part.chars().filter(|c| !c.is_ascii()) {
+                        let font = eframe::egui::FontId::proportional(14.0);
+                        // U+FE0F (emoji presentation) has no glyph of its own and draws as a box too
+                        if c == '\u{FE0F}' || !ctx.fonts(|f| f.has_glyph(&font, c)) {
+                            missing.insert(format!("{:?} U+{:04X} in {:?}", c, c as u32, part));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "no glyph for:\n{}", missing.into_iter().collect::<Vec<_>>().join("\n"));
+    }
+}

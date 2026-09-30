@@ -196,7 +196,7 @@ pub(crate) mod tests {
     fn load_files_reads_single_documents() {
         let dir = tempfile::tempdir().unwrap();
         let (_l, _v) = make_result(dir.path(), serde_json::json!({}));
-        let file = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().map_or(false, |e| e == "json")).unwrap();
+        let file = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
         let items = load_files(&[file, "/nope.json".into()]);
         assert_eq!(items.len(), 1);
     }

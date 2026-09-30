@@ -312,7 +312,7 @@ mod tests {
         let mut all: Vec<usize> = g.iter().flatten().copied().collect();
         all.sort();
         assert_eq!(all, (0..num_cpus::get()).collect::<Vec<_>>());
-        assert_eq!(with_siblings(0, &g).contains(&0), true);
+        assert!(with_siblings(0, &g).contains(&0));
     }
 
     #[test]

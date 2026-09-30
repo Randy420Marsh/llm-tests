@@ -505,7 +505,6 @@ impl CpuBenchmark {
         let start_line = Arc::new(std::sync::Barrier::new(thread_count + 1));
 
         for i in 0..thread_count {
-            let workload = workload;
             let timer = HighResTimer::new();
             let core_id = self.get_core_for_thread(i, thread_count, core_mask, affinity_mode);
             let start_line = start_line.clone();

@@ -380,11 +380,11 @@ impl SystemInfoCollector {
         let lnx = status.linux.as_ref();
         Ok(VirtualizationInfo {
             bios_virtualization_enabled: status.bios.vt_x_enabled || status.bios.svm_enabled,
-            hyper_v_enabled: win.map_or(false, |w| w.hyper_v_enabled),
-            vbs_enabled: win.map_or(false, |w| w.vbs_enabled),
-            hvci_enabled: win.map_or(false, |w| w.hvci_enabled),
-            wsl_enabled: win.map_or(false, |w| w.wsl_enabled),
-            kvm_enabled: lnx.map_or(false, |l| l.kvm_enabled),
+            hyper_v_enabled: win.is_some_and(|w| w.hyper_v_enabled),
+            vbs_enabled: win.is_some_and(|w| w.vbs_enabled),
+            hvci_enabled: win.is_some_and(|w| w.hvci_enabled),
+            wsl_enabled: win.is_some_and(|w| w.wsl_enabled),
+            kvm_enabled: lnx.is_some_and(|l| l.kvm_enabled),
             kvm_guest: vendor.starts_with("KVM"),
             vmware_detected: vendor.starts_with("VMware"),
             virtualbox_detected: vendor.starts_with("VBox"),
@@ -427,8 +427,7 @@ mod tests {
 
     #[test]
     fn test_collector_creation() {
+        // must not panic
         let _collector = SystemInfoCollector::new();
-        // Just verify it creates without panic
-        assert!(true);
     }
 }
