@@ -101,13 +101,12 @@ fn bg_color(bg: Bg) -> Color32 {
 }
 
 /// Pure colours for the sensor bar: black and white must be exactly 0 / 255
-fn bar_color(bar: Bar, bg: Color32) -> Color32 {
+fn bar_color(bar: Bar) -> Color32 {
     match bar {
         Bar::Dim => Color32::from_rgb(25, 25, 25),
         Bar::Black => Color32::BLACK,
         Bar::White => Color32::WHITE,
         Bar::Red => Color32::from_rgb(255, 0, 0),
-        Bar::Hidden => bg,
     }
 }
 
@@ -252,7 +251,7 @@ impl LatencyTesterApp {
         painter.rect_filled(rect, 0.0, bg);
         let bar_w = rect.width() * self.input_test.cfg.bar_fraction;
         let bar_rect = egui::Rect::from_min_max(egui::pos2(rect.right() - bar_w, rect.top()), rect.right_bottom());
-        painter.rect_filled(bar_rect, 0.0, bar_color(visual.bar, bg));
+        painter.rect_filled(bar_rect, 0.0, bar_color(visual.bar));
         let text_center = egui::pos2(rect.left() + (rect.width() - bar_w) / 2.0, rect.center().y);
         painter.text(text_center, egui::Align2::CENTER_CENTER, &visual.label, egui::FontId::proportional(30.0), Color32::WHITE);
     }

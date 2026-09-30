@@ -140,15 +140,39 @@ const KINDS = {
   },
   cpu: {
     title: 'CPU',
-    metrics: [['mcalls','Throughput','M calls/s'],['ns_per_call','Time per call','time'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
-    rows(sec) { return (sec.results || []).map((r, i) => {
-      const mask = Number(r.core_mask);
-      const single = Number.isFinite(mask) && mask > 0 && mask < 2**53 && Math.log2(mask) % 1 === 0 ? Math.log2(mask) : null;
-      const v = Object.assign({ mcalls: r.operations_per_second/1e6, ns_per_call: r.latency_ns, threads: r.thread_count }, telemetryValues(r.telemetry));
-      if (r.frequency_mhz > 0) v.clock = r.frequency_mhz;
-      if (single !== null && r.telemetry && r.telemetry.core_temp_max_c) { const t = r.telemetry.core_temp_max_c.find(c => c[0] === single); if (t) v.this_core_temp = t[1]; }
-      return { series: String(r.workload), x: single !== null ? single : i, xLabel: r.cores || (single !== null ? `Core ${single}` : `#${i+1}`), values: v };
-    }); },
+    metrics: [['mcalls','Throughput','M calls/s'],['mcalls_thread','Throughput per thread','M calls/s'],['ns_per_call','Time per call','time'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
+    // per-core runs next to all-core runs: the all-core total (24 threads) would dwarf every core, so
+    // the chart starts on the per-thread value; the total stays in the table and the value chips
+    defaultChart: rows => rows.some(r => r.core !== undefined) && rows.some(r => r.core === undefined) ? 'mcalls_thread' : 'mcalls',
+    rows(sec) {
+      const res = sec.results || [];
+      const topo = sec.core_topology || {};
+      const pSet = new Set(topo.performance_cores || []), eSet = new Set(topo.efficiency_cores || []);
+      const cls = c => pSet.size && eSet.size ? (pSet.has(c) ? 'P' : eSet.has(c) ? 'E' : '') : '';
+      const singleOf = r => { const mask = Number(r.core_mask); return Number.isFinite(mask) && mask > 0 && mask < 2**53 && Math.log2(mask) % 1 === 0 ? Math.log2(mask) : null; };
+      const anySingle = res.some(r => singleOf(r) !== null);
+      const multiKeys = [...new Set(res.filter(r => singleOf(r) === null).map(r => `${r.thread_count}|${r.cores || ''}`))];
+      return res.map(r => {
+        const single = singleOf(r);
+        const threads = Math.max(1, r.thread_count || 1);
+        const v = Object.assign({ mcalls: r.operations_per_second/1e6, mcalls_thread: r.operations_per_second/1e6/threads, ns_per_call: r.latency_ns, threads: r.thread_count }, telemetryValues(r.telemetry));
+        if (r.frequency_mhz > 0) v.clock = r.frequency_mhz;
+        const runs = (r.iteration_results || []).filter(it => it.duration_ns > 0).map(it => it.operations / it.duration_ns * 1e3);
+        if (single !== null) {
+          if (r.telemetry && r.telemetry.core_temp_max_c) { const t = r.telemetry.core_temp_max_c.find(c => c[0] === single); if (t) v.this_core_temp = t[1]; }
+          const c = cls(single);
+          return { series: String(r.workload), x: single, core: single, coreClass: c, xLabel: `Core ${single}` + (c ? ` · ${c}` : ''), values: v, runs };
+        }
+        const allCores = !r.cores || String(r.cores).startsWith('All cores');
+        if (!anySingle) {
+          // thread-count sweep: threads on the x axis
+          return { series: String(r.workload) + (allCores ? '' : ` · ${r.cores}`), x: threads, xLabel: `${threads} thread${threads === 1 ? '' : 's'}`, values: v, runs };
+        }
+        // next to per-core runs: own line, own slot left of core 0 (never drawn at a core's position)
+        const where = allCores ? 'all cores' : r.cores;
+        return { series: `${r.workload} · ${threads}T ${where}`, x: -2 - multiKeys.indexOf(`${r.thread_count}|${r.cores || ''}`), xLabel: `${threads}T ${where}`, values: v, runs };
+      });
+    },
   },
   gpu: {
     title: 'GPU (Vulkan compute)', logX: true, xLabel: 'elements per dispatch', xFmt: v => humanCount(2 ** v),
@@ -514,6 +538,8 @@ class Chart {
         const x0 = Math.max(L, sx(b.x0)), x1 = Math.min(L + pw, sx(b.x1));
         if (x1 <= L || x0 >= L + pw) continue;
         bg += `<rect x="${x0.toFixed(1)}" y="${T}" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${ph}" fill="${b.color}" fill-opacity="${state.phaseOpacity}"/>`;
+        // where one test ends and the next begins, when there is room to see it
+        if (x1 - x0 > 3) bg += `<line x1="${x0.toFixed(1)}" x2="${x0.toFixed(1)}" y1="${T}" y2="${T + ph}" stroke="${b.color}" stroke-opacity="${Math.min(1, state.phaseOpacity * 2.5)}"/>`;
         this.bandHits.push({ x0, x1, b });
       }
       g = bg + g;
@@ -663,7 +689,10 @@ function kindSection(kindKey, entries) {
   const hid = (k) => state.hiddenSeries.has(kindKey + ':' + k), hidc = (k) => state.hiddenCols.has(kindKey + ':' + k);
   const shownMetrics = metrics.filter(m => !hidc(m[0]));
   let chosen = (state.chartMetrics[kindKey] || []).filter(k => shownMetrics.some(m => m[0] === k));
-  if (!chosen.length && shownMetrics.length) chosen = [shownMetrics[0][0]];
+  if (!chosen.length && shownMetrics.length) {
+    const d = kind.defaultChart && kind.defaultChart(rows);
+    chosen = [d && shownMetrics.some(m => m[0] === d) ? d : shownMetrics[0][0]];
+  }
   const chosenMetrics = shownMetrics.filter(m => chosen.includes(m[0]));   // catalogue order keeps dashes stable
   const id = 'sec_' + kindKey, o = optsOf(kindKey);
   const visRows = rows.filter(r => !hid(r.series));
@@ -731,13 +760,16 @@ function kindSection(kindKey, entries) {
 }
 
 function slowCoreNotes(rows) {
+  // per workload, each core against the median of its own kind (P with P, E with E): on a hybrid CPU
+  // the E cores are slower by design, and some workloads even favour them
   const by = {};
-  rows.forEach(r => { if (/^Core \d+$/.test(r.xLabel || '')) (by[r.series] ??= []).push([r.x, r.values.mcalls]); });
+  rows.forEach(r => { if (r.core !== undefined) (by[r.series + '|' + (r.coreClass || '')] ??= []).push([r.core, r.values.mcalls, r.coreClass]); });
   let out = '';
-  for (const [w, arr] of Object.entries(by)) {
+  for (const [key, arr] of Object.entries(by)) {
     if (arr.length < 3) continue;
+    const w = key.slice(0, key.lastIndexOf('|'));
     const s = arr.map(a => a[1]).sort((a, b) => a - b), med = s[Math.floor(s.length / 2)];
-    arr.sort((a, b) => a[0] - b[0]).forEach(([core, v]) => { if (med > 0 && v < med * 0.92) out += `<div class="warn">⚠ ${esc(w)}: core ${core} is ${((1 - v / med) * 100).toFixed(0)}% slower than the median core</div>`; });
+    arr.sort((a, b) => a[0] - b[0]).forEach(([core, v, c]) => { if (med > 0 && v < med * 0.92) out += `<div class="warn">⚠ ${esc(w)}: core ${core} is ${((1 - v / med) * 100).toFixed(0)}% slower than the median ${c ? c + '-core' : 'core'}</div>`; });
   }
   return out;
 }
@@ -757,6 +789,24 @@ const SENSOR_PRESETS = {
 const PHASE_COLORS = { memory: '#e5484d', cpu: '#3e8bff', gpu: '#30c070', input: '#f0b429' };
 const PHASE_NAMES = { memory: 'Memory', cpu: 'CPU', gpu: 'GPU', input: 'Input' };
 const phaseColor = k => PHASE_COLORS[k] || '#9aa3b2';
+// which test of its category a phase is ("CPU · IntegerAdd · 1 thread(s) · Core 3" -> "IntegerAdd")
+const phaseKey = p => { const s = String(p.label || '').split(' · '); return s[p.kind === 'memory' ? 2 : 1] ?? s[s.length - 1] ?? ''; };
+// shade i of n of a category colour: hue steps across ±30°, every other shade darker
+function phaseShade(kind, i, n) {
+  const hex = phaseColor(kind);
+  if (n <= 1) return hex;
+  const r = parseInt(hex.slice(1, 3), 16) / 255, g = parseInt(hex.slice(3, 5), 16) / 255, b = parseInt(hex.slice(5, 7), 16) / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+  let h = 0; const sat = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  if (d) h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  h = (h * 60 + ((i / (n - 1)) - 0.5) * 60 + 360) % 360;
+  return `hsl(${h.toFixed(0)} ${(sat * 100).toFixed(0)}% ${((i % 2 ? l * 0.62 : l) * 100).toFixed(0)}%)`;
+}
+function phaseKeys(phases) {
+  const m = {};
+  phases.forEach(p => { const k = phaseKey(p); (m[p.kind] ??= []).includes(k) || m[p.kind].push(k); });
+  return m;
+}
 const sensorValue = (p, key) => key.startsWith('x:') ? (p.sensors || {})[key.slice(2)] : p[key];
 
 function sensorDefs(sec) {
@@ -802,6 +852,9 @@ function sensorsSection(entries) {
       `<label class="chk"><input type="checkbox" data-pkind="${esc(k)}" ${state.phaseHidden.has(k) ? '' : 'checked'}><span class="sw" style="background:${phaseColor(k)}"></span>${esc(PHASE_NAMES[k] || k)} (${phases.filter(p => p.kind === k).length})</label>`).join('') +
       `<label class="chk">opacity <input type="range" min="0" max="60" value="${Math.round(state.phaseOpacity * 100)}" data-popacity style="width:120px"> <span data-popv>${Math.round(state.phaseOpacity * 100)} %</span></label>` +
       '<span style="color:var(--dim);font-size:12px">hover a band to see which test ran</span></div>';
+    const keys = phaseKeys(phases);
+    html += '<details><summary>Test colours (one shade per test)</summary>' + kindsSeen.map(k => `<div class="row"><b>${esc(PHASE_NAMES[k] || k)}:</b>` +
+      keys[k].map((t, i) => `<span class="chk"><span class="sw" style="background:${phaseShade(k, i, keys[k].length)}"></span>${esc(t)}</span>`).join('') + '</div>').join('') + '</details>';
   }
   if (units.length > 1) html += '<div style="color:var(--dim);font-size:12px">Each unit has its own axis (first on the left, others on the right); lines on different axes use different dash patterns.</div>';
   const axes = units.map(u => ({ unit: u, label: sel.filter(d => d[2] === u).map(d => d[1]).slice(0, 2).join(' · ') + (sel.filter(d => d[2] === u).length > 2 ? ' …' : '') + ` (${u})` }));
@@ -809,7 +862,11 @@ function sensorsSection(entries) {
     const st = seriesStyle(defs.indexOf(d));
     return { series: d[1], metric: d[1], unit: d[2], name: d[1], color: st.color, shape: 'circle', dash: DASHES[units.indexOf(d[2]) % DASHES.length], axis: units.indexOf(d[2]), pts: tl.filter(p => sensorValue(p, d[0]) != null).map(p => [p.t_s, sensorValue(p, d[0])]) };
   });
-  const bands = phases.filter(p => !state.phaseHidden.has(p.kind)).map(p => ({ x0: p.t0_s, x1: Math.max(p.t1_s, p.t0_s + 0.05), color: phaseColor(p.kind), label: p.label }));
+  const pkeys = phaseKeys(phases);
+  const bands = phases.filter(p => !state.phaseHidden.has(p.kind)).map(p => {
+    const ks = pkeys[p.kind] || [], i = Math.max(0, ks.indexOf(phaseKey(p)));
+    return { x0: p.t0_s, x1: Math.max(p.t1_s, p.t0_s + 0.05), color: phaseShade(p.kind, i, ks.length), label: p.label };
+  });
   const cid = 'chart_sensors';
   pendingSpecs.set(cid, { id: cid, lines, axes, bands, legend: sel.length > 1 && sel.length <= 12 ? lines.map(l => ({ label: l.name + ' (' + l.unit + ')', color: l.color, dash: l.dash, axis: l.axis })) : null, ysig: sel.map(d => d[0]).join('|'), xLabel: 'seconds since the test started', logY: false, zeroY: false, markers: false, xFmt: v => fmt(v) + ' s' });
   html += chartTools(cid) + `<div class="chartbox big" data-chart="${cid}"></div>`;

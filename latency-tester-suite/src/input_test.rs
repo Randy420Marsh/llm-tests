@@ -87,8 +87,6 @@ pub enum Bar {
     Black,
     White,
     Red,
-    /// Same colour as the background (bar invisible)
-    Hidden,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -349,10 +347,12 @@ impl Engine {
             Phase::FalseStart => Visual { bg: Bg::Yellow, bar: Bar::Black, label: "Too early! That trial restarts".into() },
             Phase::Ready => Visual { bg: Bg::Green, bar: Bar::White, label: format!("{} NOW!", verb) },
             Phase::Result => {
+                // after the red-black-red end marker the sensor bar stays black (its idle level) until the
+                // next trial; it used to take the blue result background, which a photodiode reads as
+                // a different level in the robot test's wait
                 let bar = match self.finish_step {
                     Some(0) | Some(2) => Bar::Red,
-                    Some(_) => Bar::Black,
-                    None => Bar::Hidden,
+                    _ => Bar::Black,
                 };
                 Visual {
                     bg: Bg::Blue,
@@ -500,7 +500,7 @@ mod tests {
                 }
             }
             let seq: Vec<Bar> = runs.iter().map(|r| r.0).collect();
-            assert_eq!(&seq[..4], &[Bar::Red, Bar::Black, Bar::Red, Bar::Hidden], "frame {} ms: {:?}", frame_ms, seq);
+            assert_eq!(&seq[..4], &[Bar::Red, Bar::Black, Bar::Red, Bar::Black], "frame {} ms: {:?}", frame_ms, seq);
             for i in 0..3 {
                 assert!(runs[i].2 >= 1);
                 let dur = runs[i + 1].1 - runs[i].1;

@@ -232,7 +232,7 @@ impl CpuBenchmark {
 
         let p_end = p_threads.min(logical);
         // Exact per-CPU classification when CPUID can tell us, else the "P threads first" convention
-        let (p_cores, e_cores): (Vec<usize>, Vec<usize>) = match crate::topology::detect_core_kinds() {
+        let (p_cores, e_cores): (Vec<usize>, Vec<usize>) = match crate::topology::cached_core_kinds() {
             Some(kinds) => {
                 let ids = |want| kinds.iter().enumerate().filter(|(_, &k)| k == want).map(|(i, _)| i).collect();
                 (ids(crate::topology::CoreKind::Performance), ids(crate::topology::CoreKind::Efficiency))
@@ -591,17 +591,17 @@ impl CpuBenchmark {
         match workload {
             WorkloadType::IntegerAdd => {
                 for _ in 0..1000 {
-                    x = std::hint::black_box(x).wrapping_add(0x123456789ABCDEF);
+                    x = opaque(x).wrapping_add(0x123456789ABCDEF);
                 }
             }
             WorkloadType::IntegerMul => {
                 for _ in 0..1000 {
-                    x = std::hint::black_box(x).wrapping_mul(0x123456789ABCDEF);
+                    x = opaque(x).wrapping_mul(0x123456789ABCDEF);
                 }
             }
             WorkloadType::IntegerDiv => {
                 for _ in 0..1000 {
-                    x = std::hint::black_box(x).wrapping_div(0x123456789ABCDEF | 1);
+                    x = opaque(x).wrapping_div(0x123456789ABCDEF | 1);
                 }
             }
             WorkloadType::FloatAdd => {
@@ -675,7 +675,7 @@ impl CpuBenchmark {
                 }
                 let mut idx = (x % 1024) as usize;
                 for _ in 0..1000 {
-                    idx = std::hint::black_box(table[idx]) as usize;
+                    idx = opaque(table[idx] as u64) as usize;
                 }
                 x = x.wrapping_add(idx as u64 + 1);
             }
@@ -716,7 +716,7 @@ impl CpuBenchmark {
                         3 => x ^= x.rotate_left(13),
                         4 => x = x.wrapping_div(0x123456789ABCDEF | 1),
                         _ => {
-                            x = std::hint::black_box(x);
+                            x = opaque(x);
                         }
                     }
                 }
@@ -758,6 +758,23 @@ impl CpuBenchmark {
     }
 }
 
+/// Hides a value from the optimiser (so a dependent chain is not folded away) while it stays in a
+/// register. `std::hint::black_box` stores the value to the stack and loads it back, so a chain of
+/// them measures store-to-load forwarding instead of the instruction: IntegerAdd then ran 5x slower
+/// on Arrow Lake P-cores than on its E-cores, which forward stores differently.
+#[inline(always)]
+fn opaque(mut x: u64) -> u64 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        std::arch::asm!("/* {0} */", inout(reg) x, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        x = std::hint::black_box(x);
+    }
+    x
+}
+
 /// Parse a Linux cpulist such as "0-7,16,18-19" into a count of CPUs
 #[cfg(target_os = "linux")]
 fn parse_cpulist_len(list: &str) -> usize {
@@ -782,7 +799,7 @@ fn parse_cpulist_len(list: &str) -> usize {
 pub fn hybrid_thread_counts() -> (usize, usize) {
     let logical = num_cpus::get();
     // CPUID per pinned core works on Windows and Linux
-    if let Some(kinds) = crate::topology::detect_core_kinds() {
+    if let Some(kinds) = crate::topology::cached_core_kinds() {
         let p = kinds.iter().filter(|&&k| k == crate::topology::CoreKind::Performance).count();
         let e = kinds.iter().filter(|&&k| k == crate::topology::CoreKind::Efficiency).count();
         if p > 0 && e > 0 {
@@ -900,6 +917,17 @@ mod tests {
         let bench = CpuBenchmark::new(CpuBenchmarkConfig::default()).unwrap();
         assert!(!bench.is_valid_combination(usize::MAX, AffinityMode::AllCores));
         assert!(!bench.is_valid_combination(2, AffinityMode::SingleCore));
+    }
+
+    #[test]
+    fn integer_chains_compute_the_real_result() {
+        // the barrier must not change the arithmetic: 1000 dependent adds / muls of a constant
+        let x0 = 7u64.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        let add = CpuBenchmark::execute_workload(WorkloadType::IntegerAdd, 7);
+        assert_eq!(add, x0.wrapping_add(0x123456789ABCDEFu64.wrapping_mul(1000)));
+        let mul = CpuBenchmark::execute_workload(WorkloadType::IntegerMul, 7);
+        assert_eq!(mul, (0..1000).fold(x0, |x, _| x.wrapping_mul(0x123456789ABCDEF)));
+        assert_eq!(opaque(42), 42);
     }
 
     #[test]

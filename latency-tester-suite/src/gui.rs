@@ -120,6 +120,9 @@ pub struct LatencyTesterApp {
     lhm_fetch: Arc<std::sync::Mutex<Option<Result<String, String>>>>,
     lhm_fetching: bool,
     lhm_note: String,
+    /// Installed PawnIO driver version (Windows; LibreHardwareMonitor ≥ 0.9.5 needs it)
+    pawnio: Option<String>,
+    pawnio_installing: bool,
 }
 
 /// See `LatencyTesterApp::session_snapshot`
@@ -161,7 +164,7 @@ impl LatencyTesterApp {
             config_dir.to_string_lossy().to_string(),
         ).ok();
 
-        let core_kinds = crate::topology::detect_core_kinds();
+        let core_kinds = crate::topology::cached_core_kinds().map(|k| k.to_vec());
 
         Self {
             tab: Tab::Dashboard,
@@ -225,6 +228,8 @@ impl LatencyTesterApp {
             lhm_fetch: Arc::new(std::sync::Mutex::new(None)),
             lhm_fetching: false,
             lhm_note: String::new(),
+            pawnio: crate::lhm::pawnio_version(),
+            pawnio_installing: false,
         }
     }
 
@@ -690,11 +695,15 @@ impl LatencyTesterApp {
     fn lhm_panel(&mut self, ui: &mut Ui) {
         let fetched = self.lhm_fetch.lock().unwrap().take();
         if let Some(r) = fetched {
+            let pawn = std::mem::take(&mut self.pawnio_installing);
             self.lhm_fetching = false;
             self.lhm_note = match r {
-                Ok(t) => format!("{} · used from the next test on", t.lines().last().unwrap_or("done")),
-                Err(e) => format!("download failed: {}", e.lines().last().unwrap_or("")),
+                Ok(t) => format!("{} · sensor helper restarted", t.lines().last().unwrap_or("done")),
+                Err(e) => format!("{} failed: {}", if pawn { "PawnIO install" } else { "download" }, e.lines().last().unwrap_or("")),
             };
+            self.pawnio = crate::lhm::pawnio_version();
+            // the helper opened LibreHardwareMonitor before the library or the driver existed
+            crate::sensors::restart_windows_helpers();
             let n = self.lhm_note.clone();
             self.log(&format!("LibreHardwareMonitor: {}", n));
         }
@@ -733,6 +742,32 @@ impl LatencyTesterApp {
                     let slot = self.lhm_fetch.clone();
                     thread::spawn(move || {
                         let r = crate::lhm::fetch();
+                        *slot.lock().unwrap() = Some(r);
+                    });
+                }
+            });
+        }
+        if cfg!(target_os = "windows") {
+            ui.horizontal_wrapped(|ui| {
+                match &self.pawnio {
+                    Some(v) => ui.label(format!("PawnIO driver: {}", v)),
+                    None => ui.label(
+                        RichText::new("PawnIO driver: not installed. LibreHardwareMonitor 0.9.5+ needs it for CPU core temperatures, board (VRM, fans, voltages) and memory sensors")
+                            .color(Color32::from_rgb(255, 170, 60)),
+                    ),
+                };
+                if self.pawnio.is_none()
+                    && ui
+                        .add_enabled(!self.lhm_fetching && crate::lhm::dir().is_some(), egui::Button::new("Install PawnIO"))
+                        .on_hover_text("Runs the PawnIO setup that ships inside LibreHardwareMonitor.exe (signed driver by namazso, pawnio.eu), the same way LibreHardwareMonitor does on its first start. Needs administrator rights.")
+                        .clicked()
+                {
+                    self.lhm_fetching = true;
+                    self.pawnio_installing = true;
+                    self.lhm_note = "installing PawnIO…".into();
+                    let slot = self.lhm_fetch.clone();
+                    thread::spawn(move || {
+                        let r = crate::lhm::install_pawnio();
                         *slot.lock().unwrap() = Some(r);
                     });
                 }

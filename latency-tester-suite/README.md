@@ -86,6 +86,27 @@ workloads), and every suite can still be run and saved by hand.
   128 KB StridedRead with a 4 KB stride used to show 255 ns per access in one of three runs; it now measures
   about 1 ns every time).
 
+## What the memory and CPU tests measure
+
+- **Sequential read / write / read-write and STREAM scale / add / triad** work on 64-bit words, compiled twice and
+  picked at run time: AVX2 when the CPU has it, SSE2 otherwise. They used to go byte by byte, which capped every
+  size (even L1) at the same ~10 GB/s, so they showed the loop, not the memory. STREAM add is `a = a + b` and triad
+  `a = a + k·b` over two buffers: the same 2 reads + 1 write per element as STREAM's three-array versions.
+- **Pointer chase** carries on from where the previous pass stopped, so a 1 GB buffer is walked through instead of
+  the same 65 536 lines being revisited (they then sat in L3, and "1 GB" reported cache latency). With several
+  threads each starts at its own point of the cycle. **Dependent read** does the same along its sequential chain.
+- Threads split a buffer on **cache-line boundaries**, so no two threads write the same line (false sharing made
+  4 KB with 24 threads look several times slower). The second STREAM buffer starts half a page after the first,
+  so `src[i]` and `dst[i]` never share a position within a 4 KB page (4K aliasing halved StreamCopy at one size).
+- **CPU integer workloads** keep the value in a register between steps. `std::hint::black_box` stored it to the
+  stack and loaded it back each time, so IntegerAdd measured store-to-load forwarding: on Arrow Lake the P-cores
+  came out 5× slower than the E-cores.
+- Results are compared per core type: the Results tab and the report flag a core only against the median of its
+  own kind (P with P, E with E), and label cores "Core 10 · P" / "Core 2 · E". P and E cores are read from what
+  the OS reports (Windows: each core's efficiency class; Linux: `cpu_core` / `cpu_atom`), CPUID only as a fallback.
+- All-core runs next to per-core runs get their own line and slot left of core 0 in the charts, and the chart starts
+  on *Throughput per thread* so they can be compared with single cores (the total stays in the table).
+
 ## Choosing what to test
 
 Every tab shows live progress (what is running right now, ETA) and fills its results in as tests finish;
@@ -117,17 +138,34 @@ also recorded as a *phase*, so the timeline shows which test was running when.
 
 **LibreHardwareMonitor on Windows.** `build.bat` downloads the official
 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) release (MPL-2.0) into
-`dist\LibreHardwareMonitor\`, and the Dashboard has a *Download LibreHardwareMonitor* button for an exe that was
-copied elsewhere. The app loads the library itself, so the LibreHardwareMonitor program does not have to run.
-Its driver, and with it the CPU, board and memory sensors, only loads for an administrator:
-use *Restart as administrator* on the Dashboard. Without the library the app reads the LibreHardwareMonitor or
-OpenHardwareMonitor app if one is running, and otherwise only the ACPI thermal zone.
+`dist\LibreHardwareMonitor\`, and the Dashboard has a *Download / Update LibreHardwareMonitor* button for an exe
+that was copied elsewhere. The app loads the library itself, so the LibreHardwareMonitor program does not have to
+run. Three things have to be in place, and the Dashboard's sensor notes say which one is missing:
+
+1. **The .NET Framework build.** Releases ship `LibreHardwareMonitor.zip` (.NET Framework) and
+   `LibreHardwareMonitor.NET.10.zip`; Windows PowerShell, which hosts the library, can only load the first. The
+   download picks it, replaces anything that was in the folder and checks that it loads. (Before 1.1 the script
+   could pick the .NET 10 build, and then no sensor appeared: press *Update LibreHardwareMonitor* once.)
+2. **The PawnIO driver.** Since LibreHardwareMonitor 0.9.5 the CPU (core temperatures, clocks, power), board
+   (Super I/O: VRM, fans, voltages) and memory (SPD) sensors are read through [PawnIO](https://pawnio.eu).
+   *Install PawnIO* on the Dashboard runs the PawnIO setup that ships inside `LibreHardwareMonitor.exe`, the same
+   way LibreHardwareMonitor does on its first start (or start `dist\LibreHardwareMonitor\LibreHardwareMonitor.exe`
+   once and accept its prompt). Without it only GPU and drive sensors appear.
+3. **Administrator rights:** use *Restart as administrator* on the Dashboard.
+
+Per-core sensors are placed on the right logical CPU: LibreHardwareMonitor names hybrid cores "P-Core #3" /
+"E-Core #1", which on Arrow Lake are CPU 10 and CPU 2 (P and E cores are interleaved). Its per-core clocks replace
+the performance-counter estimate. Without the library the app reads the LibreHardwareMonitor or
+OpenHardwareMonitor app if one is running (WMI), and otherwise only the ACPI thermal zone, which on many boards is
+a fixed value.
 
 **Report / viewer:** the *Sensors over time* chart can overlay any mix of sensors (presets: temperatures, fans,
 power, voltages, clocks, load, RAM/VRAM; filter box for names like "VRM" or "DIMM"). Each unit gets its own axis.
 Every test is drawn as a background band (memory red, CPU blue, GPU green, input amber) with an opacity slider
-and per-suite switches; hovering a band names the test. A table lists min / average / max of every sensor for the
-whole run. The app's **Results & Graphs** tab shows the same bands and sensor groups. `sensors.csv` holds every
+and per-suite switches; within a suite each test (workload, pattern, mode, size) gets its own shade and a thin line
+marks where one test ends and the next begins (*Test colours* lists them). Hovering names the test and its time. A table lists min / average / max of every sensor for the
+whole run. The app's **Results & Graphs** tab shows the same bands and sensor groups (hover the chart to see which test
+ran); its legend sits under the chart, and *Reset view* returns to the whole chart after zooming. `sensors.csv` holds every
 sample with one column per sensor, and `phases.csv` lists each test's start and end.
 
 ## Keeping the app out of the measurement

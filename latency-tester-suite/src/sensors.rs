@@ -456,13 +456,27 @@ pub struct WinSensors {
     pub zones_c: Vec<f32>,
     /// Every LibreHardwareMonitor temperature, fan, power, voltage and current sensor
     pub extra: Vec<SensorReading>,
+    /// LibreHardwareMonitor's library folder was passed to the helper
+    pub lhm_present: bool,
+    /// Why the library could not be loaded or opened
+    pub lhm_error: Option<String>,
+    /// Installed PawnIO driver version (LibreHardwareMonitor ≥ 0.9.5 reads CPU / board / memory through it)
+    pub pawnio: Option<String>,
+    /// P and E cores LibreHardwareMonitor names in its temperatures ("P-Core #n", "E-Core #n")
+    pub lhm_pe: Option<(usize, usize)>,
 }
 
 const ACPI_SOURCE: &str = "ACPI thermal zone";
 
-/// Parse one JSON line printed by [`WIN_STREAM_SCRIPT`]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Parse one JSON line printed by [`WIN_STREAM_SCRIPT`] (per-core names placed by their number alone)
+#[cfg(test)]
 pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
+    parse_win_sensor_line_with(line, &crate::topology::CoreMap::default())
+}
+
+/// Parse one JSON line; `map` places per-core sensors ("P-Core #2", "E-Core #5") on logical CPUs
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn parse_win_sensor_line_with(line: &str, map: &crate::topology::CoreMap) -> Option<WinSensors> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let as_list = |v: &serde_json::Value| -> Vec<serde_json::Value> {
         match v {
@@ -479,10 +493,8 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
             continue;
         }
         let lower = name.to_lowercase();
-        if let Some(rest) = lower.strip_prefix("cpu core #") {
-            if let Ok(n) = rest.trim().parse::<usize>() {
-                w.cores.push((n.saturating_sub(1), val));
-            }
+        if let Some(cpus) = map.logical_for(name) {
+            w.cores.extend(cpus.into_iter().map(|c| (c, val)));
         } else if lower.contains("cpu package") || lower.contains("tctl") || lower.contains("core (tdie)") || lower == "core average" {
             w.package_c = Some(w.package_c.map_or(val, |p| p.max(val)));
         } else if lower == "gpu core" || lower.starts_with("gpu core") {
@@ -491,6 +503,12 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
     }
     w.cores.sort_by_key(|c| c.0);
     w.cores.dedup_by_key(|c| c.0);
+    let names: Vec<String> = as_list(&v["t"]).iter().filter_map(|t| t["n"].as_str().map(str::to_lowercase)).collect();
+    let count = |prefix: &str| names.iter().filter(|n| n.strip_prefix(prefix).map_or(false, |r| r.trim().parse::<usize>().is_ok())).count();
+    let (pc, ec) = (count("p-core #"), count("e-core #"));
+    if pc + ec > 0 {
+        w.lhm_pe = Some((pc, ec));
+    }
     // Actual clocks: every instance is "group,cpu"; % Processor Performance is relative to the base clock
     let base = v["base"].as_f64().unwrap_or(0.0);
     if base > 0.0 {
@@ -506,6 +524,25 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
         freqs.sort_by_key(|f| f.0);
         w.core_freq_mhz = freqs.into_iter().map(|f| f.1).collect();
     }
+    // LibreHardwareMonitor's own per-core clocks are better than the performance counter
+    let mut lhm_clocks: Vec<(usize, f32)> = Vec::new();
+    for c in as_list(&v["cl"]) {
+        let (Some(name), Some(mhz)) = (c["n"].as_str(), c["v"].as_f64()) else { continue };
+        if let Some(cpus) = map.logical_for(name).filter(|_| mhz > 100.0 && mhz < 10_000.0) {
+            lhm_clocks.extend(cpus.into_iter().map(|cpu| (cpu, mhz as f32)));
+        }
+    }
+    if let Some(n) = lhm_clocks.iter().map(|c| c.0 + 1).max() {
+        let mut f = vec![0.0f32; n.max(w.core_freq_mhz.len())];
+        f[..w.core_freq_mhz.len()].copy_from_slice(&w.core_freq_mhz);
+        for (cpu, mhz) in lhm_clocks {
+            f[cpu] = mhz;
+        }
+        w.core_freq_mhz = f;
+    }
+    w.lhm_present = v["lhm"].as_bool().unwrap_or(false);
+    w.lhm_error = v["lerr"].as_str().map(str::trim).filter(|e| !e.is_empty()).map(String::from);
+    w.pawnio = v["pawn"].as_str().map(str::trim).filter(|e| !e.is_empty()).map(String::from);
     if let Some(src) = v["src"].as_str().filter(|s| !s.is_empty()) {
         w.source = if src == "lib" {
             "LibreHardwareMonitor library"
@@ -545,7 +582,8 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
             w.source = ACPI_SOURCE.to_string();
         }
     }
-    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty() || !w.extra.is_empty()).then_some(w)
+    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty() || !w.extra.is_empty() || w.lhm_error.is_some())
+        .then_some(w)
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -559,35 +597,67 @@ $pf = '\Processor Information(*)\% Processor Performance'
 # so fall back to smaller sets instead of losing the clocks as well
 $sets = @(@($hp, $tzc, $pf), @($tzc, $pf), @($pf))
 # 1) LibreHardwareMonitor's own library next to the exe ($env:LTS_LHM_DIR): no separate app needed.
-#    Without administrator rights it cannot load its driver, so CPU / board / memory sensors stay empty.
-$computer = $null
+#    Since v0.9.5 it reads CPU (MSR), board (Super I/O: VRM, fans, voltages) and memory (SPD) sensors
+#    through the PawnIO driver, which LibreHardwareMonitor.exe installs on its first start. Without
+#    PawnIO, or without administrator rights, only GPU, drive and similar sensors appear.
+$computer = $null; $lerr = ''
+$pawn = ''
+foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO') {
+  if (-not $pawn) { $pawn = [string](Get-ItemProperty $k -ErrorAction SilentlyContinue).DisplayVersion }
+}
 $lhm = $env:LTS_LHM_DIR
 if ($lhm -and (Test-Path (Join-Path $lhm 'LibreHardwareMonitorLib.dll'))) {
   try {
-    Get-ChildItem $lhm -Filter *.dll | ForEach-Object { try { [void][Reflection.Assembly]::LoadFrom($_.FullName) } catch {} }
+    $ErrorActionPreference = 'Stop'
+    if (Get-ChildItem $lhm -Filter '*.runtimeconfig.json') {
+      throw 'this is the .NET 10 build of LibreHardwareMonitor, which Windows PowerShell cannot load: press Update LibreHardwareMonitor on the Dashboard to get the .NET Framework build (LibreHardwareMonitor.zip)'
+    }
+    # files from a browser download carry a "downloaded from the internet" mark that blocks loading
+    Get-ChildItem $lhm -Recurse -File | ForEach-Object { try { Unblock-File $_.FullName } catch {} }
+    # the library's dependencies may want other versions than the ones next to it (the exe has
+    # binding redirects in its .config, PowerShell does not): hand over whatever is there
+    $resolve = [ResolveEventHandler]{
+      param($sender, $e)
+      $name = (New-Object Reflection.AssemblyName($e.Name)).Name
+      foreach ($a in [AppDomain]::CurrentDomain.GetAssemblies()) { if ($a.GetName().Name -eq $name) { return $a } }
+      $p = Join-Path $env:LTS_LHM_DIR ($name + '.dll')
+      if (Test-Path $p) { return [Reflection.Assembly]::UnsafeLoadFrom($p) }
+      return $null
+    }
+    [AppDomain]::CurrentDomain.add_AssemblyResolve($resolve)
+    [void][Reflection.Assembly]::UnsafeLoadFrom((Join-Path $lhm 'LibreHardwareMonitorLib.dll'))
     $computer = New-Object LibreHardwareMonitor.Hardware.Computer
     foreach ($p in 'IsCpuEnabled','IsGpuEnabled','IsMemoryEnabled','IsMotherboardEnabled','IsControllerEnabled','IsPsuEnabled','IsStorageEnabled','IsBatteryEnabled') {
       try { $computer.$p = $true } catch {}
     }
     $computer.Open()
-  } catch { $computer = $null }
+  } catch {
+    $lerr = [string]$_.Exception.GetBaseException().Message
+    if (-not $lerr) { $lerr = [string]$_ }
+    $computer = $null
+  }
+  $ErrorActionPreference = 'SilentlyContinue'
 }
 function Read-Lhm($hw, $out) {
   try { $hw.Update() } catch {}
   foreach ($sub in $hw.SubHardware) { Read-Lhm $sub $out }
   foreach ($s in $hw.Sensors) {
-    if ($s.Value -ne $null) { $out.Add(@{ h = [string]$hw.Name; n = [string]$s.Name; k = [string]$s.SensorType; v = [double]$s.Value }) }
+    if ($s.Value -ne $null) { $out.Add(@{ h = [string]$hw.Name; ht = [string]$hw.HardwareType; n = [string]$s.Name; k = [string]$s.SensorType; v = [double]$s.Value }) }
   }
 }
 while ($true) {
-  $ns = $null; $all = $null; $s = $null; $x = @(); $t = @()
+  $ns = $null; $all = $null; $s = $null; $x = @(); $t = @(); $cl = @(); $cpuT = $false
   if ($computer) {
     $list = New-Object System.Collections.ArrayList
     foreach ($hw in $computer.Hardware) { Read-Lhm $hw $list }
     $ns = 'lib'
-    $t = @($list | Where-Object { $_.k -eq 'Temperature' } | ForEach-Object { @{ n = $_.n; v = $_.v } })
+    $t = @($list | Where-Object { $_.k -eq 'Temperature' -and ($_.ht -eq 'Cpu' -or $_.ht -like 'Gpu*') } | ForEach-Object { @{ n = $_.n; v = $_.v } })
+    # per-core clocks ("P-Core #1", "E-Core #3", "CPU Core #2")
+    $cl = @($list | Where-Object { $_.k -eq 'Clock' -and $_.ht -eq 'Cpu' } | ForEach-Object { @{ n = $_.n; v = $_.v } })
     $x = @($list | Where-Object { 'Temperature','Fan','Power','Voltage','Current' -contains $_.k } | ForEach-Object { @{ n = "$($_.h): $($_.n)"; k = $_.k; v = $_.v } })
-  } else {
+    $cpuT = [bool]($list | Where-Object { $_.k -eq 'Temperature' -and $_.ht -eq 'Cpu' })
+  }
+  if (-not $cpuT) {
   # 2) the LibreHardwareMonitor / OpenHardwareMonitor app, if it runs, through WMI
   foreach ($n in 'root/LibreHardwareMonitor', 'root/OpenHardwareMonitor') {
     $all = Get-CimInstance -Namespace $n -ClassName Sensor
@@ -596,6 +666,7 @@ while ($true) {
   }
   if ($all) {
     $s = $all | Where-Object { $_.SensorType -eq 'Temperature' }
+    $cl = @($all | Where-Object { $_.SensorType -eq 'Clock' -and [string]$_.Parent -like '*cpu*' } | ForEach-Object { @{ n = [string]$_.Name; v = [double]$_.Value } })
     # every sensor with its hardware's name: "Nuvoton NCT6798D: VRM MOS", "DIMM #1: Temperature", "Corsair HX1000i: Total"
     $hw = @{}; Get-CimInstance -Namespace $ns -ClassName Hardware | ForEach-Object { $hw[[string]$_.Identifier] = $_.Name }
     $x = @($all | Where-Object { 'Temperature','Fan','Power','Voltage','Current' -contains $_.SensorType } | ForEach-Object {
@@ -612,10 +683,64 @@ while ($true) {
     $tz = @($samples | Where-Object { $_.Path -like '*thermal zone*' -and $_.Path -like '*\temperature' } | ForEach-Object { [double]$_.CookedValue })
     $perf = @($samples | Where-Object { $_.Path -like '*processor performance*' -and $_.InstanceName -notmatch '_total' } | ForEach-Object { @{ n = $_.InstanceName; v = [double]$_.CookedValue } })
   }
-  [pscustomobject]@{ src = $ns; t = $t; x = $x; tz = $tz; tzh = $tzh; perf = $perf; base = $base } | ConvertTo-Json -Compress -Depth 4
+  [pscustomobject]@{ src = $ns; t = $t; x = $x; cl = $cl; tz = $tz; tzh = $tzh; perf = $perf; base = $base; lhm = [bool]$lhm; lerr = $lerr; pawn = $pawn } | ConvertTo-Json -Compress -Depth 4
   Start-Sleep -Milliseconds 500
 }
 "#;
+
+/// What is missing for LibreHardwareMonitor to deliver CPU / board / memory sensors, and whether it
+/// agrees with the suite about which cores are P and E cores
+fn lhm_notes(w: &WinSensors, admin: bool) -> Vec<String> {
+    let mut n = Vec::new();
+    if let Some((lp, le)) = w.lhm_pe {
+        let (sp, se) = match crate::topology::cached_core_kinds() {
+            Some(k) => (
+                k.iter().filter(|&&c| c == crate::topology::CoreKind::Performance).count(),
+                k.iter().filter(|&&c| c == crate::topology::CoreKind::Efficiency).count(),
+            ),
+            None => (0, 0),
+        };
+        let groups = crate::app_core::sibling_groups();
+        // LibreHardwareMonitor counts physical cores; with Hyper-Threading a P core has two threads
+        let phys = |want| {
+            groups.iter().filter(|g| crate::topology::cached_core_kinds().and_then(|k| k.get(g[0]).copied()) == Some(want)).count()
+        };
+        let (pp, pe) = (phys(crate::topology::CoreKind::Performance), phys(crate::topology::CoreKind::Efficiency));
+        if sp + se == 0 {
+            n.push(format!("LibreHardwareMonitor sees {} P-cores and {} E-cores, but the suite could not tell them apart on this PC", lp, le));
+        } else if (pp, pe) != (lp, le) {
+            n.push(format!("Core types differ: LibreHardwareMonitor sees {} P + {} E cores, the suite {} P + {} E", lp, le, pp, pe));
+        } else {
+            n.push(format!("Core types: {} P-cores and {} E-cores (the suite and LibreHardwareMonitor agree)", pp, pe));
+        }
+    }
+    let cpu_ok = !w.cores.is_empty();
+    if let Some(e) = &w.lhm_error {
+        n.push(format!("LibreHardwareMonitor library could not be loaded: {}", e));
+    } else if !w.lhm_present && !cpu_ok {
+        n.push("Per-core CPU, board, VRM, fan, memory and PSU sensors: press Download LibreHardwareMonitor on the Dashboard (or run the LibreHardwareMonitor app)".into());
+    }
+    if w.lhm_present && w.lhm_error.is_none() && !cpu_ok {
+        if w.pawnio.is_none() {
+            n.push("The PawnIO driver is not installed: LibreHardwareMonitor 0.9.5 and later read CPU, motherboard (VRM, fans, voltages) and memory sensors through it. Press Install PawnIO on the Dashboard, or start LibreHardwareMonitor.exe once and accept its PawnIO prompt.".into());
+        } else if !admin {
+            n.push("LibreHardwareMonitor needs administrator rights for CPU, board and memory sensors: restart the app as administrator".into());
+        } else {
+            n.push(format!(
+                "LibreHardwareMonitor is loaded (PawnIO {}) but reports no CPU temperature for this CPU; a newer LibreHardwareMonitor may add it",
+                w.pawnio.as_deref().unwrap_or("?")
+            ));
+        }
+    }
+    n
+}
+
+/// Physical cores of this PC (detected once: it briefly pins a thread to every logical CPU)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn core_map() -> &'static crate::topology::CoreMap {
+    static MAP: std::sync::OnceLock<crate::topology::CoreMap> = std::sync::OnceLock::new();
+    MAP.get_or_init(crate::topology::CoreMap::detect)
+}
 
 /// What the PowerShell reader thread has seen so far
 #[derive(Default)]
@@ -645,18 +770,28 @@ const WIN_STALE: Duration = Duration::from_secs(6);
 /// The helper is restarted after this long without any output, or as soon as it exits
 const WIN_HUNG: Duration = Duration::from_secs(12);
 
+/// Bumped to make every Windows sensor helper start over (new LibreHardwareMonitor or driver)
+static WIN_HELPER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Restart the Windows sensor helpers so they load LibreHardwareMonitor / PawnIO again
+pub fn restart_windows_helpers() {
+    WIN_HELPER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Long-running PowerShell child that prints one JSON line of sensor data every second or two
 struct WinStream {
     shared: Arc<Mutex<WinShared>>,
     child: Option<std::process::Child>,
     spawned: Instant,
+    generation: u64,
 }
 
 impl WinStream {
     fn start() -> Self {
         let shared = Arc::new(Mutex::new(WinShared::default()));
+        let generation = WIN_HELPER_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
         let child = Self::spawn(&shared);
-        Self { shared, child, spawned: Instant::now() }
+        Self { shared, child, spawned: Instant::now(), generation }
     }
 
     #[cfg(target_os = "windows")]
@@ -674,9 +809,10 @@ impl WinStream {
         if let Some(stdout) = child.stdout.take() {
             let shared = shared.clone();
             std::thread::spawn(move || {
+                let map = core_map();
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     let now = Instant::now();
-                    let parsed = parse_win_sensor_line(&line);
+                    let parsed = parse_win_sensor_line_with(&line, map);
                     if let Ok(mut sh) = shared.lock() {
                         sh.line_at = Some(now);
                         if let Some(w) = parsed {
@@ -743,13 +879,22 @@ impl WinStream {
         };
         let last_output = self.shared.lock().ok().and_then(|s| s.line_at).unwrap_or(self.spawned);
         let silent = last_output.elapsed() > WIN_HUNG;
-        if (exited || silent) && self.spawned.elapsed() > Duration::from_secs(5) {
+        let generation = WIN_HELPER_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        let asked = generation != self.generation;
+        if asked || ((exited || silent) && self.spawned.elapsed() > Duration::from_secs(5)) {
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();
                 let _ = c.wait();
             }
+            if asked {
+                // readings from the old helper describe the old setup
+                if let Ok(mut sh) = self.shared.lock() {
+                    *sh = WinShared::default();
+                }
+            }
             self.child = Self::spawn(&self.shared);
             self.spawned = Instant::now();
+            self.generation = generation;
         }
     }
 }
@@ -1046,11 +1191,9 @@ impl Collector {
                         snap.core_temps_c = w.cores.clone();
                         cpu_source = w.source.clone();
                     }
+                    notes.extend(lhm_notes(&w, crate::lhm::is_admin()));
                     if w.cores.is_empty() {
-                        notes.push(format!(
-                            "CPU temperature: {} (package only). Per-core temperatures need LibreHardwareMonitor or OpenHardwareMonitor running.",
-                            w.source
-                        ));
+                        notes.push(format!("CPU temperature: {} (package only, no per-core values)", w.source));
                     } else {
                         notes.push(format!("CPU temperature: {} ({} per-core sensors)", w.source, w.cores.len()));
                     }
@@ -1113,7 +1256,7 @@ impl Collector {
                 count(SensorKind::Current)
             ));
         } else if cfg!(target_os = "windows") {
-            notes.push("Board, memory, VRM, fan and power sensors: run LibreHardwareMonitor to have them logged".into());
+            notes.push("Board, memory, VRM, fan and power sensors: none yet (see the LibreHardwareMonitor notes above)".into());
         }
 
         // GPU
@@ -1160,6 +1303,30 @@ mod tests {
     fn write(dir: &Path, file: &str, content: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(file), content).unwrap();
+    }
+
+    #[test]
+    fn hybrid_core_temps_clocks_and_lhm_status_are_read() {
+        use crate::topology::{CoreKind::*, CoreMap};
+        let mut kinds = vec![Efficiency; 24];
+        for p in [0, 1, 10, 11, 12, 13, 22, 23] {
+            kinds[p] = Performance;
+        }
+        let map = CoreMap::from_parts((0..24).map(|c| vec![c]).collect(), Some(&kinds));
+        let line = r#"{"src":"lib","t":[{"n":"CPU Package","v":61.0},{"n":"P-Core #3","v":70.0},{"n":"E-Core #1","v":55.0},{"n":"P-Core #3 Distance to TjMax","v":30.0}],
+            "cl":[{"n":"P-Core #1","v":5500.0},{"n":"E-Core #16","v":4600.0}],"x":[],"lhm":true,"lerr":"","pawn":"2.0.1.0"}"#;
+        let w = parse_win_sensor_line_with(&line.replace('\n', ""), &map).unwrap();
+        assert_eq!(w.cores, vec![(2, 55.0), (10, 70.0)], "P-Core #3 is CPU 10, E-Core #1 is CPU 2");
+        assert_eq!(w.package_c, Some(61.0));
+        assert_eq!((w.core_freq_mhz[0], w.core_freq_mhz[21]), (5500.0, 4600.0));
+        assert_eq!((w.lhm_present, w.lhm_error.as_deref(), w.pawnio.as_deref()), (true, None, Some("2.0.1.0")));
+        assert_eq!(w.lhm_pe, Some((1, 1)));
+        // a failed load is reported even without any temperature
+        let e = parse_win_sensor_line(r#"{"src":null,"t":[],"tz":[],"lhm":true,"lerr":"could not load","pawn":""}"#).unwrap();
+        assert_eq!((e.lhm_error.as_deref(), e.pawnio.as_deref()), (Some("could not load"), None));
+        assert!(lhm_notes(&e, true)[0].contains("could not load"));
+        let no_pawn = WinSensors { lhm_present: true, ..Default::default() };
+        assert!(lhm_notes(&no_pawn, true).iter().any(|n| n.contains("PawnIO")));
     }
 
     #[test]

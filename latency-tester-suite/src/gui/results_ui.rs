@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use egui::{Color32, RichText, Ui};
-use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoints, Points, Polygon};
+use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, Points, Polygon};
 use std::collections::{BTreeMap, HashSet};
 
 use super::input_ui::RunRecord;
@@ -13,6 +13,7 @@ use crate::gpu_benchmark::GpuBenchmarkResult;
 use crate::input_latency::InputLatencyResult;
 use crate::memory_benchmark::MemoryBenchmarkResult;
 use crate::sensors::{Phase, SensorKind, Snapshot, Telemetry};
+use crate::topology::CoreKind;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) enum Dataset {
@@ -84,8 +85,9 @@ const MEMORY_METRICS: [Metric; 6] = [
     ("min_run", "Best run", "ms"),
     ("runs", "Runs", ""),
 ];
-const CPU_METRICS: [Metric; 5] = [
+const CPU_METRICS: [Metric; 6] = [
     ("mcalls", "Throughput", "M calls/s"),
+    ("mcalls_thread", "Throughput per thread", "M calls/s"),
     ("ns_per_call", "Time per call", "ns"),
     ("clock", "Clock (during run)", "MHz"),
     ("this_core_temp", "Temp of this core", "°C"),
@@ -191,31 +193,53 @@ pub(super) fn manual_rows(runs: &[RunRecord]) -> Vec<Row> {
     rows
 }
 
-pub(super) fn cpu_rows(results: &[CpuBenchmarkResult]) -> Vec<Row> {
+pub(super) fn cpu_rows(results: &[CpuBenchmarkResult], kinds: Option<&[CoreKind]>) -> Vec<Row> {
+    let single_of = |r: &CpuBenchmarkResult| (r.core_mask.count_ones() == 1).then(|| r.core_mask.trailing_zeros() as usize);
+    let any_single = results.iter().any(|r| single_of(r).is_some());
+    let mut multi_keys: Vec<(usize, String)> = Vec::new();
+    for r in results.iter().filter(|r| single_of(r).is_none()) {
+        let k = (r.thread_count, r.cores.clone());
+        if !multi_keys.contains(&k) {
+            multi_keys.push(k);
+        }
+    }
     results
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
+        .map(|r| {
+            let threads = r.thread_count.max(1);
             let mut v = BTreeMap::new();
             v.insert("mcalls", r.operations_per_second / 1e6);
+            v.insert("mcalls_thread", r.operations_per_second / 1e6 / threads as f64);
             v.insert("ns_per_call", r.latency_ns);
             v.insert("threads", r.thread_count as f64);
             if r.frequency_mhz > 0 {
                 v.insert("clock", r.frequency_mhz as f64);
             }
             telemetry_values(&r.telemetry, &mut v);
-            let single = (r.core_mask.count_ones() == 1).then(|| r.core_mask.trailing_zeros() as usize);
-            if let Some(core) = single {
-                if let Some(t) = r.telemetry.core_temp_max_c.iter().find(|c| c.0 == core) {
-                    v.insert("this_core_temp", t.1 as f64);
+            let all_cores = r.cores.is_empty() || r.cores.starts_with("All cores");
+            let (series, x, x_label) = match single_of(r) {
+                Some(core) => {
+                    if let Some(t) = r.telemetry.core_temp_max_c.iter().find(|c| c.0 == core) {
+                        v.insert("this_core_temp", t.1 as f64);
+                    }
+                    let class = crate::topology::class_label(kinds, core);
+                    let label = if class.is_empty() { format!("Core {}", core) } else { format!("Core {} · {}", core, class) };
+                    (format!("{:?}", r.workload), core as f64, label)
                 }
-            }
-            Row {
-                series: format!("{:?}", r.workload),
-                x: single.map(|c| c as f64).unwrap_or(i as f64),
-                x_label: r.cores.clone(),
-                values: v,
-            }
+                // a thread-count sweep: threads on the x axis
+                None if !any_single => (
+                    if all_cores { format!("{:?}", r.workload) } else { format!("{:?} · {}", r.workload, r.cores) },
+                    threads as f64,
+                    format!("{} thread{}", threads, if threads == 1 { "" } else { "s" }),
+                ),
+                // next to per-core runs: its own line and slot left of core 0, never on a core's position
+                None => {
+                    let k = multi_keys.iter().position(|m| m.0 == r.thread_count && m.1 == r.cores).unwrap_or(0);
+                    let place = if all_cores { "all cores".to_string() } else { r.cores.clone() };
+                    (format!("{:?} · {}T {}", r.workload, threads, place), -2.0 - k as f64, format!("{}T {}", threads, place))
+                }
+            };
+            Row { series, x, x_label, values: v }
         })
         .collect()
 }
@@ -267,19 +291,21 @@ pub(super) fn input_rows(results: &[InputLatencyResult]) -> Vec<Row> {
         .collect()
 }
 
-/// Cores whose throughput is well below the median of the single-core CPU results
-pub(super) fn slow_cores(results: &[CpuBenchmarkResult], threshold: f64) -> Vec<(String, usize, f64)> {
-    let mut by_workload: BTreeMap<String, Vec<(usize, f64)>> = BTreeMap::new();
+/// Cores whose throughput is well below the median of the single-core CPU results of the same core
+/// kind (P against P, E against E: on a hybrid CPU the E cores differ by design). (workload, core, % slower, "P"/"E"/"")
+pub(super) fn slow_cores(results: &[CpuBenchmarkResult], threshold: f64, kinds: Option<&[CoreKind]>) -> Vec<(String, usize, f64, &'static str)> {
+    let mut by_workload: BTreeMap<(String, &'static str), Vec<(usize, f64)>> = BTreeMap::new();
     for r in results {
         if r.core_mask.count_ones() == 1 {
+            let core = r.core_mask.trailing_zeros() as usize;
             by_workload
-                .entry(format!("{:?}", r.workload))
+                .entry((format!("{:?}", r.workload), crate::topology::class_label(kinds, core)))
                 .or_default()
-                .push((r.core_mask.trailing_zeros() as usize, r.operations_per_second));
+                .push((core, r.operations_per_second));
         }
     }
     let mut out = Vec::new();
-    for (w, mut cores) in by_workload {
+    for ((w, class), mut cores) in by_workload {
         if cores.len() < 3 {
             continue;
         }
@@ -289,11 +315,39 @@ pub(super) fn slow_cores(results: &[CpuBenchmarkResult], threshold: f64) -> Vec<
         cores.sort_by_key(|c| c.0);
         for (core, ops) in cores {
             if median > 0.0 && ops < median * (1.0 - threshold) {
-                out.push((w.clone(), core, (1.0 - ops / median) * 100.0));
+                out.push((w.clone(), core, (1.0 - ops / median) * 100.0, class));
             }
         }
     }
+    out.sort_by_key(|o| o.1);
     out
+}
+
+/// Legend under a chart, right-aligned and wrapped; folded away when there are many lines (the
+/// coloured line switches above the chart name them too)
+fn legend_below<'a>(ui: &mut Ui, id: impl std::hash::Hash, items: impl Iterator<Item = (Color32, &'a str)>) {
+    let items: Vec<(Color32, &str)> = items.collect();
+    if items.is_empty() {
+        return;
+    }
+    let draw = |ui: &mut Ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP).with_main_wrap(true), |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            // right-to-left: add in reverse so the first line ends up leftmost in reading order
+            for (color, name) in items.iter().rev() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(RichText::new(*name).small());
+                    ui.label(RichText::new("●").color(*color).small());
+                });
+            }
+        });
+    };
+    if items.len() <= 16 {
+        draw(ui);
+    } else {
+        egui::CollapsingHeader::new(RichText::new(format!("Legend ({} lines)", items.len())).small()).id_salt(id).default_open(false).show(ui, draw);
+    }
 }
 
 const PALETTE: [Color32; 12] = [
@@ -335,6 +389,8 @@ pub(super) struct ResultsUi {
     pub sensor_group: SensorGroup,
     /// Opacity of the per-test background bands on the sensors chart (0 = off)
     pub phase_opacity: f32,
+    /// Charts to reset to their full view on the next frame ("Reset view" button)
+    pub reset_view: HashSet<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -359,6 +415,41 @@ pub(super) fn phase_color(kind: &str) -> Color32 {
     }
 }
 
+/// Which test of its category a phase is: the CPU workload, the memory pattern, the input mode,
+/// the GPU size ("CPU · IntegerAdd · 1 thread(s) · Core 3" -> "IntegerAdd")
+pub(super) fn phase_test_key(p: &Phase) -> &str {
+    let segs: Vec<&str> = p.label.split(" · ").collect();
+    let i = if p.kind == "memory" { 2 } else { 1 };
+    segs.get(i).or(segs.last()).copied().unwrap_or("")
+}
+
+/// Shade `i` of `n` of a category colour: hue steps across ±30°, alternate shades darker, so
+/// neighbouring tests stand apart while the category stays recognisable
+pub(super) fn phase_shade(kind: &str, i: usize, n: usize) -> Color32 {
+    let base = phase_color(kind);
+    if n <= 1 {
+        return base;
+    }
+    let hsva = egui::ecolor::Hsva::from(base);
+    let t = i as f32 / (n - 1) as f32;
+    let h = (hsva.h + (t - 0.5) * 0.17).rem_euclid(1.0);
+    let v = if i % 2 == 0 { hsva.v } else { hsva.v * 0.62 };
+    Color32::from(egui::ecolor::Hsva::new(h, hsva.s, v, 1.0))
+}
+
+/// Tests of each category in order of first appearance
+pub(super) fn phase_keys(phases: &[Phase]) -> BTreeMap<String, Vec<String>> {
+    let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for p in phases {
+        let keys = m.entry(p.kind.clone()).or_default();
+        let k = phase_test_key(p);
+        if !keys.iter().any(|x| x == k) {
+            keys.push(k.to_string());
+        }
+    }
+    m
+}
+
 impl ResultsUi {
     pub fn new() -> Self {
         Self {
@@ -373,6 +464,7 @@ impl ResultsUi {
             log_y: false,
             sensor_group: SensorGroup::Temperatures,
             phase_opacity: 0.18,
+            reset_view: HashSet::new(),
         }
     }
 
@@ -435,7 +527,7 @@ impl LatencyTesterApp {
     fn dataset_rows(&self, d: Dataset) -> Vec<Row> {
         match d {
             Dataset::Memory => memory_rows(&self.mem_progress.lock().unwrap().completed),
-            Dataset::Cpu => cpu_rows(&self.cpu_partial.lock().unwrap()),
+            Dataset::Cpu => cpu_rows(&self.cpu_partial.lock().unwrap(), crate::topology::cached_core_kinds()),
             Dataset::Gpu => gpu_rows(&self.gpu_partial.lock().unwrap()),
             Dataset::Input => {
                 let mut rows = manual_rows(&self.input_test.runs);
@@ -537,19 +629,27 @@ impl LatencyTesterApp {
                 ui.checkbox(&mut self.results_ui.show_points, "Markers");
                 ui.checkbox(&mut self.results_ui.zero_y, "Start Y at 0");
                 ui.checkbox(&mut self.results_ui.log_y, "Log Y");
+                if ui.button("⟲ Reset view").on_hover_text("Back to the whole chart after zooming or panning (double-click the chart does the same)").clicked() {
+                    self.results_ui.reset_view.insert(d.tag());
+                }
             });
 
             if d == Dataset::Cpu {
                 let results = self.cpu_partial.lock().unwrap().clone();
-                for (w, core, pct) in slow_cores(&results, 0.08) {
-                    ui.colored_label(Color32::from_rgb(255, 170, 60), format!("⚠ {}: core {} is {:.0}% slower than the median core", w, core, pct));
+                for (w, core, pct, class) in slow_cores(&results, 0.08, crate::topology::cached_core_kinds()) {
+                    let peer = if class.is_empty() { "core".to_string() } else { format!("{}-core", class) };
+                    ui.colored_label(Color32::from_rgb(255, 170, 60), format!("⚠ {}: core {} is {:.0}% slower than the median {}", w, core, pct, peer));
                 }
             }
 
             // ---------------- chart ----------------
             let selectable: Vec<Metric> = metrics.iter().copied().filter(|m| !self.results_ui.col_hidden(d, m.0)).collect();
             if self.results_ui.show_chart {
-                let key = *self.results_ui.chart_metric.entry(d.tag()).or_insert(selectable.first().map(|m| m.0).unwrap_or(""));
+                // per-core runs next to all-core runs: the 24-thread total would dwarf every core, so
+                // the chart starts on the per-thread value
+                let mixed = d == Dataset::Cpu && rows.iter().any(|r| r.x < 0.0) && rows.iter().any(|r| r.x >= 0.0);
+                let default = if mixed && selectable.iter().any(|m| m.0 == "mcalls_thread") { "mcalls_thread" } else { selectable.first().map(|m| m.0).unwrap_or("") };
+                let key = *self.results_ui.chart_metric.entry(d.tag()).or_insert(default);
                 let mut current = selectable.iter().copied().find(|m| m.0 == key).or(selectable.first().copied());
                 if let Some(cur) = current.as_mut() {
                     ui.horizontal(|ui| {
@@ -607,16 +707,16 @@ impl LatencyTesterApp {
         });
     }
 
-    fn draw_chart(&self, ui: &mut Ui, d: Dataset, rows: &[Row], series: &[String], metric: Metric) {
+    fn draw_chart(&mut self, ui: &mut Ui, d: Dataset, rows: &[Row], series: &[String], metric: Metric) {
         let log_x = matches!(d, Dataset::Memory | Dataset::Gpu);
         let show_points = self.results_ui.show_points;
         let log_y = self.results_ui.log_y;
         let zero_y = self.results_ui.zero_y && !log_y;
         let ylabel = format!("{} ({}){}", metric.1, metric.2, if log_y { " — log scale" } else { "" });
         let labels: BTreeMap<i64, String> = rows.iter().map(|r| (r.x.round() as i64, r.x_label.clone())).collect();
+        // no legend inside the plot: with dozens of lines it covered the data; it is drawn below instead
         let mut plot = Plot::new(("plot", d.tag()))
             .height(320.0)
-            .legend(Legend::default())
             .y_axis_label(ylabel)
             .allow_scroll(false);
         if log_y {
@@ -637,6 +737,9 @@ impl LatencyTesterApp {
         };
         if zero_y {
             plot = plot.include_y(0.0);
+        }
+        if self.results_ui.reset_view.remove(d.tag()) {
+            plot = plot.reset();
         }
         plot.show(ui, |plot_ui| {
             for (i, s) in series.iter().enumerate() {
@@ -659,6 +762,8 @@ impl LatencyTesterApp {
                 }
             }
         });
+        let shown: Vec<(usize, &String)> = series.iter().enumerate().filter(|(_, s)| !self.results_ui.series_hidden(d, s)).collect();
+        legend_below(ui, ("legend", d.tag()), shown.iter().map(|(i, s)| (color_for(*i), s.as_str())));
     }
 
     // ------------------------------------------------------------------ sensors over time
@@ -707,8 +812,14 @@ impl LatencyTesterApp {
                 }
             });
         });
-        // per-test background bands
+        // per-test background bands: one colour per category, one shade of it per test
         let phases: Vec<Phase> = self.last_phases.clone();
+        let keys = phase_keys(&phases);
+        let shade_of = |p: &Phase| -> Color32 {
+            let ks = keys.get(&p.kind).map(|v| v.as_slice()).unwrap_or(&[]);
+            let k = phase_test_key(p);
+            phase_shade(&p.kind, ks.iter().position(|x| x == k).unwrap_or(0), ks.len())
+        };
         if !phases.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Test backgrounds:");
@@ -719,6 +830,18 @@ impl LatencyTesterApp {
                     }
                 }
                 ui.add(egui::Slider::new(&mut self.results_ui.phase_opacity, 0.0..=0.6).text("opacity"));
+                ui.label(RichText::new("hover the chart to see which test ran").weak().small());
+            });
+            egui::CollapsingHeader::new(RichText::new("Test colours").small()).default_open(false).show(ui, |ui| {
+                for (k, name) in [("input", "Input"), ("memory", "Memory"), ("cpu", "CPU"), ("gpu", "GPU")] {
+                    let Some(ks) = keys.get(k) else { continue };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("{}:", name)).small());
+                        for (i, key) in ks.iter().enumerate() {
+                            ui.label(RichText::new(format!("■ {}", key)).small().color(phase_shade(k, i, ks.len())));
+                        }
+                    });
+                }
             });
         }
         let visible: Vec<&(String, Vec<[f64; 2]>)> =
@@ -728,30 +851,43 @@ impl LatencyTesterApp {
         let pad = if hi > lo { (hi - lo) * 0.05 } else { 1.0 };
         let (band_lo, band_hi) = (lo - pad, hi + pad);
         let opacity = self.results_ui.phase_opacity;
-        Plot::new("sensor_plot")
-            .height(420.0)
-            .legend(Legend::default())
-            .x_axis_label("seconds since the test started")
-            .show(ui, |plot_ui| {
-                if opacity > 0.0 && band_lo < band_hi {
-                    for p in &phases {
-                        let (x0, x1) = (p.start_ms as f64 / 1000.0, (p.end_ms.max(p.start_ms + 50)) as f64 / 1000.0);
-                        let c = phase_color(&p.kind);
-                        let fill = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (opacity * 255.0) as u8);
-                        plot_ui.polygon(
-                            Polygon::new(PlotPoints::from(vec![[x0, band_lo], [x1, band_lo], [x1, band_hi], [x0, band_hi]]))
-                                .fill_color(fill)
-                                .stroke(egui::Stroke::NONE),
-                        );
-                    }
+        if ui.button("⟲ Reset view").on_hover_text("Back to the whole run after zooming or panning (double-click the chart does the same)").clicked() {
+            self.results_ui.reset_view.insert("sen");
+        }
+        let mut sensor_plot = Plot::new("sensor_plot").height(420.0).x_axis_label("seconds since the test started");
+        if self.results_ui.reset_view.remove("sen") {
+            sensor_plot = sensor_plot.reset();
+        }
+        let plot = sensor_plot.show(ui, |plot_ui| {
+            if opacity > 0.0 && band_lo < band_hi {
+                for p in &phases {
+                    let (x0, x1) = (p.start_ms as f64 / 1000.0, (p.end_ms.max(p.start_ms + 50)) as f64 / 1000.0);
+                    let c = shade_of(p);
+                    let fill = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (opacity * 255.0) as u8);
+                    plot_ui.polygon(
+                        Polygon::new(PlotPoints::from(vec![[x0, band_lo], [x1, band_lo], [x1, band_hi], [x0, band_hi]]))
+                            .fill_color(fill)
+                            .stroke(egui::Stroke::NONE),
+                    );
                 }
-                for (i, (name, pts)) in lines.iter().enumerate() {
-                    if self.results_ui.series_hidden(Dataset::Sensors, name) {
-                        continue;
-                    }
-                    plot_ui.line(Line::new(PlotPoints::from(pts.clone())).name(name).color(color_for(i)));
+            }
+            for (i, (name, pts)) in lines.iter().enumerate() {
+                if self.results_ui.series_hidden(Dataset::Sensors, name) {
+                    continue;
                 }
-            });
+                plot_ui.line(Line::new(PlotPoints::from(pts.clone())).name(name).color(color_for(i)));
+            }
+            // which test was running under the pointer
+            let x = plot_ui.pointer_coordinate()?.x;
+            let p = phases.iter().rev().find(|p| x >= p.start_ms as f64 / 1000.0 && x <= p.end_ms.max(p.start_ms + 50) as f64 / 1000.0)?;
+            Some(format!("{}\n{:.1} – {:.1} s ({:.1} s)", p.label, p.start_ms as f64 / 1000.0, p.end_ms as f64 / 1000.0, (p.end_ms.saturating_sub(p.start_ms)) as f64 / 1000.0))
+        });
+        if let Some(text) = plot.inner {
+            plot.response.on_hover_text_at_pointer(text);
+        }
+        let shown: Vec<(usize, &String)> =
+            lines.iter().map(|l| &l.0).enumerate().filter(|(_, n)| !self.results_ui.series_hidden(Dataset::Sensors, n)).collect();
+        legend_below(ui, "sensor_legend", shown.iter().map(|(i, n)| (color_for(*i), n.as_str())));
 
         // Peak temperature per core over the whole run
         let peaks = core_peaks(&self.last_timeline);
@@ -880,7 +1016,7 @@ mod tests {
 
     #[test]
     fn cpu_rows_carry_core_position_and_own_temperature() {
-        let rows = cpu_rows(&[cpu_result(3, 2e6), cpu_result(5, 2e6)]);
+        let rows = cpu_rows(&[cpu_result(3, 2e6), cpu_result(5, 2e6)], None);
         assert_eq!(rows[0].x, 3.0);
         assert_eq!(rows[0].values["this_core_temp"], 63.0);
         assert_eq!(rows[1].values["mcalls"], 2.0);
@@ -891,11 +1027,39 @@ mod tests {
     fn slow_core_is_flagged() {
         let mut v: Vec<_> = (0..6).map(|c| cpu_result(c, 1e6)).collect();
         v[4] = cpu_result(4, 0.7e6);
-        let slow = slow_cores(&v, 0.08);
+        let slow = slow_cores(&v, 0.08, None);
         assert_eq!(slow.len(), 1);
         assert_eq!(slow[0].1, 4);
         assert!((slow[0].2 - 30.0).abs() < 0.01);
-        assert!(slow_cores(&v[..2], 0.08).is_empty()); // too few cores to judge
+        assert!(slow_cores(&v[..2], 0.08, None).is_empty()); // too few cores to judge
+    }
+
+    #[test]
+    fn hybrid_cores_are_compared_with_their_own_kind() {
+        use CoreKind::{Efficiency as E, Performance as P};
+        // IntegerAdd on Arrow Lake: E cores 5x the P cores; no core is slow within its kind
+        let kinds = [P, P, E, E, E, E, P, P];
+        let v: Vec<_> = (0..8).map(|c| cpu_result(c, if kinds[c] == P { 0.8e6 } else { 4.0e6 })).collect();
+        assert!(slow_cores(&v, 0.08, Some(&kinds)).is_empty());
+        assert_eq!(slow_cores(&v, 0.08, None).len(), 4, "without kinds every P core looks slow");
+        let rows = cpu_rows(&v, Some(&kinds));
+        assert_eq!(rows[2].x_label, "Core 2 · E");
+    }
+
+    #[test]
+    fn all_core_runs_get_their_own_slot_next_to_per_core_runs() {
+        let mut all = cpu_result(0, 110e6);
+        all.core_mask = 0xFF_FFFF;
+        all.thread_count = 24;
+        all.cores = "All cores (OS scheduled)".into();
+        let rows = cpu_rows(&[all.clone(), cpu_result(0, 5e6), cpu_result(1, 5e6)], None);
+        assert_eq!(rows[0].x, -2.0, "not on core 0's position");
+        assert!(rows[0].series.ends_with("· 24T all cores"), "{}", rows[0].series);
+        assert!((rows[0].values["mcalls_thread"] - 110.0 / 24.0).abs() < 1e-9);
+        assert_eq!(rows[1].x, 0.0);
+        // all-core runs alone: threads on the x axis
+        let only = cpu_rows(&[all], None);
+        assert_eq!((only[0].x, only[0].x_label.as_str()), (24.0, "24 threads"));
     }
 
     #[test]
