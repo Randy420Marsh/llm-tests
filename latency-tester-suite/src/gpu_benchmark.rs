@@ -6,6 +6,9 @@ use anyhow::{anyhow, Result};
 use ash::{vk, Device, Entry, Instance};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
+use crate::cancel::{self, CancelFlag};
+use crate::progress::{self, SharedProgress, SharedResults};
+use crate::sensors::{Sampler, Telemetry};
 use crate::timer::HighResTimer;
 
 /// ALU steps (one multiply + one add each) executed by every shader invocation
@@ -42,6 +45,9 @@ pub struct GpuBenchmarkResult {
     pub percentile_95_ms: f64,
     pub percentile_99_ms: f64,
     pub throughput_geops: f64,
+    /// GPU/VRAM/CPU readings taken while this size ran
+    #[serde(default)]
+    pub telemetry: Telemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +78,10 @@ pub struct GpuBenchmark {
     queue: vk::Queue,
     queue_family_index: u32,
     timer: HighResTimer,
+    cancel: CancelFlag,
+    progress: Option<SharedProgress>,
+    partial: Option<SharedResults<GpuBenchmarkResult>>,
+    sensors: Option<std::sync::Arc<Sampler>>,
 }
 
 impl Drop for GpuBenchmark {
@@ -224,7 +234,30 @@ impl GpuBenchmark {
             queue,
             queue_family_index,
             timer: HighResTimer::new(),
+            cancel: cancel::new_flag(),
+            progress: None,
+            partial: None,
+            sensors: None,
         })
+    }
+
+    /// Publish live progress and finished results to the GUI
+    pub fn with_progress(mut self, progress: SharedProgress, partial: SharedResults<GpuBenchmarkResult>) -> Self {
+        self.progress = Some(progress);
+        self.partial = Some(partial);
+        self
+    }
+
+    /// Attach a sensor sampler so every result carries GPU/VRAM/CPU readings
+    pub fn with_sensors(mut self, sampler: std::sync::Arc<Sampler>) -> Self {
+        self.sensors = Some(sampler);
+        self
+    }
+
+    /// Share a flag that stops the run early when set
+    pub fn with_cancel(mut self, flag: CancelFlag) -> Self {
+        self.cancel = flag;
+        self
     }
 
     fn create_instance(entry: &Entry) -> Result<Instance> {
@@ -292,13 +325,32 @@ impl GpuBenchmark {
         Ok((device, queue))
     }
 
+    /// Convenience for `GpuBenchmark::new(..).and_then(|b| b.run_owned())`
+    pub fn run_owned(mut self) -> Result<GpuBenchmarkSummary> {
+        self.run()
+    }
+
     pub fn run(&mut self) -> Result<GpuBenchmarkSummary> {
         let system_info = crate::system_info::collect_system_info()?;
         let vulkan_info = self.get_vulkan_info()?;
         let mut results = Vec::new();
 
+        let total = self.config.workload_sizes.len();
+        progress::update(&self.progress, |p| {
+            *p = progress::RunProgress { total, started: Some(std::time::Instant::now()), ..Default::default() }
+        });
         for &size in &self.config.workload_sizes {
-            results.push(self.run_compute_workload(size)?);
+            cancel::check(&self.cancel)?;
+            progress::update(&self.progress, |p| {
+                p.title = format!("{} elements · {} dispatches", size, self.config.iterations);
+                p.detail = "creating pipeline and buffer, then timing dispatches".into();
+            });
+            let r = self.run_compute_workload(size)?;
+            progress::update(&self.progress, |p| p.done += 1);
+            if let Some(partial) = &self.partial {
+                partial.lock().unwrap().push(r.clone());
+            }
+            results.push(r);
         }
 
         Ok(GpuBenchmarkSummary {
@@ -513,14 +565,17 @@ impl GpuBenchmark {
 
     fn run_compute_workload(&self, size: u64) -> Result<GpuBenchmarkResult> {
         let res = self.create_resources(size, false)?;
+        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
 
         for _ in 0..self.config.warmup_iterations {
+            cancel::check(&self.cancel)?;
             self.submit_and_wait(&res)?;
         }
 
         let iterations = self.config.iterations.max(1);
         let mut times = Vec::with_capacity(iterations as usize);
         for _ in 0..iterations {
+            cancel::check(&self.cancel)?;
             let start = self.timer.now_ticks();
             self.submit_and_wait(&res)?;
             let end = self.timer.now_ticks();
@@ -544,6 +599,10 @@ impl GpuBenchmark {
             percentile_95_ms: pct(0.95),
             percentile_99_ms: pct(0.99),
             throughput_geops: if avg > 0.0 { ops / (avg / 1000.0) / 1e9 } else { 0.0 },
+            telemetry: match (&self.sensors, sensor_start) {
+                (Some(s), Some(t0)) => s.window(t0, s.now_ms()),
+                _ => Telemetry::default(),
+            },
         })
     }
 

@@ -8,7 +8,11 @@ use sysinfo::System;
 pub struct SystemInfo {
     pub cpu: CpuInfo,
     pub memory: MemoryInfo,
+    /// The primary (largest-VRAM) GPU
     pub gpu: Option<GpuInfo>,
+    /// Every GPU found (iGPU + dGPU)
+    #[serde(default)]
+    pub gpus: Vec<GpuInfo>,
     pub motherboard: MotherboardInfo,
     pub os: OsInfo,
     pub virtualization: VirtualizationInfo,
@@ -115,6 +119,9 @@ pub struct VirtualizationInfo {
     pub kvm_enabled: bool,                    // Linux KVM
     pub vmware_detected: bool,
     pub virtualbox_detected: bool,
+    /// Running as a KVM guest (hypervisor signature "KVMKVMKVM")
+    #[serde(default)]
+    pub kvm_guest: bool,
     pub details: String,
 }
 
@@ -131,18 +138,31 @@ impl SystemInfoCollector {
 
     pub fn collect(&mut self) -> Result<SystemInfo> {
         self.sys.refresh_all();
-        
+
+        let extras = crate::hwinfo::gather();
         let cpu = self.collect_cpu_info()?;
-        let memory = self.collect_memory_info()?;
-        let gpu = self.collect_gpu_info();
-        let motherboard = self.collect_motherboard_info();
-        let os = self.collect_os_info();
+        let mut memory = self.collect_memory_info()?;
+        if !extras.modules.is_empty() {
+            memory.speed = extras.modules.iter().map(|m| m.speed).max().unwrap_or(0);
+            // Consumer platforms run at most two channels regardless of how many DIMMs are fitted
+            memory.channels = (extras.modules.len() as u32).min(2);
+            memory.modules = extras.modules.clone();
+        }
+        if let Some(t) = &extras.memory_type {
+            memory.type_ = t.clone();
+        }
+        let gpus = extras.gpus.clone();
+        let gpu = gpus.iter().max_by_key(|g| g.vram_total).cloned();
+        let motherboard = extras.board.clone().unwrap_or_else(|| self.collect_motherboard_info());
+        let mut os = extras.os.clone().unwrap_or_else(|| self.collect_os_info());
         let virtualization = self.collect_virtualization_info()?;
+        os.is_virtualized = virtualization.vmware_detected || virtualization.virtualbox_detected || virtualization.kvm_guest;
 
         Ok(SystemInfo {
             cpu,
             memory,
             gpu,
+            gpus,
             motherboard,
             os,
             virtualization,
@@ -167,11 +187,18 @@ impl SystemInfoCollector {
         // Get CPU brand and vendor from raw-cpuid
         let (vendor, brand, features) = self.get_cpuid_info();
         
+        let caches = crate::hwinfo::cpu_caches_kb();
+
         // Detect P-cores and E-cores (Intel hybrid architecture)
         let (p_cores, e_cores) = self.detect_hybrid_cores();
 
         Ok(CpuInfo {
-            name: cpu.name().to_string(),
+            // sysinfo reports "CPU 1" on Windows; the CPUID brand string is the real model name
+            name: if brand.trim().is_empty() || brand == "Unknown" {
+                cpu.name().to_string()
+            } else {
+                brand.trim().to_string()
+            },
             vendor: vendor.clone(),
             brand: brand.clone(),
             frequency: cpu.frequency(),
@@ -180,9 +207,9 @@ impl SystemInfoCollector {
             threads: cpus.len(),
             p_cores,
             e_cores,
-            l1_cache: 0, // Would need platform-specific detection
-            l2_cache: 0,
-            l3_cache: 0,
+            l1_cache: caches.0,
+            l2_cache: caches.1,
+            l3_cache: caches.2,
             architecture: std::env::consts::ARCH.to_string(),
             microarchitecture: self.detect_microarchitecture(&vendor, &brand),
             features,
@@ -215,7 +242,6 @@ impl SystemInfoCollector {
                 if feature_info.has_sse41() { features.push("SSE4.1".to_string()); }
                 if feature_info.has_sse42() { features.push("SSE4.2".to_string()); }
                 if feature_info.has_avx() { features.push("AVX".to_string()); }
-                if feature_info.has_avx() { features.push("AVX2".to_string()); }
                 if feature_info.has_fma() { features.push("FMA".to_string()); }
                 if feature_info.has_aesni() { features.push("AES-NI".to_string()); }
                 // SHA detection is more complex in raw-cpuid, skipping for now or using a generic check
@@ -225,6 +251,7 @@ impl SystemInfoCollector {
             
             // Check for AVX-512
             if let Some(ext_features) = cpuid.get_extended_feature_info() {
+                if ext_features.has_avx2() { features.push("AVX2".to_string()); }
                 if ext_features.has_avx512f() { features.push("AVX-512F".to_string()); }
                 if ext_features.has_avx512dq() { features.push("AVX-512DQ".to_string()); }
                 if ext_features.has_avx512cd() { features.push("AVX-512CD".to_string()); }
@@ -291,8 +318,9 @@ impl SystemInfoCollector {
     fn detect_hybrid_cores(&self) -> (usize, usize) {
         // Intel hybrid architecture: logical P/E thread counts
         // (e.g. Core Ultra 270K = 8 P-threads + 12 E-threads, no SMT)
-        // For now, return (0, 0) - would need CPUID leaf 0x1A/0x1B parsing
-        (0, 0)
+        let (p, e) = crate::topology::hybrid_counts();
+        // Only hybrid CPUs have a P/E split; otherwise report (0, 0) rather than "all cores are P"
+        if e == 0 { (0, 0) } else { (p, e) }
     }
 
     fn collect_memory_info(&mut self) -> Result<MemoryInfo> {
@@ -322,14 +350,6 @@ impl SystemInfoCollector {
         })
     }
 
-    fn collect_gpu_info(&self) -> Option<GpuInfo> {
-        // GPU info would need platform-specific code:
-        // - Windows: WMI, DXGI, NVAPI, ADL
-        // - Linux: DRM, sysfs, nvidia-smi, rocm-smi
-        // For now, return None - would be implemented with platform-specific backends
-        None
-    }
-
     fn collect_motherboard_info(&self) -> MotherboardInfo {
         // Would need platform-specific code (WMI on Windows, dmidecode on Linux)
         MotherboardInfo {
@@ -344,186 +364,31 @@ impl SystemInfoCollector {
 
     fn collect_os_info(&self) -> OsInfo {
         OsInfo {
-            name: std::env::consts::OS.to_string(),
-            version: "Unknown".to_string(),
-            build: "Unknown".to_string(),
-            kernel_version: "Unknown".to_string(),
-            is_virtualized: false, // Would be detected in virtualization_info
+            name: System::name().unwrap_or_else(|| std::env::consts::OS.to_string()),
+            version: System::os_version().unwrap_or_else(|| "Unknown".to_string()),
+            build: System::long_os_version().unwrap_or_else(|| "Unknown".to_string()),
+            kernel_version: System::kernel_version().unwrap_or_else(|| "Unknown".to_string()),
+            is_virtualized: false,
         }
     }
 
+    /// Built from the unprivileged detector (see virtualization.rs) so the saved results agree with the GUI
     fn collect_virtualization_info(&self) -> Result<VirtualizationInfo> {
-        #[cfg(target_os = "windows")]
-        {
-            self.collect_windows_virtualization_info()
-        }
-        
-        #[cfg(target_os = "linux")]
-        {
-            self.collect_linux_virtualization_info()
-        }
-        
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        {
-            Ok(VirtualizationInfo {
-                bios_virtualization_enabled: false,
-                hyper_v_enabled: false,
-                vbs_enabled: false,
-                hvci_enabled: false,
-                wsl_enabled: false,
-                kvm_enabled: false,
-                vmware_detected: false,
-                virtualbox_detected: false,
-                details: "Unsupported platform".to_string(),
-            })
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn collect_windows_virtualization_info(&self) -> Result<VirtualizationInfo> {
-        use windows::Win32::System::SystemInformation::*;
-        use windows::Win32::Foundation::*;
-        use std::ptr;
-        
-        let mut details = String::new();
-        
-        // Check if running in a VM
-        let mut vmware_detected = false;
-        let mut virtualbox_detected = false;
-        
-        // Check for VMware
-        if let Ok(output) = std::process::Command::new("wmic")
-            .args(["computersystem", "get", "manufacturer"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            if output_str.to_lowercase().contains("vmware") {
-                vmware_detected = true;
-                details.push_str("VMware detected; ");
-            }
-            if output_str.to_lowercase().contains("virtualbox") || output_str.to_lowercase().contains("innotek") {
-                virtualbox_detected = true;
-                details.push_str("VirtualBox detected; ");
-            }
-        }
-        
-        // Check Hyper-V
-        let mut hyper_v_enabled = false;
-        if let Ok(output) = std::process::Command::new("powershell")
-            .args(["-Command", "Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Select-Object State"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            if output_str.contains("Enabled") {
-                hyper_v_enabled = true;
-                details.push_str("Hyper-V enabled; ");
-            }
-        }
-        
-        // Check VBS/HVCI (Memory Integrity)
-        let mut vbs_enabled = false;
-        let mut hvci_enabled = false;
-        if let Ok(output) = std::process::Command::new("powershell")
-            .args(["-Command", "Get-CimInstance -Namespace root\\Microsoft\\Windows\\DeviceGuard -ClassName DeviceGuardSecurityProperties | Select-Object VirtualizationBasedSecurityStatus, RequiredSecurityProperties"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            if output_str.contains("2") { // VBS running
-                vbs_enabled = true;
-                details.push_str("VBS enabled; ");
-            }
-            if output_str.contains("1") { // HVCI enabled
-                hvci_enabled = true;
-                details.push_str("HVCI (Memory Integrity) enabled; ");
-            }
-        }
-        
-        // Check WSL
-        let mut wsl_enabled = false;
-        if let Ok(output) = std::process::Command::new("wsl")
-            .args(["--status"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            if output_str.contains("WSL 2") || output_str.contains("WSL 1") {
-                wsl_enabled = true;
-                details.push_str("WSL enabled; ");
-            }
-        }
-        
-        // BIOS virtualization (VT-x/SVM) - would need WMI or registry check
-        let bios_virtualization_enabled = true; // Assume enabled if we can run VMs
-        
+        let status = crate::virtualization::VirtualizationDetector::detect()?;
+        let vendor = crate::virtualization::hypervisor_vendor().unwrap_or_default();
+        let win = status.windows.as_ref();
+        let lnx = status.linux.as_ref();
         Ok(VirtualizationInfo {
-            bios_virtualization_enabled,
-            hyper_v_enabled,
-            vbs_enabled,
-            hvci_enabled,
-            wsl_enabled,
-            kvm_enabled: false,
-            vmware_detected,
-            virtualbox_detected,
-            details,
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    fn collect_linux_virtualization_info(&self) -> Result<VirtualizationInfo> {
-        let mut details = String::new();
-        let mut bios_virtualization_enabled = false;
-        let mut kvm_enabled = false;
-        let mut vmware_detected = false;
-        let mut virtualbox_detected = false;
-        
-        // Check CPU flags for virtualization support
-        if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-            if cpuinfo.contains("vmx") || cpuinfo.contains("svm") {
-                bios_virtualization_enabled = true;
-                details.push_str("CPU virtualization extensions (VMX/SVM) present; ");
-            }
-        }
-        
-        // Check KVM
-        if std::path::Path::new("/dev/kvm").exists() {
-            kvm_enabled = true;
-            details.push_str("KVM available; ");
-        }
-        
-        // Check for VMware
-        if let Ok(output) = std::process::Command::new("systemd-detect-virt")
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            if output_str.contains("vmware") {
-                vmware_detected = true;
-                details.push_str("VMware detected; ");
-            } else if output_str.contains("virtualbox") || output_str.contains("vbox") {
-                virtualbox_detected = true;
-                details.push_str("VirtualBox detected; ");
-            } else if output_str.trim() != "none" {
-                details.push_str(&format!("Running in VM: {}; ", output_str.trim()));
-            }
-        }
-        
-        // Check for disabled virtualization in kernel cmdline
-        if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
-            if cmdline.contains("kvm_intel.enable_virt_at_load=0") || 
-               cmdline.contains("kvm_amd.enable_virt_at_load=0") ||
-               cmdline.contains("nokvm") {
-                details.push_str("KVM disabled via kernel cmdline; ");
-            }
-        }
-        
-        Ok(VirtualizationInfo {
-            bios_virtualization_enabled,
-            hyper_v_enabled: false,
-            vbs_enabled: false,
-            hvci_enabled: false,
-            wsl_enabled: false,
-            kvm_enabled,
-            vmware_detected,
-            virtualbox_detected,
-            details,
+            bios_virtualization_enabled: status.bios.vt_x_enabled || status.bios.svm_enabled,
+            hyper_v_enabled: win.map_or(false, |w| w.hyper_v_enabled),
+            vbs_enabled: win.map_or(false, |w| w.vbs_enabled),
+            hvci_enabled: win.map_or(false, |w| w.hvci_enabled),
+            wsl_enabled: win.map_or(false, |w| w.wsl_enabled),
+            kvm_enabled: lnx.map_or(false, |l| l.kvm_enabled),
+            kvm_guest: vendor.starts_with("KVM"),
+            vmware_detected: vendor.starts_with("VMware"),
+            virtualbox_detected: vendor.starts_with("VBox"),
+            details: format!("hypervisor vendor: {}; {}", if vendor.is_empty() { "none" } else { &vendor }, status.bios.details),
         })
     }
 }
@@ -535,9 +400,25 @@ impl Default for SystemInfoCollector {
 }
 
 /// Collect system information once (for logging)
+static CACHE: std::sync::Mutex<Option<(std::time::Instant, SystemInfo)>> = std::sync::Mutex::new(None);
+
+/// System information, reused for two minutes: gathering it can spawn PowerShell, and every
+/// benchmark run asks for it.
 pub fn collect_system_info() -> Result<SystemInfo> {
+    if let Some((at, info)) = CACHE.lock().unwrap().as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(120) {
+            return Ok(info.clone());
+        }
+    }
+    collect_system_info_fresh()
+}
+
+/// Always re-reads everything (the Refresh button)
+pub fn collect_system_info_fresh() -> Result<SystemInfo> {
     let mut collector = SystemInfoCollector::new();
-    collector.collect()
+    let info = collector.collect()?;
+    *CACHE.lock().unwrap() = Some((std::time::Instant::now(), info.clone()));
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -546,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_collector_creation() {
-        let collector = SystemInfoCollector::new();
+        let _collector = SystemInfoCollector::new();
         // Just verify it creates without panic
         assert!(true);
     }

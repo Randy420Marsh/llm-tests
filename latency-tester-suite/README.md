@@ -22,20 +22,87 @@ separately; stronger guarantees would need an external timestamping/signing serv
 
 ## Build & run
 
+One step (needs [Rust](https://rustup.rs)):
+
+| | Build | Run the GUI |
+|---|---|---|
+| Windows | `build.bat` → `dist\LatencyTester.exe` | double-click the exe, or `run.bat` |
+| Linux   | `./build.sh` → `dist/latency-tester` | `./run.sh` |
+
+The exe is self-contained: the MSVC runtime is linked statically, the Vulkan loader is
+optional (loaded at run time; the GPU suite reports "no device" without it), and results are
+written to a `latency_results` folder next to the exe. Copy the single file anywhere to use it.
+
+Command line (also works on the built exe):
+
 ```sh
-cargo build --release
-./target/release/latency-tester                 # GUI
-./target/release/latency-tester --cli           # quick headless pass of all suites
-./target/release/latency-tester --cli --skip gpu --out ./my_results
+latency-tester --cli                       # quick headless pass of all suites
+latency-tester --cli --skip gpu --out ./my_results
 ```
 
 Linux GUI needs `libxkbcommon`, X11/Wayland and OpenGL. The GPU suite needs a Vulkan driver
 (software drivers such as Mesa lavapipe work: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`).
 
+## Choosing what to test
+
+Every tab shows live progress (what is running right now, ETA) and fills its results in as tests finish;
+**Stop** keeps whatever already finished.
+
+- **Cores** (Memory, CPU, Input): all / P-cores / E-cores / P+E pinned / any specific cores, plus
+  **Test each core on its own** to find slow, hot or faulty cores. The Results tab flags cores that are
+  well below the median.
+- **Memory**: pick buffer sizes, access patterns, thread counts (presets or a custom number), runs per
+  test and a time limit per test.
+- **CPU**: pick workloads, thread count (all selected cores or an exact number), run length and repeats.
+
+## Sensors and graphs
+
+While any test runs, a background sampler records CPU per-core temperatures, clocks, load, RAM and
+GPU temperature/load/power/VRAM, and each result stores a summary of the readings taken during that test.
+The **Results & Graphs** tab charts every value, and each line or column can be switched on and off.
+
+| Reading | Linux | Windows |
+|---|---|---|
+| CPU temperature (package / per core) | hwmon (`coretemp`, `k10temp`) | per-core needs [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (or OpenHardwareMonitor) running; otherwise a package-level ACPI thermal zone |
+| CPU clocks / load / RAM | yes | yes |
+| GPU temp / load / power / VRAM | `nvidia-smi` or amdgpu sysfs | `nvidia-smi` (ships with the NVIDIA driver) |
+
+The Dashboard lists which sensors were found. Windows itself does not expose per-core CPU temperatures
+to normal programs, so without a helper such as LibreHardwareMonitor those columns stay empty.
+
+## Logging and viewing results
+
+- **Log everything** (Dashboard) runs nothing new: it saves all results currently in the app (memory, CPU, GPU,
+  input, per-core sweeps, sensor timeline, full system/hardware info) as **one signed session file**. Each suite
+  also has its own "Log …" button.
+- The **log panel** at the bottom of the window is a normal read-only text box: drag to select, `Ctrl+A` to
+  select all, `Ctrl+C` to copy, or use **Copy all / Save… / Clear**.
+- **Web viewer**: in the app press *Start server & open browser*, or run
+
+  ```sh
+  latency-tester --serve [--dir ./latency_results] [--port 8080] [--bind 127.0.0.1] [--open]
+  latency-tester --report [--dir ./latency_results] [--out report.html] [file.json ...]
+  ```
+
+  `--serve` is a read-only local web server (no uploads, only the result `*.json` files of one folder;
+  bind to `0.0.0.0` only if you want other devices on your network to see it). `--report` writes one
+  self-contained `report.html` (no external resources: e-mail it or open it offline). The page shows each
+  file's signature status (valid / edited / signed by another key), the system info, per-test results, sweeps
+  and the sensor timeline, with per-series toggles.
+
+## Automated input-latency rig (optional)
+
+The Input tab has separate **mouse click** and **keyboard press** tests (10 trials averaged, random 500–2000 ms
+waits so you cannot anticipate, red *wait* / green *go* screen with a black/white marker bar and a
+red-black-red finish flash). A small Arduino Pro Micro rig can click/press for you, and measure the
+display too (refresh rate, response time, click-to-photon). Schematics, parts list, wiring and calibration:
+[`docs/latency-rig/README.md`](docs/latency-rig/README.md). Firmware: [`arduino/latency_rig`](arduino/latency_rig).
+
 ## Tests
 
 ```sh
 cargo test
+g++ -std=c++11 -o /tmp/t arduino/tests/test_analysis.cpp && /tmp/t   # rig firmware maths, see arduino/tests/README.md
 ```
 
 GPU tests skip themselves when no Vulkan device is available.
