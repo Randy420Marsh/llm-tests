@@ -247,6 +247,8 @@ pub struct WinSensors {
     pub package_c: Option<f32>,
     pub cores: Vec<(usize, f32)>,
     pub gpu_c: Option<f32>,
+    /// Actual per-logical-CPU clock in MHz ("% Processor Performance" x base clock, like Task Manager)
+    pub core_freq_mhz: Vec<f32>,
     /// "LibreHardwareMonitor", "OpenHardwareMonitor" or "ACPI thermal zone"
     pub source: String,
 }
@@ -282,6 +284,21 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
     }
     w.cores.sort_by_key(|c| c.0);
     w.cores.dedup_by_key(|c| c.0);
+    // Actual clocks: every instance is "group,cpu"; % Processor Performance is relative to the base clock
+    let base = v["base"].as_f64().unwrap_or(0.0);
+    if base > 0.0 {
+        let mut freqs: Vec<(usize, f32)> = Vec::new();
+        for p in as_list(&v["perf"]) {
+            let (Some(name), Some(pct)) = (p["n"].as_str(), p["v"].as_f64()) else { continue };
+            let mut it = name.split(',');
+            let (Some(g), Some(c)) = (it.next().and_then(|x| x.trim().parse::<usize>().ok()), it.next().and_then(|x| x.trim().parse::<usize>().ok())) else { continue };
+            if pct > 0.0 && pct < 1000.0 {
+                freqs.push((g * 64 + c, (pct * base / 100.0) as f32));
+            }
+        }
+        freqs.sort_by_key(|f| f.0);
+        w.core_freq_mhz = freqs.into_iter().map(|f| f.1).collect();
+    }
     if let Some(src) = v["src"].as_str().filter(|s| !s.is_empty()) {
         w.source = if src.contains("Libre") { "LibreHardwareMonitor" } else { "OpenHardwareMonitor" }.to_string();
     }
@@ -295,12 +312,13 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
             w.source = "ACPI thermal zone".to_string();
         }
     }
-    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some()).then_some(w)
+    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty()).then_some(w)
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const WIN_STREAM_SCRIPT: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
+$base = (Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1).MaxClockSpeed
 while ($true) {
   $ns = $null; $s = $null
   foreach ($n in 'root/LibreHardwareMonitor', 'root/OpenHardwareMonitor') {
@@ -308,9 +326,13 @@ while ($true) {
     if ($s) { $ns = $n; break }
   }
   $t = @(); if ($s) { $t = @($s | ForEach-Object { @{ n = $_.Name; v = [double]$_.Value } }) }
-  $tz = @()
-  try { $tz = @((Get-Counter '\Thermal Zone Information(*)\Temperature' -ErrorAction Stop).CounterSamples | ForEach-Object { [double]$_.CookedValue }) } catch {}
-  [pscustomobject]@{ src = $ns; t = $t; tz = $tz } | ConvertTo-Json -Compress -Depth 4
+  $tz = @(); $perf = @()
+  try {
+    $samples = (Get-Counter -Counter '\Thermal Zone Information(*)\Temperature', '\Processor Information(*)\% Processor Performance' -ErrorAction Stop).CounterSamples
+    $tz = @($samples | Where-Object { $_.Path -like '*thermal zone*' } | ForEach-Object { [double]$_.CookedValue })
+    $perf = @($samples | Where-Object { $_.Path -like '*processor performance*' -and $_.InstanceName -notmatch '_total' } | ForEach-Object { @{ n = $_.InstanceName; v = [double]$_.CookedValue } })
+  } catch {}
+  [pscustomobject]@{ src = $ns; t = $t; tz = $tz; perf = $perf; base = $base } | ConvertTo-Json -Compress -Depth 4
   Start-Sleep -Milliseconds 500
 }
 "#;
@@ -514,6 +536,11 @@ impl Collector {
                 } else {
                     notes.push(format!("CPU temperature: {} ({} per-core sensors)", w.source, w.cores.len()));
                 }
+                if w.core_freq_mhz.len() >= snap.core_freq_mhz.len().min(1) && !w.core_freq_mhz.is_empty() {
+                    // real clocks instead of sysinfo's nominal values
+                    let n = snap.core_freq_mhz.len().max(w.core_freq_mhz.len());
+                    snap.core_freq_mhz = (0..n).map(|i| w.core_freq_mhz.get(i).copied().unwrap_or(0.0)).collect();
+                }
                 if let Some(g) = w.gpu_c {
                     snap.gpu = Some(GpuSensors { name: "GPU".into(), temp_c: Some(g), ..Default::default() });
                 }
@@ -633,6 +660,16 @@ mod tests {
         assert_eq!(w.package_c, Some(51.0));
         assert_eq!(w.cores, vec![(0, 47.0), (1, 62.5)]);
         assert_eq!(w.gpu_c, Some(36.0));
+    }
+
+    #[test]
+    fn windows_actual_clocks_from_processor_performance() {
+        let line = r#"{"src":null,"t":[],"tz":[],"perf":[{"n":"0,0","v":143.0},{"n":"0,1","v":100.0},{"n":"0,2","v":0.0},{"n":"junk","v":1.0}],"base":3700}"#;
+        let w = parse_win_sensor_line(line).unwrap();
+        // 143% of a 3.7 GHz base clock = 5.29 GHz; zero / malformed instances are skipped
+        assert_eq!(w.core_freq_mhz.len(), 2);
+        assert!((w.core_freq_mhz[0] - 5291.0).abs() < 1.0);
+        assert!((w.core_freq_mhz[1] - 3700.0).abs() < 1.0);
     }
 
     #[test]

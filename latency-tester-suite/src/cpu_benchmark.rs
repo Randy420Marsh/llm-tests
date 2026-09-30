@@ -412,7 +412,8 @@ impl CpuBenchmark {
             latency_ns: avg_latency_ns,
             instructions_per_cycle: None, // Would need PMU
             cycles_per_operation: None,
-            frequency_mhz: avg_freq,
+            // Sampler clocks (real, per CPU) beat the single nominal value sysinfo reports on Windows
+            frequency_mhz: telemetry.cpu_freq_avg_mhz.map(|f| f as u64).filter(|f| *f > 0).unwrap_or(avg_freq),
             temperature_c: telemetry.cpu_temp_max_c,
             power_watts: None,
             iteration_results,

@@ -6,6 +6,7 @@ use egui::{Color32, RichText, Ui};
 use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoints, Points};
 use std::collections::{BTreeMap, HashSet};
 
+use super::input_ui::RunRecord;
 use super::{human_size, LatencyTesterApp};
 use crate::cpu_benchmark::CpuBenchmarkResult;
 use crate::gpu_benchmark::GpuBenchmarkResult;
@@ -95,7 +96,9 @@ const GPU_METRICS: [Metric; 5] = [
     ("gops", "Throughput", "GOPS"),
     ("min_ms", "Best dispatch", "ms"),
 ];
-const INPUT_METRICS: [Metric; 6] = [
+const INPUT_METRICS: [Metric; 8] = [
+    ("trial_ms", "Trial latency", "ms"),
+    ("trial_corrected_ms", "Trial latency (rig-corrected)", "ms"),
     ("avg_ms", "Average", "ms"),
     ("p99_ms", "p99", "ms"),
     ("max_ms", "Worst", "ms"),
@@ -164,6 +167,24 @@ pub(super) fn memory_rows(results: &[MemoryBenchmarkResult]) -> Vec<Row> {
             }
         })
         .collect()
+}
+
+/// One line per click / key-press run; x is the trial number
+pub(super) fn manual_rows(runs: &[RunRecord]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (ri, r) in runs.iter().enumerate() {
+        let s = &r.summary;
+        let series = format!("{} · {} #{}", s.kind.label(), if s.robot { "robot" } else { "human" }, ri + 1);
+        for (i, ms) in s.samples_ms.iter().enumerate() {
+            let mut v = BTreeMap::new();
+            v.insert("trial_ms", *ms);
+            if s.robot {
+                v.insert("trial_corrected_ms", r.corrected(*ms).minus_robot_and_display_ms);
+            }
+            rows.push(Row { series: series.clone(), x: (i + 1) as f64, x_label: format!("trial {}", i + 1), values: v });
+        }
+    }
+    rows
 }
 
 pub(super) fn cpu_rows(results: &[CpuBenchmarkResult]) -> Vec<Row> {
@@ -384,7 +405,11 @@ impl LatencyTesterApp {
             Dataset::Memory => memory_rows(&self.mem_progress.lock().unwrap().completed),
             Dataset::Cpu => cpu_rows(&self.cpu_partial.lock().unwrap()),
             Dataset::Gpu => gpu_rows(&self.gpu_partial.lock().unwrap()),
-            Dataset::Input => self.last_input_result.as_ref().map(|s| input_rows(&s.results)).unwrap_or_default(),
+            Dataset::Input => {
+                let mut rows = manual_rows(&self.input_test.runs);
+                rows.extend(self.last_input_result.as_ref().map(|s| input_rows(&s.results)).unwrap_or_default());
+                rows
+            }
             Dataset::Sensors => Vec::new(),
         }
     }
@@ -826,6 +851,25 @@ mod tests {
         let csv = to_csv(&[&row], &[MEMORY_METRICS[0], MEMORY_METRICS[1]]);
         assert_eq!(csv.lines().next().unwrap(), "series,x,Latency / access (ns),Bandwidth (GB/s)");
         assert_eq!(csv.lines().nth(1).unwrap(), "\"a\",\"1 MB\",,2");
+    }
+
+    #[test]
+    fn manual_runs_become_one_line_each_with_corrected_values() {
+        use crate::input_test::{summarize, InputKind};
+        use crate::rig::RigCalibration;
+        let human = RunRecord { summary: summarize(InputKind::MouseClick, false, &[200.0, 210.0], 0, 0, (500.0, 2000.0)), cal: RigCalibration::default() };
+        let robot = RunRecord {
+            summary: summarize(InputKind::KeyPress, true, &[30.0, 32.0, 31.0], 0, 0, (500.0, 2000.0)),
+            cal: RigCalibration { keyboard_robot_ms: 6.0, subtract_robot: true, ..Default::default() },
+        };
+        let rows = manual_rows(&[human, robot]);
+        assert_eq!(rows.len(), 5);
+        assert!(rows[0].series.starts_with("Mouse click · human"));
+        assert!(!rows[0].values.contains_key("trial_corrected_ms"));
+        assert_eq!(rows[2].series, "Keyboard press · robot #2");
+        assert_eq!(rows[2].values["trial_ms"], 30.0);
+        assert_eq!(rows[2].values["trial_corrected_ms"], 24.0);
+        assert_eq!(rows[4].x, 3.0);
     }
 
     #[test]

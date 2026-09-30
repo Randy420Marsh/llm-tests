@@ -143,7 +143,6 @@ pub fn parse_win_facts(json: &str) -> Option<WinFacts> {
 
 /// CPUID: is a hypervisor running underneath us? (leaf 1 ECX bit 31)
 #[cfg(target_arch = "x86_64")]
-#[allow(dead_code)]
 fn cpuid_hypervisor_present() -> bool {
     core::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
 }
@@ -152,6 +151,26 @@ fn cpuid_hypervisor_present() -> bool {
 #[allow(dead_code)]
 fn cpuid_hypervisor_present() -> bool {
     false
+}
+
+/// Hypervisor signature from CPUID leaf 0x40000000 ("VMwareVMware", "KVMKVMKVM", "Microsoft Hv", ...)
+#[cfg(target_arch = "x86_64")]
+pub fn hypervisor_vendor() -> Option<String> {
+    if !cpuid_hypervisor_present() {
+        return None;
+    }
+    let r = core::arch::x86_64::__cpuid(0x4000_0000);
+    let mut b = Vec::with_capacity(12);
+    for reg in [r.ebx, r.ecx, r.edx] {
+        b.extend_from_slice(&reg.to_le_bytes());
+    }
+    let s = String::from_utf8_lossy(&b).trim_end_matches('\0').to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn hypervisor_vendor() -> Option<String> {
+    None
 }
 
 /// CPU vendor string from CPUID leaf 0

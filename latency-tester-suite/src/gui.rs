@@ -3,22 +3,20 @@
 //! Tabs: Dashboard, Memory, CPU, GPU, Input Latency, Virtualization, Results
 
 use eframe::egui;
-use egui::{Color32, RichText, Ui, Sense};
-use rand::Rng;
-use serde_json::json;
+use egui::{Color32, RichText, Ui};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 mod core_select;
+mod input_ui;
 mod memory_ui;
 mod results_ui;
 mod suites_ui;
 
 use crate::cancel::{self, CancelFlag};
 use crate::gpu_benchmark::GpuBenchmarkConfig;
-use crate::input_latency::{InputLatencyTester, InputLatencyConfig, InputTestMode, measure_timer_resolution, TimerResolutionInfo};
 use crate::memory_benchmark::{MemoryBenchmarkConfig, MemoryBenchmarkSummary, QuickMemoryResult};
 use crate::result_logger::{ResultLogger, VerifiedResult, generate_shareable_summary};
 use crate::system_info::SystemInfo;
@@ -56,6 +54,9 @@ pub struct LatencyTesterApp {
     last_input_result: Option<crate::input_latency::InputLatencySummary>,
     last_logged: Option<(VerifiedResult, crate::result_logger::VerificationResult)>,
     all_results: Option<Vec<VerifiedResult>>,
+    last_mem_config: Option<MemoryBenchmarkConfig>,
+    last_cpu_config: Option<crate::cpu_benchmark::CpuBenchmarkConfig>,
+    last_gpu_config: Option<GpuBenchmarkConfig>,
     
     // Running task (completed tasks are stored in pending)
     running: Arc<std::sync::Mutex<Option<RunningTaskState>>>,
@@ -90,26 +91,16 @@ pub struct LatencyTesterApp {
     gpu_custom_k: u32,
     
     // Input latency interactive state
-    input_tester: InputLatencyTester,
-    input_state: InputState,
-    input_waiting_until: Option<f64>,  // Instant seconds since app start
-    ready_time_ticks: u64,
-    input_start_time: Instant,
-    click_samples: Vec<f64>,
-    last_click_latency: Option<f64>,
-    timer_info: Option<TimerResolutionInfo>,
     show_log_panel: bool,
+    input_test: input_ui::InputTestUi,
+    display_whole_area: bool,
     log_text: String,
-}
-
-#[derive(Default, Clone, Copy, PartialEq)]
-enum InputState {
-    #[default]
-    Idle,       // Press space / click to start
-    Waiting,    // Red screen - wait for green
-    Ready,      // Green screen - CLICK NOW
-    Result,     // Show result
-    FalseStart, // Clicked too early
+    log_saved_note: String,
+    web_server: Option<crate::server::Server>,
+    web_port: u16,
+    web_lan: bool,
+    web_note: String,
+    results_dir_path: std::path::PathBuf,
 }
 
 #[allow(dead_code)] // kept for display/diagnostics
@@ -137,7 +128,6 @@ impl LatencyTesterApp {
         ).ok();
         
         let core_kinds = crate::topology::detect_core_kinds();
-        let input_tester = InputLatencyTester::new(InputLatencyConfig::default());
         
         Self {
             tab: Tab::Dashboard,
@@ -152,6 +142,9 @@ impl LatencyTesterApp {
             last_input_result: None,
             last_logged: None,
             all_results: None,
+            last_mem_config: None,
+            last_cpu_config: None,
+            last_gpu_config: None,
             running: Arc::new(std::sync::Mutex::new(None)),
             cancel: cancel::new_flag(),
             quick_mem_result: None,
@@ -176,27 +169,38 @@ impl LatencyTesterApp {
             sensor_probe: None,
             gpu_config: GpuBenchmarkConfig::default(),
             gpu_custom_k: 512,
-            input_tester,
-            input_state: InputState::Idle,
-            input_waiting_until: None,
-            input_start_time: Instant::now(),
-            click_samples: Vec::new(),
-            last_click_latency: None,
-            ready_time_ticks: 0,
-            timer_info: None,
             show_log_panel: true,
+            input_test: input_ui::InputTestUi::new(),
+            display_whole_area: false,
             log_text: String::new(),
+            log_saved_note: String::new(),
+            web_server: None,
+            web_port: 8787,
+            web_lan: false,
+            web_note: String::new(),
+            results_dir_path: config_dir.clone(),
         }
+    }
+
+    /// Folder holding the signed result files (next to the executable)
+    fn results_dir(&self) -> std::path::PathBuf {
+        self.results_dir_path.clone()
     }
 
     fn log(&mut self, msg: &str) {
         let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
-        self.log_text = format!("[{}] {}\n{}", timestamp, msg, self.log_text);
-        if self.log_text.len() > 60_000 {
-            // Keep log bounded
-            // Newest entries come first, so drop the tail (on a line boundary)
-            let cut = self.log_text[..40_000].rfind('\n').unwrap_or(40_000);
-            self.log_text.truncate(cut + 1);
+        if !self.log_text.is_empty() {
+            self.log_text.push('\n');
+        }
+        self.log_text.push_str(&format!("[{}] {}", timestamp, msg));
+        if self.log_text.len() > 200_000 {
+            // Keep the log bounded: drop the oldest lines (on a line boundary)
+            let mut cut = self.log_text.len() - 150_000;
+            while !self.log_text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            let cut = self.log_text[cut..].find('\n').map(|i| cut + i + 1).unwrap_or(cut);
+            self.log_text.drain(..cut);
         }
     }
 
@@ -208,7 +212,7 @@ impl LatencyTesterApp {
 
         // Collected on a worker thread so the GUI never blocks; picked up in check_completed_tasks
         thread::spawn(|| {
-            let sys = crate::system_info::collect_system_info();
+            let sys = crate::system_info::collect_system_info_fresh();
             let virt = VirtualizationDetector::detect();
             COMPLETE_SYSINFO.lock().unwrap().replace((sys, virt));
         });
@@ -371,146 +375,62 @@ impl LatencyTesterApp {
         }
     }
 
-    fn log_last_result(&mut self) {
-        let logger = match &self.logger {
-            Some(l) => l,
-            None => {
-                self.log("No result logger available");
-                return;
-            }
-        };
-        
-        let sys_info = match &self.system_info {
-            Some(s) => s,
-            None => {
-                self.log("No system info collected yet");
-                return;
-            }
-        };
-        
-        let (test_type, config, results) = if let Some(r) = &self.last_memory_result {
-            ("memory", json!(r), json!(r))
-        } else if let Some(r) = &self.last_cpu_result {
-            ("cpu", json!(r), json!(r))
-        } else if let Some(r) = &self.last_input_result {
-            ("input", json!(r), json!(r))
-        } else if let Some(r) = &self.last_gpu_result {
-            ("gpu", json!(r), json!(r))
-        } else {
-            self.log("Run a benchmark first to log results");
+    /// Sign and save the current session (or one suite of it) as a single record
+    fn log_session(&mut self, scope: crate::session::Scope) {
+        use crate::session::{self, SessionData};
+        let Some(logger) = &self.logger else {
+            self.log("No result logger available");
             return;
         };
-        
-        let metadata: HashMap<String, String> = HashMap::new();
-        
-        match logger.log_result(test_type, sys_info, &config, &results, metadata) {
+        let Some(sys_info) = &self.system_info else {
+            self.log("No system info collected yet");
+            return;
+        };
+
+        let (mem, mem_planned) = {
+            let p = self.mem_progress.lock().unwrap();
+            (p.completed.clone(), p.total_tests)
+        };
+        let cpu = self.cpu_partial.lock().unwrap().clone();
+        let gpu = self.gpu_partial.lock().unwrap().clone();
+        let trials: Vec<_> = self.input_test.runs.iter().map(|r| (r.summary.clone(), r.cal.clone())).collect();
+        let virtualization = self.virt_status.as_ref().and_then(|v| serde_json::to_value(v).ok());
+        let data = SessionData {
+            memory_config: self.last_mem_config.as_ref(),
+            memory: &mem,
+            memory_planned: mem_planned,
+            cpu_config: self.last_cpu_config.as_ref(),
+            cpu_topology: self.last_cpu_result.as_ref().map(|s| &s.core_topology),
+            cpu: &cpu,
+            gpu_config: self.last_gpu_config.as_ref(),
+            gpu_vulkan: self.last_gpu_result.as_ref().map(|s| &s.vulkan_info),
+            gpu: &gpu,
+            input_suite: self.last_input_result.as_ref(),
+            trials: &trials,
+            timeline: &self.last_timeline,
+            sensor_notes: &self.sensor_notes,
+            virtualization,
+            calibration: Some(&self.input_test.cal),
+        };
+        if !session::has_data(&data, scope) {
+            self.log("Nothing to log yet: run a test first");
+            return;
+        }
+        let (config, results) = session::build(&data, scope);
+        match logger.log_result(scope.test_type(), sys_info, &config, &results, HashMap::new()) {
             Ok(verified) => {
                 let verification = logger.verify_result(&verified);
+                let parts: Vec<String> = results.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
                 self.last_logged = Some((verified.clone(), verification.clone()));
                 self.log(&format!(
-                    "Result logged and verified: {} (signature: {}...)",
+                    "Logged {} ({}): {} (signature {}…)",
+                    scope.test_type(),
+                    parts.join(", "),
                     verification.message,
                     &verified.signature.sig[..16]
                 ));
             }
-            Err(e) => {
-                self.log(&format!("Failed to log result: {}", e));
-            }
-        }
-    }
-
-    /// Handle the interactive input latency test (click reaction)
-    fn handle_input_test(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let now = self.input_start_time.elapsed().as_secs_f64();
-        
-        // Reserve the test area first so pointer presses can be limited to it
-        let rect = ui.available_rect_before_wrap();
-        let _response = ui.allocate_rect(rect, Sense::click());
-
-        // React on press (not release) to measure true input latency
-        let space_pressed = ui.input(|i| i.key_pressed(egui::Key::Space));
-        let pointer_clicked = ui.input(|i| {
-            i.pointer.primary_pressed()
-                && i.pointer.interact_pos().map_or(false, |p| rect.contains(p))
-        });
-        
-        // State machine
-        match self.input_state {
-            InputState::Idle | InputState::Result | InputState::FalseStart => {
-                if space_pressed || pointer_clicked {
-                    // Start: random delay 1.5-4 seconds
-                    let mut rng = rand::thread_rng();
-                    let delay = rng.gen_range(1.5..4.0); // seconds
-                    self.input_waiting_until = Some(now + delay);
-                    self.input_state = InputState::Waiting;
-                    self.last_click_latency = None;
-                }
-            }
-            InputState::Waiting => {
-                if space_pressed || pointer_clicked {
-                    self.input_state = InputState::FalseStart;
-                    self.last_click_latency = None;
-                }
-                
-                if self.input_waiting_until.map(|t| now >= t).unwrap_or(false) {
-                    // Switch to Ready - record trigger time with QPC
-                    self.input_state = InputState::Ready;
-                    self.input_tester.trigger_stimulus(InputTestMode::MouseClick);
-                    self.ready_time_ticks = self.input_tester.timer.now_ticks();
-                }
-            }
-            InputState::Ready => {
-                if space_pressed || pointer_clicked {
-                    // Record click time - compute latency
-                    let click_ticks = self.input_tester.timer.now_ticks();
-                    let latency_ms = self
-                        .input_tester
-                        .timer
-                        .ticks_to_ms_f64(click_ticks.saturating_sub(self.ready_time_ticks));
-                    self.last_click_latency = Some(latency_ms);
-                    self.click_samples.push(latency_ms);
-                    self.input_state = InputState::Result;
-                    self.log(&format!("Click reaction: {:.3} ms (sample #{})", latency_ms, self.click_samples.len()));
-                }
-            }
-        }
-        
-        // Render the test area
-        let color = match self.input_state {
-            InputState::Idle => Color32::from_rgb(40, 40, 40),
-            InputState::Waiting => Color32::from_rgb(180, 50, 50),
-            InputState::Ready => Color32::from_rgb(50, 190, 50),
-            InputState::Result => Color32::from_rgb(50, 50, 180),
-            InputState::FalseStart => Color32::from_rgb(150, 150, 50),
-        };
-        
-        ui.painter().rect_filled(rect, 8.0, color);
-        
-        let (text, text_color) = match self.input_state {
-            InputState::Idle => ("Click or press SPACE to start".to_string(), Color32::WHITE),
-            InputState::Waiting => ("Wait for GREEN...".to_string(), Color32::WHITE),
-            InputState::Ready => ("CLICK NOW!".to_string(), Color32::WHITE),
-            InputState::Result => {
-                let lat = self.last_click_latency.unwrap_or(0.0);
-                let avg = if self.click_samples.is_empty() { 0.0 } else {
-                    self.click_samples.iter().sum::<f64>() / self.click_samples.len() as f64
-                };
-                let text = format!(
-                    "Latency: {:.3} ms\nAverage ({}): {:.3} ms\n\nPress SPACE to go again",
-                    lat, self.click_samples.len(), avg
-                );
-                (text, Color32::WHITE)
-            }
-            InputState::FalseStart => ("Too early! Click / SPACE to try again".to_string(), Color32::WHITE),
-        };
-        
-        let center = rect.center();
-        ui.painter()
-            .text(center, egui::Align2::CENTER_CENTER, &text, egui::FontId::proportional(28.0), text_color);
-
-        // The state machine is time driven, so keep frames coming while a round is active
-        if matches!(self.input_state, InputState::Waiting | InputState::Ready) {
-            ctx.request_repaint();
+            Err(e) => self.log(&format!("Failed to log result: {}", e)),
         }
     }
 
@@ -526,8 +446,11 @@ impl LatencyTesterApp {
                 ui.end_row();
                 
                 ui.label("Cores/Threads:");
-                ui.label(format!("{} physical / {} logical (P: {}, E: {})", 
-                    sys.cpu.cores, sys.cpu.threads, sys.cpu.p_cores, sys.cpu.e_cores));
+                ui.label(if sys.cpu.e_cores > 0 {
+                    format!("{} physical / {} logical (P: {}, E: {})", sys.cpu.cores, sys.cpu.threads, sys.cpu.p_cores, sys.cpu.e_cores)
+                } else {
+                    format!("{} physical / {} logical", sys.cpu.cores, sys.cpu.threads)
+                });
                 ui.end_row();
                 
                 ui.label("Architecture:");
@@ -708,83 +631,6 @@ impl LatencyTesterApp {
         }
     }
 
-    fn render_input_tab(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        ui.heading("Input Latency Test");
-        ui.separator();
-        
-        // Timer resolution info
-        if self.timer_info.is_none() {
-            if let Ok(info) = measure_timer_resolution() {
-                self.timer_info = Some(info);
-            }
-        }
-        if let Some(info) = &self.timer_info {
-            ui.horizontal(|ui| {
-                ui.label(format!("Timer: {} Hz ({} ns resolution)", info.frequency_hz, info.resolution_ns));
-                ui.label(format!("min measurable: {} ns", info.min_measurable_interval_ns));
-                ui.label(format!("overhead: {} ns", info.overhead_ns));
-            });
-        }
-        
-        // Interactive test area
-        let available = ui.available_size();
-        let test_height = (available.y * 0.5).max(200.0);
-        egui::ScrollArea::both().show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.allocate_ui(egui::vec2(available.x, test_height), |ui| {
-                    self.handle_input_test(ui, ctx);
-                });
-                
-                // Statistics
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if !self.click_samples.is_empty() {
-                        let avg = self.click_samples.iter().sum::<f64>() / self.click_samples.len() as f64;
-                        let mut sorted = self.click_samples.clone();
-                        sorted.sort_by(|a, b| a.total_cmp(b));
-                        let min = sorted[0];
-                        let max = *sorted.last().unwrap();
-                        let p95 = sorted[((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1)];
-                        
-                        ui.label(format!("Samples: {}", self.click_samples.len()));
-                        ui.label(format!("Min: {:.3} ms", min));
-                        ui.label(format!("Avg: {:.3} ms", avg));
-                        ui.label(format!("p95: {:.3} ms", p95));
-                        ui.label(format!("Max: {:.3} ms", max));
-                    }
-                    if ui.button("Clear Samples").clicked() {
-                        self.click_samples.clear();
-                        self.last_click_latency = None;
-                        self.input_state = InputState::Idle;
-                    }
-                    if ui.add_enabled(!self.is_running(), egui::Button::new("Run Full Input Suite")).clicked() {
-                        self.start_input_benchmark();
-                    }
-                    self.stop_button(ui);
-                });
-                self.input_suite_options(ui);
-            });
-        });
-        
-        if let Some(summary) = &self.last_input_result {
-            ui.separator();
-            ui.heading("Full Suite Results");
-            for result in &summary.results {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{:?}", result.mode));
-                    if let Some(c) = result.core {
-                        ui.label(format!("core {}", c));
-                    }
-                    ui.label(format!("avg: {:.3} ms", result.avg_latency_ms));
-                    ui.label(format!("p99: {:.3} ms", result.percentile_99_ms));
-                    if let Some(rate) = result.polling_rate_hz {
-                        ui.label(format!("polling: {:.0} Hz", rate));
-                    }
-                });
-            }
-        }
-    }
-
     fn render_virtualization_tab(&mut self, ui: &mut Ui) {
         ui.heading("Virtualization Settings");
         ui.separator();
@@ -852,9 +698,18 @@ impl LatencyTesterApp {
         ui.separator();
         
         ui.group(|ui| {
-            if ui.button("Log Latest Result (signed)").clicked() {
-                self.log_last_result();
-            }
+            ui.label(RichText::new("Sign and save (one record per click):").strong());
+            ui.horizontal_wrapped(|ui| {
+                use crate::session::Scope;
+                if ui.button(RichText::new("💾 Log everything").strong()).on_hover_text("All suites with data, manual click/key trials, sensors and virtualization state in one signed record").clicked() {
+                    self.log_session(Scope::Everything);
+                }
+                for (label, scope) in [("Memory", Scope::Memory), ("CPU", Scope::Cpu), ("GPU", Scope::Gpu), ("Input", Scope::Input), ("Sensors", Scope::Sensors)] {
+                    if ui.button(label).clicked() {
+                        self.log_session(scope);
+                    }
+                }
+            });
             
             if ui.button("Verify Entire Log (signatures + chain)").clicked() {
                 match self.logger.as_ref().map(|l| l.verify_log()) {
@@ -876,6 +731,8 @@ impl LatencyTesterApp {
             }
         });
         
+        self.web_viewer_panel(ui);
+
         if let Some((verified, verification)) = &self.last_logged {
             ui.separator();
             ui.heading("Last Logged Result");
@@ -910,23 +767,112 @@ impl LatencyTesterApp {
         }
     }
 
+    /// Browser view of the saved JSON results: a local read-only web server, or a standalone HTML file
+    fn web_viewer_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(6.0);
+        ui.group(|ui| {
+            ui.label(RichText::new("Web viewer for saved results").strong());
+            ui.label(RichText::new("Charts, tables and switches for every saved JSON file, in your browser. Read-only.").weak().small());
+            ui.horizontal_wrapped(|ui| {
+                let running = self.web_server.is_some();
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.label("Port:");
+                    ui.add(egui::DragValue::new(&mut self.web_port).range(1024..=65535));
+                    ui.checkbox(&mut self.web_lan, "allow other computers on my network")
+                        .on_hover_text("Listen on all network interfaces so another PC can open http://<this-pc>:<port>/. Anyone who can reach the port can read the results.");
+                });
+                if !running {
+                    if ui.button(RichText::new("▶ Start server and open in browser").strong()).clicked() {
+                        let bind = if self.web_lan { "0.0.0.0" } else { "127.0.0.1" };
+                        match crate::server::Server::start(self.results_dir(), bind, self.web_port) {
+                            Ok(server) => {
+                                let url = server.url();
+                                crate::server::open_in_browser(&url);
+                                self.web_note = format!("serving {}", url);
+                                self.log(&format!("Web viewer started: {}", url));
+                                self.web_server = Some(server);
+                            }
+                            Err(e) => {
+                                self.web_note = format!("could not start: {}", e);
+                                self.log(&format!("Web viewer failed to start: {}", e));
+                            }
+                        }
+                    }
+                } else if let Some(server) = &self.web_server {
+                    let url = server.url();
+                    if ui.button("Open in browser").clicked() {
+                        crate::server::open_in_browser(&url);
+                    }
+                    if ui.button(RichText::new("⏹ Stop server").color(Color32::from_rgb(255, 120, 120))).clicked() {
+                        self.web_server = None;
+                        self.web_note = "server stopped".into();
+                        self.log("Web viewer stopped");
+                    }
+                    let mut shown: &str = &url;
+                    ui.add(egui::TextEdit::singleline(&mut shown).desired_width(220.0));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Export HTML report").on_hover_text("One self-contained .html file with all saved results; opens offline and can be e-mailed").clicked() {
+                    let entries = crate::report::list(&self.results_dir());
+                    if entries.is_empty() {
+                        self.web_note = "no saved results to export yet".into();
+                    } else {
+                        let file = self.results_dir().join(format!("latency_report_{}.html", chrono::Local::now().format("%Y%m%d_%H%M%S")));
+                        match std::fs::write(&file, crate::report::render_static(&entries)) {
+                            Ok(()) => {
+                                self.web_note = format!("wrote {} result(s) to {}", entries.len(), file.display());
+                                crate::server::open_in_browser(&format!("file:///{}", file.to_string_lossy().replace('\\', "/")));
+                            }
+                            Err(e) => self.web_note = format!("could not write report: {}", e),
+                        }
+                    }
+                }
+                ui.label(RichText::new(&self.web_note).weak().small());
+            });
+        });
+    }
+
     fn render_log_panel(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label("Log:");
             ui.checkbox(&mut self.show_log_panel, "show");
+            if ui.button("Copy all").on_hover_text("Copy the whole log to the clipboard").clicked() {
+                ui.ctx().copy_text(self.log_text.clone());
+            }
+            if ui.button("Save…").on_hover_text("Write the log to latency_log.txt next to the program").clicked() {
+                let path = self.results_dir().join("latency_log.txt");
+                match std::fs::write(&path, &self.log_text) {
+                    Ok(()) => self.log_saved_note = format!("saved to {}", path.display()),
+                    Err(e) => self.log_saved_note = format!("could not save: {}", e),
+                }
+            }
             if ui.button("Clear").clicked() {
                 self.log_text.clear();
             }
+            ui.label(RichText::new(format!("{} lines · drag to select, Ctrl+A / Ctrl+C in the box", self.log_text.lines().count())).weak().small());
+            if !self.log_saved_note.is_empty() {
+                ui.label(RichText::new(&self.log_saved_note).weak().small());
+            }
         });
-        
+
         if self.show_log_panel {
+            // A read-only multi-line editor: selectable with the mouse, Ctrl+A selects everything,
+            // Ctrl+C copies the selection, and the panel can be dragged taller.
             egui::ScrollArea::vertical()
-                .auto_shrink([false, true])
-                .max_height(150.0)
+                .id_salt("log_scroll")
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for line in self.log_text.lines().take(100) {
-                        ui.label(egui::RichText::new(line).monospace().size(11.0));
-                    }
+                    let mut text: &str = &self.log_text;
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4)
+                            .frame(false)
+                            .id_salt("log_text"),
+                    );
                 });
         }
     }
@@ -961,9 +907,13 @@ impl eframe::App for LatencyTesterApp {
             });
         });
         
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
-            self.render_log_panel(ui);
-        });
+        egui::TopBottomPanel::bottom("bottom")
+            .resizable(true)
+            .min_height(70.0)
+            .default_height(150.0)
+            .show(ctx, |ui| {
+                self.render_log_panel(ui);
+            });
         
         egui::SidePanel::left("sidebar").resizable(true).show(ctx, |ui| {
             ui.heading("Tabs:");

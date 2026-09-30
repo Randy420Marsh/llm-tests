@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latency Tester — Results</title>
+<style>
+  :root { --bg:#16181d; --panel:#1e2128; --panel2:#262a33; --line:#343a46; --text:#dfe3ea; --dim:#8b93a3; --accent:#5ab0ff; --ok:#4cc38a; --bad:#ff6b6b; --warn:#f0b429; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .sub { color:var(--dim); font-size:12px; }
+  #layout { display:flex; min-height:calc(100vh - 50px); }
+  #side { width:300px; flex:none; background:var(--panel); border-right:1px solid var(--line); overflow:auto; max-height:calc(100vh - 50px); position:sticky; top:50px; }
+  #main { flex:1; min-width:0; padding:16px 20px 60px; }
+  .item { padding:8px 12px; border-bottom:1px solid var(--line); cursor:pointer; display:flex; gap:8px; align-items:flex-start; }
+  .item:hover { background:var(--panel2); }
+  .item.sel { background:#22344a; }
+  .item .t { font-size:12px; color:var(--dim); }
+  .badge { display:inline-block; padding:0 6px; border-radius:9px; font-size:11px; background:#38414f; margin-right:4px; }
+  .badge.ok { background:#1f4d3a; color:var(--ok); } .badge.bad { background:#552a2a; color:var(--bad); } .badge.warn { background:#4d3e14; color:var(--warn); }
+  h2 { font-size:17px; margin:26px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--line); }
+  h3 { font-size:14px; margin:16px 0 6px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin:10px 0; }
+  .grid { display:grid; grid-template-columns:max-content 1fr; gap:3px 16px; }
+  .grid .k { color:var(--dim); }
+  .row { display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center; margin:6px 0; }
+  label.chk { display:inline-flex; align-items:center; gap:5px; cursor:pointer; user-select:none; }
+  button, select, input[type=text] { background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:5px; padding:3px 9px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.small { padding:0 7px; font-size:12px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { padding:3px 10px; text-align:right; white-space:nowrap; border-bottom:1px solid #2a2f39; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align:left; }
+  th { color:var(--dim); font-weight:500; position:sticky; top:0; background:var(--panel); }
+  .scroll { overflow:auto; max-height:420px; border:1px solid var(--line); border-radius:6px; }
+  svg text { fill:var(--dim); font-size:11px; }
+  .chartwrap { background:#12141a; border:1px solid var(--line); border-radius:8px; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 14px; padding:6px 10px; }
+  .sw { width:11px; height:11px; border-radius:2px; display:inline-block; }
+  pre { background:#12141a; padding:10px; border-radius:6px; overflow:auto; max-height:360px; font-size:12px; }
+  .warn { color:var(--warn); } .bad { color:var(--bad); } .ok { color:var(--ok); }
+  #empty { color:var(--dim); padding:40px 0; text-align:center; }
+  a { color:var(--accent); }
+  @media (max-width:800px){ #layout{flex-direction:column;} #side{width:auto;position:static;max-height:220px;} }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Latency Tester — Results</h1>
+  <span class="sub" id="source"></span>
+  <span style="flex:1"></span>
+  <button id="btnRefresh" title="Reload the list from the server">Refresh</button>
+</header>
+<div id="layout">
+  <div id="side"><div class="row" style="padding:8px 12px;margin:0"><select id="typeFilter"><option value="">all types</option></select><label class="chk"><input type="checkbox" id="compareMode"> compare</label></div><div id="list"></div></div>
+  <div id="main"><div id="empty">Loading…</div></div>
+</div>
+<script id="embedded" type="application/json">/*__EMBEDDED__*/null</script>
+<script>
+'use strict';
+// ------------------------------------------------------------------------------------------------
+// helpers
+// ------------------------------------------------------------------------------------------------
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const PALETTE = ['#56b4e9','#e69f00','#009e73','#f0e442','#cc79a7','#d55e00','#9696ff','#78dc78','#ff8282','#b482ff','#5adcdc','#c8c8c8'];
+const colorOf = i => PALETTE[i % PALETTE.length];
+function humanSize(b) { if (b >= 2**30) return (b/2**30).toFixed(b % 2**30 ? 1 : 0)+' GB'; if (b >= 2**20) return (b/2**20).toFixed(0)+' MB'; if (b >= 1024) return (b/1024).toFixed(0)+' KB'; return b+' B'; }
+function fmt(v, unit) {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  const a = Math.abs(v);
+  const s = Number.isInteger(v) && a < 1e9 ? String(v) : a >= 1000 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : a >= 1 ? v.toFixed(2) : v.toFixed(3);
+  return unit ? s + ' ' + unit : s;
+}
+function patternLabel(p) {
+  if (typeof p === 'string') return p;
+  const k = Object.keys(p || {})[0];
+  return k ? (p[k] && p[k].stride ? `${k}(${p[k].stride} B)` : k) : '?';
+}
+const isPow2 = n => Number.isInteger(n) && n > 0 && n < 2**53 && (n & (n - 1)) === 0 || (Number.isInteger(n) && n > 0 && n < 2**53 && Math.log2(n) % 1 === 0);
+
+// ------------------------------------------------------------------------------------------------
+// metric catalogues (mirrors the desktop app's Results & Graphs tab)
+// ------------------------------------------------------------------------------------------------
+const TELEMETRY = [
+  ['cpu_temp_max','CPU temp (max)','°C'],['cpu_temp_avg','CPU temp (avg)','°C'],['hottest_core','Hottest core','°C'],
+  ['cpu_freq','CPU clock (avg)','MHz'],['cpu_usage','CPU load (avg)','%'],['ram_used','RAM used (max)','MB'],
+  ['gpu_temp','GPU temp (max)','°C'],['gpu_util','GPU load (avg)','%'],['gpu_clock','GPU clock (avg)','MHz'],
+  ['gpu_power','GPU power (max)','W'],['vram_used','VRAM used (max)','MB'],['vram_total','VRAM total','MB'],
+];
+function telemetryValues(t) {
+  const v = {};
+  if (!t || !t.samples) return v;
+  const put = (k, x) => { if (x !== null && x !== undefined) v[k] = x; };
+  put('cpu_temp_max', t.cpu_temp_max_c); put('cpu_temp_avg', t.cpu_temp_avg_c);
+  if (t.core_temp_max_c && t.core_temp_max_c.length) put('hottest_core', Math.max(...t.core_temp_max_c.map(c => c[1])));
+  put('cpu_freq', t.cpu_freq_avg_mhz); put('cpu_usage', t.cpu_usage_avg_pct); put('ram_used', t.ram_used_max_mb);
+  put('gpu_temp', t.gpu_temp_max_c); put('gpu_util', t.gpu_util_avg_pct); put('gpu_clock', t.gpu_clock_avg_mhz);
+  put('gpu_power', t.gpu_power_max_w); put('vram_used', t.vram_used_max_mb); put('vram_total', t.vram_total_mb);
+  return v;
+}
+const KINDS = {
+  memory: {
+    title: 'Memory', logX: true,
+    metrics: [['ns_per_access','Latency / access','ns'],['bandwidth','Bandwidth','GB/s'],['avg_run','Avg run','ms'],['p99_run','p99 run','ms'],['min_run','Best run','ms'],['runs','Runs','']].concat(TELEMETRY),
+    rows(sec) { return (sec.results || []).map(r => ({
+      series: `${patternLabel(r.pattern)} · ${r.thread_count}T` + (r.cores && !String(r.cores).startsWith('All cores') ? ` · ${r.cores}` : ''),
+      x: Math.log2(r.size), xLabel: humanSize(r.size),
+      values: Object.assign({ ns_per_access: r.ns_per_access, bandwidth: r.bandwidth_gb_s, avg_run: r.latency_ns/1e6, p99_run: r.percentile_99_ns/1e6, min_run: r.min_latency_ns/1e6, runs: r.iterations }, telemetryValues(r.telemetry)),
+    })); },
+  },
+  cpu: {
+    title: 'CPU',
+    metrics: [['mcalls','Throughput','M calls/s'],['ns_per_call','Time per call','ns'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
+    rows(sec) { return (sec.results || []).map((r, i) => {
+      const mask = Number(r.core_mask);
+      const single = Number.isFinite(mask) && mask > 0 && mask < 2**53 && Math.log2(mask) % 1 === 0 ? Math.log2(mask) : null;
+      const v = Object.assign({ mcalls: r.operations_per_second/1e6, ns_per_call: r.latency_ns, threads: r.thread_count }, telemetryValues(r.telemetry));
+      if (r.frequency_mhz > 0) v.clock = r.frequency_mhz;
+      if (single !== null && r.telemetry && r.telemetry.core_temp_max_c) { const t = r.telemetry.core_temp_max_c.find(c => c[0] === single); if (t) v.this_core_temp = t[1]; }
+      return { series: String(r.workload), x: single !== null ? single : i, xLabel: r.cores || (single !== null ? `Core ${single}` : `#${i+1}`), values: v };
+    }); },
+  },
+  gpu: {
+    title: 'GPU (Vulkan compute)', logX: true,
+    metrics: [['avg_ms','Avg dispatch','ms'],['p95_ms','p95 dispatch','ms'],['p99_ms','p99 dispatch','ms'],['min_ms','Best dispatch','ms'],['gops','Throughput','GOPS']].concat(TELEMETRY),
+    rows(sec) { return (sec.results || []).map(r => ({
+      series: 'GPU compute', x: Math.log2(r.workload_size), xLabel: `${r.workload_size} elements`,
+      values: Object.assign({ avg_ms: r.avg_latency_ms, p95_ms: r.percentile_95_ms, p99_ms: r.percentile_99_ms, min_ms: r.min_latency_ms, gops: r.throughput_geops }, telemetryValues(r.telemetry)),
+    })); },
+  },
+  input_timing_suite: {
+    title: 'Input timing suite',
+    metrics: [['avg_ms','Average','ms'],['p99_ms','p99','ms'],['max_ms','Worst','ms'],['jitter_ms','Jitter','ms'],['polling_hz','Loop rate','Hz'],['samples','Samples','']].concat(TELEMETRY),
+    rows(sec) { return (sec.results || []).map((r, i) => ({
+      series: String(r.mode), x: r.core ?? i, xLabel: r.core !== null && r.core !== undefined ? `core ${r.core}` : 'OS scheduled',
+      values: Object.assign({ avg_ms: r.avg_latency_ms, p99_ms: r.percentile_99_ms, max_ms: r.max_latency_ms, jitter_ms: r.jitter_ms, samples: r.sample_count, ...(r.polling_rate_hz ? { polling_hz: r.polling_rate_hz } : {}) }, telemetryValues(r.telemetry)),
+    })); },
+  },
+  input_trials: {
+    title: 'Click / key-press trials',
+    metrics: [['trial_ms','Trial latency','ms'],['trial_corrected_ms','Trial latency (rig-corrected)','ms']],
+    rows(sec) {
+      const rows = [];
+      (sec.runs || []).forEach((run, ri) => {
+        const s = run.summary || {};
+        const name = `${s.kind === 'KeyPress' ? 'Keyboard press' : 'Mouse click'} · ${s.robot ? 'robot' : 'human'} #${ri + 1}`;
+        const cal = run.calibration_used || {};
+        const off = s.robot && cal.subtract_robot ? (s.kind === 'KeyPress' ? cal.keyboard_robot_ms : cal.mouse_robot_ms) : 0;
+        const off2 = s.robot && cal.subtract_display ? cal.display_ms : 0;
+        (s.samples_ms || []).forEach((ms, i) => rows.push({ series: name, x: i + 1, xLabel: `trial ${i + 1}`, values: Object.assign({ trial_ms: ms }, s.robot ? { trial_corrected_ms: ms - off - off2 } : {}) }));
+      });
+      return rows;
+    },
+  },
+};
+
+// ------------------------------------------------------------------------------------------------
+// state
+// ------------------------------------------------------------------------------------------------
+const state = {
+  list: [],             // [{name, timestamp, test_type, app_version, valid, message}]
+  docs: new Map(),      // name -> parsed VerifiedResult
+  selected: [],         // names
+  hiddenSeries: new Set(), hiddenCols: new Set(), chartMetric: {},
+  opts: { zeroY: true, logY: false, markers: true },
+  sensorGroup: 'temps',
+  serverMode: false,
+};
+
+async function loadList() {
+  const emb = JSON.parse($('#embedded').textContent || 'null');
+  if (emb) {
+    state.serverMode = false;
+    $('#source').textContent = 'static report · ' + emb.length + ' result(s)';
+    $('#btnRefresh').style.display = 'none';
+    state.list = emb.map(e => e.meta);
+    emb.forEach(e => state.docs.set(e.meta.name, e.doc));
+  } else {
+    state.serverMode = true;
+    const res = await fetch('/api/results');
+    state.list = await res.json();
+    $('#source').textContent = 'live from ' + location.host + ' · ' + state.list.length + ' result(s)';
+  }
+  const types = [...new Set(state.list.map(m => m.test_type))].sort();
+  $('#typeFilter').innerHTML = '<option value="">all types</option>' + types.map(t => `<option>${esc(t)}</option>`).join('');
+  renderList();
+  if (!state.selected.length && state.list.length) select(state.list[0].name, false);
+  else render();
+}
+
+async function getDoc(name) {
+  if (state.docs.has(name)) return state.docs.get(name);
+  // names are limited to [A-Za-z0-9._+-] by the server, so no URL encoding is needed ('+' would become %2B)
+  const r = await fetch('/api/result/' + name);
+  if (!r.ok) throw new Error(`${name}: HTTP ${r.status}`);
+  const doc = await r.json();
+  state.docs.set(name, doc);
+  return doc;
+}
+
+function renderList() {
+  const filter = $('#typeFilter').value;
+  const items = state.list.filter(m => !filter || m.test_type === filter);
+  $('#list').innerHTML = items.length ? items.map(m => {
+    const sel = state.selected.includes(m.name);
+    const v = m.valid === true ? '<span class="badge ok">✓ signed</span>' : m.valid === false ? `<span class="badge bad" title="${esc(m.message)}">✗ invalid</span>` : '';
+    return `<div class="item ${sel ? 'sel' : ''}" data-name="${esc(m.name)}"><div><div><span class="badge">${esc(m.test_type)}</span>${v}</div><div class="t">${esc((m.timestamp || '').replace('T', ' ').slice(0, 19))} · v${esc(m.app_version || '?')}</div></div></div>`;
+  }).join('') : '<div style="padding:14px;color:var(--dim)">No results found.</div>';
+  document.querySelectorAll('.item').forEach(el => el.onclick = () => select(el.dataset.name, $('#compareMode').checked));
+}
+
+async function select(name, multi) {
+  if (multi) {
+    const i = state.selected.indexOf(name);
+    if (i >= 0) state.selected.splice(i, 1); else state.selected.push(name);
+  } else state.selected = [name];
+  renderList();
+  try {
+    await Promise.all(state.selected.map(getDoc));
+    render();
+  } catch (e) {
+    $('#main').innerHTML = `<div id="empty" class="bad">Could not load the selected result: ${esc(e.message)}</div>`;
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// document -> sections
+// ------------------------------------------------------------------------------------------------
+function sectionsOf(doc) {
+  const p = doc.payload || {}; const br = p.benchmark_results || {}; const t = p.test_type;
+  const known = ['memory','cpu','gpu','input_timing_suite','input_trials','sensors','virtualization'];
+  if (t === 'session' || known.some(k => br[k] !== undefined && typeof br[k] === 'object')) {
+    const s = {}; known.forEach(k => { if (br[k] !== undefined) s[k] = br[k]; }); return s;
+  }
+  // older single-suite files: benchmark_results is the suite's summary
+  if (t === 'input') return { input_timing_suite: br };
+  if (br && Array.isArray(br.results)) return { [t]: br };
+  return {};
+}
+const docLabel = (doc, name) => (doc.header.timestamp || name || '').replace('T', ' ').slice(5, 19);
+
+// ------------------------------------------------------------------------------------------------
+// charts (plain SVG)
+// ------------------------------------------------------------------------------------------------
+function niceTicks(lo, hi, n = 6) {
+  if (!(hi > lo)) return [lo];
+  const span = hi - lo, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= step0) || step0;
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(12)); return out;
+}
+function drawChart(lines, o) {
+  // lines: [{name, color, pts:[[x,y]], labels?:Map}], o: {xLabel, yLabel, xFmt, logY, zeroY, markers, xTicks?}
+  const W = 940, H = 330, L = 64, R = 16, T = 12, B = 44;
+  let all = lines.flatMap(l => l.pts);
+  if (o.logY) all = all.filter(p => p[1] > 0).map(p => [p[0], Math.log10(p[1])]);
+  if (!all.length) return '<div style="padding:30px;color:var(--dim)">Nothing to plot for this selection.</div>';
+  let xmin = Math.min(...all.map(p => p[0])), xmax = Math.max(...all.map(p => p[0]));
+  let ymin = Math.min(...all.map(p => p[1])), ymax = Math.max(...all.map(p => p[1]));
+  if (o.zeroY && !o.logY) ymin = Math.min(0, ymin);
+  if (xmax === xmin) { xmin -= 0.5; xmax += 0.5; }
+  if (ymax === ymin) { ymax += Math.abs(ymax) * 0.1 || 1; ymin -= o.zeroY && !o.logY ? 0 : Math.abs(ymin) * 0.1; }
+  const pad = (ymax - ymin) * 0.06; ymax += pad; if (!(o.zeroY && !o.logY)) ymin -= pad;
+  const sx = x => L + (x - xmin) / (xmax - xmin) * (W - L - R);
+  const sy = y => H - B - (y - ymin) / (ymax - ymin) * (H - T - B);
+  let g = '';
+  for (const t of niceTicks(ymin, ymax)) {
+    const label = o.logY ? fmt(10 ** t) : fmt(t);
+    g += `<line x1="${L}" x2="${W - R}" y1="${sy(t)}" y2="${sy(t)}" stroke="#2a2f39"/><text x="${L - 6}" y="${sy(t) + 4}" text-anchor="end">${label}</text>`;
+  }
+  const xt = o.xTicks ? o.xTicks.filter(t => t >= xmin - 1e-9 && t <= xmax + 1e-9) : niceTicks(xmin, xmax, 8);
+  for (const t of xt) g += `<line x1="${sx(t)}" x2="${sx(t)}" y1="${T}" y2="${H - B}" stroke="#20242c"/><text x="${sx(t)}" y="${H - B + 15}" text-anchor="middle">${esc(o.xFmt ? o.xFmt(t) : fmt(t))}</text>`;
+  g += `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="none" stroke="#3a404c"/>`;
+  g += `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">${esc(o.xLabel || '')}</text>`;
+  g += `<text transform="translate(14 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">${esc(o.yLabel || '')}${o.logY ? ' (log)' : ''}</text>`;
+  for (const l of lines) {
+    let pts = l.pts.slice().sort((a, b) => a[0] - b[0]);
+    if (o.logY) pts = pts.filter(p => p[1] > 0).map(p => [p[0], Math.log10(p[1])]);
+    if (!pts.length) continue;
+    g += `<polyline fill="none" stroke="${l.color}" stroke-width="1.8" points="${pts.map(p => sx(p[0]).toFixed(1) + ',' + sy(p[1]).toFixed(1)).join(' ')}"/>`;
+    if (o.markers) for (const p of pts) {
+      const raw = o.logY ? 10 ** p[1] : p[1];
+      g += `<circle cx="${sx(p[0]).toFixed(1)}" cy="${sy(p[1]).toFixed(1)}" r="3.2" fill="${l.color}"><title>${esc(l.name)}\n${esc(o.xFmt ? o.xFmt(p[0]) : fmt(p[0]))}: ${fmt(raw)}</title></circle>`;
+    }
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px">${g}</svg>`;
+}
+
+function drawBars(items, o) {
+  // items: [{name, color, value}] -> horizontal bars, one per line (used when every line has a single point)
+  const rowH = 30, L = 210, R = 90, T = 8, W = 940, H = T * 2 + items.length * rowH;
+  const max = Math.max(...items.map(i => i.value), 0) || 1;
+  const bars = items.map((it, k) => {
+    const w = Math.max(1, it.value / max * (W - L - R)), y = T + k * rowH;
+    return `<text x="${L - 8}" y="${y + 19}" text-anchor="end" style="fill:var(--text)">${esc(it.name)}</text>` +
+      `<rect x="${L}" y="${y + 4}" width="${w.toFixed(1)}" height="${rowH - 10}" rx="3" fill="${it.color}"><title>${esc(it.name)}: ${fmt(it.value)}</title></rect>` +
+      `<text x="${L + w + 6}" y="${y + 19}">${fmt(it.value, o.unit)}</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px">${bars}</svg>`;
+}
+
+// ------------------------------------------------------------------------------------------------
+// section rendering
+// ------------------------------------------------------------------------------------------------
+function toCsv(rows, cols) {
+  const q = s => '"' + String(s).replace(/"/g, '""') + '"';
+  return ['series,at,' + cols.map(c => q(`${c[1]} (${c[2]})`)).join(',')]
+    .concat(rows.map(r => [q(r.series), q(r.xLabel)].concat(cols.map(c => r.values[c[0]] ?? '')).join(','))).join('\n');
+}
+function download(name, text, type = 'text/plain') {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+
+function kindSection(kindKey, entries) {
+  // entries: [{label, sec}] one per selected result
+  const kind = KINDS[kindKey];
+  const multi = entries.length > 1;
+  const rows = entries.flatMap(e => kind.rows(e.sec).map(r => multi ? { ...r, series: `[${e.label}] ${r.series}` } : r));
+  const series = [...new Set(rows.map(r => r.series))].sort();
+  const metrics = kind.metrics.filter(m => rows.some(r => r.values[m[0]] !== undefined && r.values[m[0]] !== null));
+  const hid = (k) => state.hiddenSeries.has(kindKey + ':' + k), hidc = (k) => state.hiddenCols.has(kindKey + ':' + k);
+  const shownMetrics = metrics.filter(m => !hidc(m[0]));
+  let cur = shownMetrics.find(m => m[0] === state.chartMetric[kindKey]) || shownMetrics[0];
+  const id = 'sec_' + kindKey;
+  const visRows = rows.filter(r => !hid(r.series));
+  let html = `<h2>${esc(kind.title)} <span class="badge">${rows.length} result rows</span></h2>`;
+  if (kindKey === 'memory' && entries.some(e => e.sec.complete === false)) html += `<div class="warn">⚠ The run was stopped early: ${entries.map(e => e.sec.tests_done + ' of ' + e.sec.tests_planned + ' tests').join(', ')} were completed.</div>`;
+  if (kindKey === 'cpu') html += slowCoreNotes(rows);
+  html += `<div class="card" id="${id}">`;
+  html += `<div class="row"><b>Lines:</b> <button class="small" data-act="ser-all">all</button><button class="small" data-act="ser-none">none</button> ` +
+    series.map((s, i) => `<label class="chk"><input type="checkbox" data-ser="${esc(s)}" ${hid(s) ? '' : 'checked'}><span class="sw" style="background:${colorOf(i)}"></span>${esc(s)}</label>`).join('') + '</div>';
+  html += `<details><summary>Show / hide values (columns)</summary><div class="row"><button class="small" data-act="col-all">all</button><button class="small" data-act="col-none">none</button><button class="small" data-act="col-perf">performance only</button><button class="small" data-act="col-sens">sensors only</button></div><div class="row">` +
+    metrics.map(m => `<label class="chk"><input type="checkbox" data-col="${m[0]}" ${hidc(m[0]) ? '' : 'checked'}>${esc(m[1])} <span style="color:var(--dim)">(${esc(m[2])})</span></label>`).join('') + '</div></details>';
+  if (cur) {
+    html += `<div class="row"><b>Chart:</b> <select data-metric>${shownMetrics.map(m => `<option value="${m[0]}" ${m[0] === cur[0] ? 'selected' : ''}>${esc(m[1])} (${esc(m[2])})</option>`).join('')}</select>` +
+      `<label class="chk"><input type="checkbox" data-opt="zeroY" ${state.opts.zeroY ? 'checked' : ''}>start Y at 0</label><label class="chk"><input type="checkbox" data-opt="logY" ${state.opts.logY ? 'checked' : ''}>log Y</label><label class="chk"><input type="checkbox" data-opt="markers" ${state.opts.markers ? 'checked' : ''}>markers</label></div>`;
+    const lines = series.map((s, i) => ({ name: s, color: colorOf(i), pts: rows.filter(r => r.series === s && r.values[cur[0]] != null).map(r => [r.x, r.values[cur[0]]]) })).filter(l => !hid(l.name));
+    const xs = [...new Set(rows.map(r => r.x))].sort((a, b) => a - b);
+    const labelAt = new Map(rows.map(r => [Math.round(r.x * 1000), r.xLabel]));
+    const allSingle = lines.length > 0 && lines.every(l => l.pts.length === 1);
+    if (allSingle) {
+      // one value per line: bars read better than isolated dots
+      const items = lines.map(l => ({ name: l.name, color: l.color, value: l.pts[0][1] }));
+      html += `<div class="chartwrap" style="padding:6px 0">${drawBars(items, { unit: cur[2] })}</div>`;
+    } else html += `<div class="chartwrap">${drawChart(lines, {
+      xLabel: kind.logX ? 'size' : (kindKey === 'cpu' ? 'core' : ''), yLabel: `${cur[1]} (${cur[2]})`, logY: state.opts.logY, zeroY: state.opts.zeroY, markers: state.opts.markers,
+      xFmt: kind.logX ? (v => humanSize(2 ** v)) : (v => labelAt.get(Math.round(v * 1000)) ?? fmt(v)),
+      xTicks: xs.length <= 24 ? xs : undefined,
+    })}</div>`;
+  } else html += '<div style="color:var(--dim)">All values are hidden.</div>';
+  html += `<div class="row"><span style="color:var(--dim)">${visRows.length} rows</span><button class="small" data-act="csv">Copy CSV</button><button class="small" data-act="dl-csv">Download CSV</button></div>`;
+  html += `<div class="scroll"><table><thead><tr><th>Line</th><th>At</th>${shownMetrics.map(m => `<th>${esc(m[1])} (${esc(m[2])})</th>`).join('')}</tr></thead><tbody>` +
+    visRows.map(r => `<tr><td><span class="sw" style="background:${colorOf(series.indexOf(r.series))}"></span> ${esc(r.series)}</td><td>${esc(r.xLabel)}</td>${shownMetrics.map(m => `<td>${fmt(r.values[m[0]])}</td>`).join('')}</tr>`).join('') + '</tbody></table></div>';
+  html += '</div>';
+  return { html, rows, shownMetrics, kindKey, series, metrics };
+}
+
+function slowCoreNotes(rows) {
+  const by = {};
+  rows.forEach(r => { if (/^Core \d+$/.test(r.xLabel || '')) (by[r.series] ??= []).push([r.x, r.values.mcalls]); });
+  let out = '';
+  for (const [w, arr] of Object.entries(by)) {
+    if (arr.length < 3) continue;
+    const s = arr.map(a => a[1]).sort((a, b) => a - b), med = s[Math.floor(s.length / 2)];
+    arr.sort((a, b) => a[0] - b[0]).forEach(([core, v]) => { if (med > 0 && v < med * 0.92) out += `<div class="warn">⚠ ${esc(w)}: core ${core} is ${((1 - v / med) * 100).toFixed(0)}% slower than the median core</div>`; });
+  }
+  return out;
+}
+
+function sensorsSection(entries) {
+  const sec = entries[0].sec;
+  const tl = sec.timeline || [];
+  let html = `<h2>Sensors over time <span class="badge">${sec.samples_recorded ?? tl.length} samples</span></h2><div class="card">`;
+  html += (sec.sources || []).map(n => `<div style="color:var(--dim);font-size:12px">• ${esc(n)}</div>`).join('');
+  const groups = {
+    temps: ['Temperatures', [['cpu_package_c','CPU package °C'],['hottest_core_c','Hottest core °C'],['gpu_temp_c','GPU °C']]],
+    clocks: ['Clocks', [['cpu_freq_avg_mhz','CPU avg MHz']]],
+    load: ['Load / power', [['cpu_load_pct','CPU load %'],['gpu_util_pct','GPU load %'],['gpu_power_w','GPU power W']]],
+    mem: ['RAM / VRAM', [['ram_used_mb','RAM used MB'],['vram_used_mb','VRAM used MB']]],
+  };
+  html += '<div class="row">' + Object.entries(groups).map(([k, g]) => `<button data-sgroup="${k}" style="${state.sensorGroup === k ? 'border-color:var(--accent)' : ''}">${g[0]}</button>`).join('') + '</div>';
+  const defs = groups[state.sensorGroup][1];
+  const lines = defs.map((d, i) => ({ name: d[1], color: colorOf(i), pts: tl.filter(p => p[d[0]] != null).map(p => [p.t_s, p[d[0]]]) })).filter(l => l.pts.length);
+  html += '<div class="row">' + lines.map(l => `<label class="chk"><input type="checkbox" data-sser="${esc(l.name)}" ${state.hiddenSeries.has('sen:' + l.name) ? '' : 'checked'}><span class="sw" style="background:${l.color}"></span>${esc(l.name)}</label>`).join('') + '</div>';
+  html += `<div class="chartwrap">${drawChart(lines.filter(l => !state.hiddenSeries.has('sen:' + l.name)), { xLabel: 'seconds since the test started', yLabel: groups[state.sensorGroup][0], zeroY: false, markers: false })}</div>`;
+  const peaks = sec.core_peak_temps_c || [];
+  if (peaks.length) {
+    html += '<h3>Peak temperature per core</h3><div class="row">' + peaks.map(p => { const t = p[1], c = t > 85 ? 'bad' : t > 70 ? 'warn' : 'ok'; return `<span class="badge ${c === 'ok' ? 'ok' : c === 'warn' ? 'warn' : 'bad'}">core ${p[0]}: ${t.toFixed(0)} °C</span>`; }).join('') + '</div>';
+  }
+  return html + '</div>';
+}
+
+function virtSection(v) {
+  const rows = [];
+  if (v.bios) rows.push(['BIOS VT-x / SVM', v.bios.vt_x_enabled || v.bios.svm_enabled], ['IOMMU / VT-d', v.bios.iommu_enabled], ['Secure Boot', v.bios.secure_boot_enabled], ['TPM', v.bios.tpm_enabled]);
+  if (v.windows) rows.push(['Hyper-V / hypervisor', v.windows.hyper_v_enabled], ['VBS', v.windows.vbs_enabled], ['Memory integrity (HVCI)', v.windows.hvci_enabled], ['WSL', v.windows.wsl_enabled], ['Virtual Machine Platform', v.windows.virtual_machine_platform_enabled]);
+  if (v.linux) rows.push(['KVM', v.linux.kvm_enabled]);
+  return `<h2>Virtualization</h2><div class="card"><div class="grid">${rows.map(r => `<span class="k">${esc(r[0])}</span><span class="${r[1] ? 'warn' : 'ok'}">${r[1] ? 'enabled' : 'disabled'}</span>`).join('')}</div>` +
+    (v.recommendations && v.recommendations.length ? '<h3>Notes</h3>' + v.recommendations.map(x => `<div style="font-size:13px">• ${esc(x)}</div>`).join('') : '') + '</div>';
+}
+
+function overview(doc, name, meta) {
+  const s = (doc.payload || {}).system_info || {}, c = s.cpu || {}, m = s.memory || {}, o = s.os || {}, b = s.motherboard || {}, h = doc.header || {};
+  const gpus = (s.gpus && s.gpus.length ? s.gpus : (s.gpu ? [s.gpu] : []));
+  const mods = (m.modules || []).map(x => `${humanSize(x.size)} ${x.speed ? x.speed + ' MT/s' : ''} ${x.part_number && x.part_number !== 'Unknown' ? x.part_number : ''}`.trim());
+  const cache = c.l3_cache ? `L1d ${c.l1_cache} KB · L2 ${c.l2_cache} KB · L3 ${c.l3_cache} KB` : '';
+  const grid = [
+    ['CPU', `${c.brand && c.brand !== 'Unknown' ? c.brand : c.name} — ${c.cores} cores / ${c.threads} threads` + (c.e_cores ? ` (P ${c.p_cores} + E ${c.e_cores})` : '')],
+    cache && ['Cache', cache],
+    ['Memory', `${(m.total / 2**30).toFixed(1)} GB ${m.type_ && m.type_ !== 'Unknown' ? m.type_ : ''} ${m.speed ? m.speed + ' MT/s' : ''}` + (mods.length ? ' — ' + mods.join(' + ') : '')],
+    ...gpus.map((g, i) => [i ? '' : 'GPU', `${g.name} — ${g.vram_total ? humanSize(g.vram_total) + ' · ' : ''}driver ${g.driver_version}`]),
+    ['Board / BIOS', `${b.manufacturer} ${b.model}${b.chipset && b.chipset !== 'Unknown' ? ' (' + b.chipset + ')' : ''} · BIOS ${b.bios_version} (${b.bios_date})`],
+    ['OS', `${o.name} ${o.version} · build ${o.build}`],
+    ['App', `v${h.app_version} · hash ${(h.app_hash || '').slice(0, 16)}…`],
+    ['Recorded', h.timestamp],
+    ['Signature', `${(doc.signature.sig || '').slice(0, 24)}… (key ${(doc.signature.public_key || '').slice(0, 12)}…)`],
+  ].filter(Boolean);
+  const status = meta && meta.valid === true ? (meta.trusted === false ? '<span class="badge ok" title="The data matches its signature, but the signing key is not the key stored next to these results (for example a file from another computer).">✓ signature intact · other computer\'s key</span>' : '<span class="badge ok">✓ signed by this computer</span>') : meta && meta.valid === false ? `<span class="badge bad">✗ ${esc(meta.message)}</span>` : '<span class="badge warn">not verified in this view</span>';
+  return `<div class="card"><div class="row"><b style="font-size:16px">${esc(doc.payload.test_type)}</b> ${status}<span style="flex:1"></span><button data-act="raw">Raw JSON</button><button data-act="dl-json">Download JSON</button></div><div class="grid">${grid.map(r => `<span class="k">${esc(r[0])}</span><span>${esc(r[1])}</span>`).join('')}</div></div>`;
+}
+
+// ------------------------------------------------------------------------------------------------
+// page
+// ------------------------------------------------------------------------------------------------
+let lastRender = null;
+function render() {
+  const main = $('#main');
+  if (!state.selected.length) { main.innerHTML = '<div id="empty">Select a result on the left.</div>'; return; }
+  const docs = state.selected.map(n => [n, state.docs.get(n)]).filter(d => d[1]);
+  let html = '';
+  if (docs.length > 1) html += `<div class="card">Comparing ${docs.length} results: overlaid lines are prefixed with their date. Column and line switches apply to all.</div>`;
+  else html += overview(docs[0][1], docs[0][0], state.list.find(m => m.name === docs[0][0]));
+  const perDoc = docs.map(([n, d]) => ({ label: docLabel(d, n), sections: sectionsOf(d), doc: d }));
+  const order = ['memory','cpu','gpu','input_timing_suite','input_trials'];
+  const built = [];
+  for (const k of order) {
+    const entries = perDoc.filter(p => p.sections[k]).map(p => ({ label: p.label, sec: p.sections[k] }));
+    if (entries.length) { const b = kindSection(k, entries); html += b.html; built.push(b); }
+  }
+  const sens = perDoc.filter(p => p.sections.sensors).map(p => ({ label: p.label, sec: p.sections.sensors }));
+  if (sens.length) html += sensorsSection(sens);
+  const virt = perDoc.find(p => p.sections.virtualization);
+  if (virt && docs.length === 1) html += virtSection(virt.sections.virtualization);
+  if (!built.length && !sens.length && !virt) html += '<div class="card">This file has no chartable results.</div>';
+  main.innerHTML = html;
+  lastRender = { built, docs };
+  wire();
+}
+
+function wire() {
+  document.querySelectorAll('.card[id^=sec_]').forEach(card => {
+    const kindKey = card.id.slice(4);
+    const b = lastRender.built.find(x => x.kindKey === kindKey);
+    card.querySelectorAll('[data-ser]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.ser; el.checked ? state.hiddenSeries.delete(k) : state.hiddenSeries.add(k); render(); });
+    card.querySelectorAll('[data-col]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.col; el.checked ? state.hiddenCols.delete(k) : state.hiddenCols.add(k); render(); });
+    card.querySelectorAll('[data-opt]').forEach(el => el.onchange = () => { state.opts[el.dataset.opt] = el.checked; render(); });
+    const sel = card.querySelector('[data-metric]'); if (sel) sel.onchange = () => { state.chartMetric[kindKey] = sel.value; render(); };
+    card.querySelectorAll('[data-act]').forEach(el => el.onclick = () => {
+      const a = el.dataset.act, isTel = k => TELEMETRY.some(t => t[0] === k);
+      if (a === 'ser-all') b.series.forEach(s => state.hiddenSeries.delete(kindKey + ':' + s));
+      if (a === 'ser-none') b.series.forEach(s => state.hiddenSeries.add(kindKey + ':' + s));
+      if (a === 'col-all') b.metrics.forEach(m => state.hiddenCols.delete(kindKey + ':' + m[0]));
+      if (a === 'col-none') b.metrics.forEach(m => state.hiddenCols.add(kindKey + ':' + m[0]));
+      if (a === 'col-perf') b.metrics.forEach(m => isTel(m[0]) ? state.hiddenCols.add(kindKey + ':' + m[0]) : state.hiddenCols.delete(kindKey + ':' + m[0]));
+      if (a === 'col-sens') b.metrics.forEach(m => isTel(m[0]) ? state.hiddenCols.delete(kindKey + ':' + m[0]) : state.hiddenCols.add(kindKey + ':' + m[0]));
+      const rows = b.rows.filter(r => !state.hiddenSeries.has(kindKey + ':' + r.series)), cols = b.metrics.filter(m => !state.hiddenCols.has(kindKey + ':' + m[0]));
+      if (a === 'csv') { navigator.clipboard && navigator.clipboard.writeText(toCsv(rows, cols)); el.textContent = 'Copied'; return; }
+      if (a === 'dl-csv') { download(kindKey + '.csv', toCsv(rows, cols), 'text/csv'); return; }
+      render();
+    });
+  });
+  document.querySelectorAll('[data-sgroup]').forEach(el => el.onclick = () => { state.sensorGroup = el.dataset.sgroup; render(); });
+  document.querySelectorAll('[data-sser]').forEach(el => el.onchange = () => { const k = 'sen:' + el.dataset.sser; el.checked ? state.hiddenSeries.delete(k) : state.hiddenSeries.add(k); render(); });
+  const raw = $('[data-act=raw]'); if (raw) raw.onclick = () => { const d = lastRender.docs[0][1]; const pre = document.createElement('pre'); pre.textContent = JSON.stringify(d, null, 2); raw.closest('.card').appendChild(pre); raw.disabled = true; };
+  const dj = $('[data-act=dl-json]'); if (dj) dj.onclick = () => download(lastRender.docs[0][0].replace(/[^\w.-]/g, '_'), JSON.stringify(lastRender.docs[0][1], null, 2), 'application/json');
+}
+
+$('#typeFilter').onchange = renderList;
+$('#btnRefresh').onclick = () => { state.docs.clear(); loadList(); };
+loadList().catch(e => { $('#main').innerHTML = `<div id="empty" class="bad">Could not load results: ${esc(e.message)}</div>`; });
+</script>
+</body>
+</html>

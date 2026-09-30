@@ -17,6 +17,12 @@ mod virtualization;
 mod verification;
 mod topology;
 mod cancel;
+mod input_test;
+mod rig;
+mod hwinfo;
+mod session;
+mod report;
+mod server;
 mod sensors;
 mod progress;
 
@@ -34,19 +40,29 @@ fn main() -> Result<()> {
 
     // Headless mode: `latency-tester --cli [--out results.json]`
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--cli" || a == "--help" || a == "-h") {
+    if args.iter().any(|a| a == "--cli" || a == "--serve" || a == "--report" || a == "--help" || a == "-h") {
         attach_parent_console();
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", cli::USAGE);
         return Ok(());
     }
+    if args.iter().any(|a| a == "--serve") {
+        return cli::serve(&args);
+    }
+    if args.iter().any(|a| a == "--report") {
+        return cli::report(&args);
+    }
     if args.iter().any(|a| a == "--cli") {
         return cli::run(&args);
     }
 
     // Run the GUI application
+    // VSync off by default: input timestamps are taken once per frame, so a fast unsynchronised frame
+    // loop keeps that quantisation to ~1 ms. `--vsync` restores normal presentation.
+    let vsync = args.iter().any(|a| a == "--vsync");
     let options = eframe::NativeOptions {
+        vsync,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 900.0])
             .with_min_inner_size([800.0, 600.0])

@@ -109,6 +109,7 @@ impl LatencyTesterApp {
             }
         };
         self.mem_config_error = None;
+        self.last_mem_config = Some(config.clone());
         self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         *self.mem_progress.lock().unwrap() = MemProgress::default();
         let sampler = self.begin_sampler();

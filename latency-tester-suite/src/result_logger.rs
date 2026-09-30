@@ -72,10 +72,39 @@ pub struct ResultHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultPayload {
     pub test_type: String,       // "memory", "cpu", "gpu", "input", "system"
-    pub system_info: crate::system_info::SystemInfo,
+    /// Kept as raw JSON: the signature covers these exact bytes, so adding fields to `SystemInfo` in a
+    /// later version must not change what an older file re-serializes to.
+    pub system_info: serde_json::Value,
     pub benchmark_config: serde_json::Value,
     pub benchmark_results: serde_json::Value,
     pub metadata: HashMap<String, String>,
+}
+
+/// A few system fields read leniently from the raw JSON (any version of the file)
+pub struct SysBrief {
+    pub cpu_name: String,
+    pub cores: u64,
+    pub threads: u64,
+    pub memory_gb: f64,
+    pub gpu: String,
+    pub os: String,
+    pub virtualization: bool,
+}
+
+impl SysBrief {
+    pub fn of(v: &serde_json::Value) -> SysBrief {
+        let text = |p: &str| v.pointer(p).and_then(|x| x.as_str()).map(String::from);
+        let num = |p: &str| v.pointer(p).and_then(|x| x.as_u64()).unwrap_or(0);
+        SysBrief {
+            cpu_name: text("/cpu/brand").filter(|b| b != "Unknown").or_else(|| text("/cpu/name")).unwrap_or_else(|| "Unknown".into()),
+            cores: num("/cpu/cores"),
+            threads: num("/cpu/threads"),
+            memory_gb: num("/memory/total") as f64 / 1_073_741_824.0,
+            gpu: text("/gpu/name").unwrap_or_else(|| "N/A".into()),
+            os: text("/os/name").unwrap_or_else(|| "Unknown".into()),
+            virtualization: v.pointer("/virtualization/bios_virtualization_enabled").and_then(|x| x.as_bool()).unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,7 +239,7 @@ impl ResultLogger {
 
         let payload = ResultPayload {
             test_type: test_type.to_string(),
-            system_info: system_info.clone(),
+            system_info: serde_json::to_value(system_info)?,
             benchmark_config: serde_json::to_value(config)?,
             benchmark_results: serde_json::to_value(results)?,
             metadata,
@@ -466,7 +495,7 @@ impl ResultLogger {
 
         for result in results {
             let verification = self.verify_result(result);
-            let sys = &result.payload.system_info;
+            let sys = SysBrief::of(&result.payload.system_info);
             
             writer.write_record(&[
                 &result.header.timestamp,
@@ -474,13 +503,13 @@ impl ResultLogger {
                 &result.header.app_version,
                 &result.header.app_hash,
                 &verification.valid.to_string(),
-                &sys.cpu.name,
-                &sys.cpu.cores.to_string(),
-                &sys.cpu.threads.to_string(),
-                &format!("{:.2}", sys.memory.total as f64 / 1_073_741_824.0),
-                &sys.gpu.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "N/A".to_string()),
-                &sys.os.name,
-                &sys.virtualization.bios_virtualization_enabled.to_string(),
+                &sys.cpu_name,
+                &sys.cores.to_string(),
+                &sys.threads.to_string(),
+                &format!("{:.2}", sys.memory_gb),
+                &sys.gpu,
+                &sys.os,
+                &sys.virtualization.to_string(),
             ])?;
         }
         
@@ -505,6 +534,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Generate a shareable result summary with verification info
 pub fn generate_shareable_summary(result: &VerifiedResult, verification: &VerificationResult) -> String {
+    let brief = SysBrief::of(&result.payload.system_info);
     format!(
         r#"=== Latency Tester Suite - Verified Result ===
 Version: {}
@@ -536,13 +566,13 @@ Nonce: {}
         result.payload.test_type,
         verification.valid,
         verification.message,
-        result.payload.system_info.cpu.name,
-        result.payload.system_info.cpu.cores,
-        result.payload.system_info.cpu.threads,
-        result.payload.system_info.memory.total as f64 / 1_073_741_824.0,
-        result.payload.system_info.gpu.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "N/A".to_string()),
-        result.payload.system_info.os.name,
-        result.payload.system_info.virtualization.bios_virtualization_enabled,
+        brief.cpu_name,
+        brief.cores,
+        brief.threads,
+        brief.memory_gb,
+        brief.gpu,
+        brief.os,
+        brief.virtualization,
         serde_json::to_string_pretty(&result.payload.benchmark_config).unwrap_or_default(),
         serde_json::to_string_pretty(&result.payload.benchmark_results).unwrap_or_default(),
         result.signature.sig,
@@ -600,6 +630,7 @@ mod tests {
                 modules: vec![],
             },
             gpu: None,
+            gpus: vec![],
             motherboard: crate::system_info::MotherboardInfo {
                 manufacturer: "Test".to_string(),
                 model: "Test".to_string(),
@@ -624,6 +655,7 @@ mod tests {
                 kvm_enabled: false,
                 vmware_detected: false,
                 virtualbox_detected: false,
+                kvm_guest: false,
                 details: "".to_string(),
             },
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -676,6 +708,7 @@ mod tests {
                 modules: vec![],
             },
             gpu: None,
+            gpus: vec![],
             motherboard: crate::system_info::MotherboardInfo {
                 manufacturer: "Test".to_string(),
                 model: "Test".to_string(),
@@ -700,6 +733,7 @@ mod tests {
                 kvm_enabled: false,
                 vmware_detected: false,
                 virtualbox_detected: false,
+                kvm_guest: false,
                 details: "".to_string(),
             },
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -895,5 +929,23 @@ mod tests {
         out.extend_from_slice(&data);
         std::fs::write(dir.path().join("results_master.log"), out).unwrap();
         assert!(!logger.verify_log().unwrap().valid);
+    }
+
+    #[test]
+    fn files_written_before_a_system_info_field_existed_still_verify() {
+        let (dir, logger, info) = logger_and_info();
+        let v = logger.log_result("cpu", &info, &serde_json::json!({}), &serde_json::json!({"x": 1}), HashMap::new()).unwrap();
+        // Simulate an older build: system_info without the newer `gpus` / `kvm_guest` fields, signed as such
+        let mut payload = v.payload.clone();
+        payload.system_info.as_object_mut().unwrap().remove("gpus");
+        payload.system_info["virtualization"].as_object_mut().unwrap().remove("kvm_guest");
+        let old = VerifiedResult { header: v.header.clone(), signature: logger.sign(&v.header, &payload).unwrap(), payload };
+        let path = dir.path().join("old.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+        // load it again through the typed structs (as the viewer / verifier does)
+        let reloaded: VerifiedResult = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pk: [u8; 32] = hex::decode(logger.public_key_hex()).unwrap().try_into().unwrap();
+        assert!(ResultLogger::verify_with_public_key(&reloaded, &pk).valid, "round trip changed the signed bytes");
+        assert!(reloaded.payload.system_info.get("gpus").is_none(), "unknown fields must not be invented on load");
     }
 }

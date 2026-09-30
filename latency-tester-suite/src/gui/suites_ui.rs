@@ -188,6 +188,7 @@ impl LatencyTesterApp {
                 return;
             }
         };
+        self.last_cpu_config = Some(config.clone());
         let sampler = self.begin_sampler();
         *self.cpu_progress.lock().unwrap() = RunProgress::default();
         self.cpu_partial.lock().unwrap().clear();
@@ -367,6 +368,7 @@ impl LatencyTesterApp {
             return;
         }
         let config = self.gpu_config.clone();
+        self.last_gpu_config = Some(config.clone());
         let cancel_flag = self.cancel.clone();
         let sampler = self.begin_sampler();
         *self.gpu_progress.lock().unwrap() = RunProgress::default();
