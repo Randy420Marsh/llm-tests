@@ -43,6 +43,33 @@ latency-tester --cli --skip gpu --out ./my_results
 Linux GUI needs `libxkbcommon`, X11/Wayland and OpenGL. The GPU suite needs a Vulkan driver
 (software drivers such as Mesa lavapipe work: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`).
 
+## Choosing what to test
+
+Every tab shows live progress (what is running right now, ETA) and fills its results in as tests finish;
+**Stop** keeps whatever already finished.
+
+- **Cores** (Memory, CPU, Input): all / P-cores / E-cores / P+E pinned / any specific cores, plus
+  **Test each core on its own** to find slow, hot or faulty cores. The Results tab flags cores that are
+  well below the median.
+- **Memory**: pick buffer sizes, access patterns, thread counts (presets or a custom number), runs per
+  test and a time limit per test.
+- **CPU**: pick workloads, thread count (all selected cores or an exact number), run length and repeats.
+
+## Sensors and graphs
+
+While any test runs, a background sampler records CPU per-core temperatures, clocks, load, RAM and
+GPU temperature/load/power/VRAM, and each result stores a summary of the readings taken during that test.
+The **Results & Graphs** tab charts every value, and each line or column can be switched on and off.
+
+| Reading | Linux | Windows |
+|---|---|---|
+| CPU temperature (package / per core) | hwmon (`coretemp`, `k10temp`) | per-core needs [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (or OpenHardwareMonitor) running; otherwise a package-level ACPI thermal zone |
+| CPU clocks / load / RAM | yes | yes |
+| GPU temp / load / power / VRAM | `nvidia-smi` or amdgpu sysfs | `nvidia-smi` (ships with the NVIDIA driver) |
+
+The Dashboard lists which sensors were found. Windows itself does not expose per-core CPU temperatures
+to normal programs, so without a helper such as LibreHardwareMonitor those columns stay empty.
+
 ## Tests
 
 ```sh

@@ -17,6 +17,8 @@ mod virtualization;
 mod verification;
 mod topology;
 mod cancel;
+mod sensors;
+mod progress;
 
 use anyhow::Result;
 use eframe::egui;

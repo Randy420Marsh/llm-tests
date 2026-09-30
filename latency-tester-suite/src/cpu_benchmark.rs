@@ -4,7 +4,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::thread;
 use crate::cancel::{self, CancelFlag};
+use crate::progress::{self, SharedProgress, SharedResults};
+use crate::sensors::{Sampler, Telemetry};
 use crate::timer::HighResTimer;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuBenchmarkConfig {
@@ -101,6 +104,12 @@ pub struct CpuBenchmarkResult {
     pub temperature_c: Option<f32>,
     pub power_watts: Option<f32>,
     pub iteration_results: Vec<IterationResult>,
+    /// Which cores the threads were pinned to ("All cores (OS scheduled)" when unpinned)
+    #[serde(default)]
+    pub cores: String,
+    /// Temperatures, clocks, RAM and GPU/VRAM readings taken while this test ran
+    #[serde(default)]
+    pub telemetry: Telemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +153,9 @@ pub struct CpuBenchmark {
     timer: HighResTimer,
     topology: CoreTopology,
     cancel: CancelFlag,
+    progress: Option<SharedProgress>,
+    partial: Option<SharedResults<CpuBenchmarkResult>>,
+    sensors: Option<Arc<Sampler>>,
 }
 
 impl CpuBenchmark {
@@ -154,7 +166,23 @@ impl CpuBenchmark {
             timer: HighResTimer::new(),
             topology,
             cancel: cancel::new_flag(),
+            progress: None,
+            partial: None,
+            sensors: None,
         })
+    }
+
+    /// Publish live progress and finished results so the GUI can show them while running
+    pub fn with_progress(mut self, progress: SharedProgress, partial: SharedResults<CpuBenchmarkResult>) -> Self {
+        self.progress = Some(progress);
+        self.partial = Some(partial);
+        self
+    }
+
+    /// Attach a sensor sampler so every result carries temperatures / clocks / VRAM
+    pub fn with_sensors(mut self, sampler: Arc<Sampler>) -> Self {
+        self.sensors = Some(sampler);
+        self
     }
 
     /// Share a flag that stops the run early when set
@@ -246,19 +274,39 @@ impl CpuBenchmark {
         let system_info = crate::system_info::collect_system_info()?;
         let mut results = Vec::new();
 
-        for workload in self.config.workload_types.clone() {
-            for thread_count in self.config.thread_counts.clone() {
-                for affinity_mode in self.config.affinity_modes.clone() {
-                    cancel::check(&self.cancel)?;
-                    // Skip invalid combinations
-                    if !self.is_valid_combination(thread_count, affinity_mode) {
-                        continue;
+        let combos: Vec<(WorkloadType, usize, AffinityMode)> = {
+            let mut v = Vec::new();
+            for &w in &self.config.workload_types {
+                for &t in &self.config.thread_counts {
+                    for &m in &self.config.affinity_modes {
+                        if self.is_valid_combination(t, m) {
+                            v.push((w, t, m));
+                        }
                     }
-
-                    let result = self.run_workload(workload, thread_count, affinity_mode)?;
-                    results.push(result);
                 }
             }
+            v
+        };
+        if combos.is_empty() {
+            return Err(anyhow::anyhow!("No valid combination of workload, threads and cores to run"));
+        }
+        progress::update(&self.progress, |p| {
+            *p = progress::RunProgress { total: combos.len(), started: Some(std::time::Instant::now()), ..Default::default() }
+        });
+
+        for (workload, thread_count, affinity_mode) in combos {
+            cancel::check(&self.cancel)?;
+            let label = Self::mask_label(self.get_affinity_mask(thread_count, affinity_mode), affinity_mode);
+            progress::update(&self.progress, |p| {
+                p.title = format!("{:?} · {} thread(s) · {}", workload, thread_count, label);
+                p.detail = "starting".into();
+            });
+            let result = self.run_workload(workload, thread_count, affinity_mode)?;
+            progress::update(&self.progress, |p| p.done += 1);
+            if let Some(partial) = &self.partial {
+                partial.lock().unwrap().push(result.clone());
+            }
+            results.push(result);
         }
 
         Ok(CpuBenchmarkSummary {
@@ -270,6 +318,25 @@ impl CpuBenchmark {
         })
     }
 
+    /// "0-7,10" style description of the cores in `mask`; unpinned runs say so
+    pub fn mask_label(mask: u64, mode: AffinityMode) -> String {
+        if mode == AffinityMode::AllCores {
+            return "All cores (OS scheduled)".to_string();
+        }
+        let ids: Vec<usize> = (0..64).filter(|&i| (mask >> i) & 1 == 1).collect();
+        let mut parts = Vec::new();
+        let mut i = 0;
+        while i < ids.len() {
+            let mut j = i;
+            while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
+                j += 1;
+            }
+            parts.push(if j > i { format!("{}-{}", ids[i], ids[j]) } else { ids[i].to_string() });
+            i = j + 1;
+        }
+        if ids.len() == 1 { format!("Core {}", parts[0]) } else { format!("Cores {}", parts.join(",")) }
+    }
+
     fn is_valid_combination(&self, thread_count: usize, affinity_mode: AffinityMode) -> bool {
         match affinity_mode {
             AffinityMode::PerformanceCores => {
@@ -279,6 +346,7 @@ impl CpuBenchmark {
                 thread_count <= self.topology.efficiency_cores.len()
             }
             AffinityMode::SingleCore => thread_count == 1,
+            AffinityMode::CustomMask(mask) => thread_count >= 1 && thread_count <= mask.count_ones() as usize,
             AffinityMode::HyperThreadPairs => {
                 thread_count <= self.topology.ht_pairs.len() * 2
             }
@@ -293,6 +361,7 @@ impl CpuBenchmark {
         affinity_mode: AffinityMode,
     ) -> Result<CpuBenchmarkResult> {
         let core_mask = self.get_affinity_mask(thread_count, affinity_mode);
+        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
         let mut iteration_results = Vec::new();
         let mut total_ops = 0u64;
         let mut total_time_ns = 0u64;
@@ -300,11 +369,13 @@ impl CpuBenchmark {
         for iter in 0..self.config.iterations {
             cancel::check(&self.cancel)?;
             // Warmup
-            if iter == 0 {
+            if iter == 0 && self.config.warmup_seconds > 0 {
+                progress::update(&self.progress, |p| p.detail = format!("warming up ({} s)", self.config.warmup_seconds));
                 self.run_workload_internal(workload, thread_count, core_mask, affinity_mode, self.config.warmup_seconds)?;
             }
             
             // Actual measurement
+            progress::update(&self.progress, |p| p.detail = format!("measuring run {}/{} ({} s each)", iter + 1, self.config.iterations, self.config.duration_seconds));
             let (ops, duration_ns, freq) = self.run_workload_internal(
                 workload,
                 thread_count,
@@ -328,6 +399,10 @@ impl CpuBenchmark {
         let avg_latency_ns = total_time_ns as f64 / total_ops as f64;
         let avg_freq = iteration_results.iter().map(|r| r.frequency_mhz).sum::<u64>() / iteration_results.len() as u64;
 
+        let telemetry = match (&self.sensors, sensor_start) {
+            (Some(s), Some(t0)) => s.window(t0, s.now_ms()),
+            _ => Telemetry::default(),
+        };
         Ok(CpuBenchmarkResult {
             workload,
             thread_count,
@@ -338,20 +413,20 @@ impl CpuBenchmark {
             instructions_per_cycle: None, // Would need PMU
             cycles_per_operation: None,
             frequency_mhz: avg_freq,
-            temperature_c: None,
+            temperature_c: telemetry.cpu_temp_max_c,
             power_watts: None,
             iteration_results,
+            cores: Self::mask_label(core_mask, affinity_mode),
+            telemetry,
         })
     }
 
     fn get_affinity_mask(&self, thread_count: usize, affinity_mode: AffinityMode) -> u64 {
         match affinity_mode {
             AffinityMode::AllCores => {
-                if thread_count >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << thread_count) - 1
-                }
+                // Not pinned; the mask only records which cores were available
+                let n = self.topology.total_logical.min(64);
+                if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
             }
             AffinityMode::PerformanceCores => {
                 let mut mask = 0u64;
@@ -410,23 +485,11 @@ impl CpuBenchmark {
             let core_id = self.get_core_for_thread(i, thread_count, core_mask, affinity_mode);
             
             let cancel_flag = self.cancel.clone();
+            let pin = affinity_mode != AffinityMode::AllCores;
             let handle = thread::spawn(move || {
-                // Set thread affinity
-                #[cfg(target_os = "windows")]
-                {
-                    use windows::Win32::System::Threading::*;
-                    let handle = unsafe { GetCurrentThread() };
-                    let mask = 1u64 << core_id;
-                    unsafe { SetThreadAffinityMask(handle, mask as usize); }
-                }
-                
-                #[cfg(target_os = "linux")]
-                {
-                    use libc::{cpu_set_t, CPU_SET, CPU_ZERO, sched_setaffinity};
-                    let mut cpuset: cpu_set_t = unsafe { std::mem::zeroed() };
-                    unsafe { CPU_ZERO(&mut cpuset) };
-                    unsafe { CPU_SET(core_id, &mut cpuset) };
-                    unsafe { sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &cpuset) };
+                // AllCores = leave scheduling to the OS; every other mode pins to a chosen core
+                if pin {
+                    crate::topology::pin_current_thread(core_id);
                 }
 
                 let mut ops = 0u64;

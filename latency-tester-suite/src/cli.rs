@@ -81,7 +81,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 AccessPattern::StreamTriad,
             ],
             thread_counts: vec![1],
-            use_huge_pages: false,
+            ..MemoryBenchmarkConfig::default()
         })
         .run()?;
         for r in &summary.results {
@@ -151,6 +151,7 @@ pub fn run(args: &[String]) -> Result<()> {
             warmup_samples: 0,
             delay_range_ms: (0, 0),
             measure_display_latency: false,
+            pin_core: None,
         })
         .run()?;
         for r in &summary.results {

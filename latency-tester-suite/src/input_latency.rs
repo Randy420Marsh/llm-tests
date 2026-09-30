@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::cancel::{self, CancelFlag};
+use crate::progress::{self, SharedProgress};
+use crate::sensors::{Sampler, Telemetry};
 use crate::timer::{HighResTimer, busy_wait_ns};
 use rand::{Rng, SeedableRng};
 
@@ -17,6 +19,9 @@ pub struct InputLatencyConfig {
     pub warmup_samples: u32,
     pub delay_range_ms: (u32, u32),  // Min/max random delay before stimulus
     pub measure_display_latency: bool, // If true, measure full click-to-photon
+    /// Pin the measuring thread to this logical CPU (None = OS decides)
+    #[serde(default)]
+    pub pin_core: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +49,7 @@ impl Default for InputLatencyConfig {
             warmup_samples: 10,
             delay_range_ms: (500, 3000),
             measure_display_latency: false, // Requires external sensor
+            pin_core: None,
         }
     }
 }
@@ -65,6 +71,12 @@ pub struct InputLatencyResult {
     pub individual_samples: Vec<f64>, // All samples in ms
     pub timer_frequency: u64,
     pub timer_overhead_ns: u64,
+    /// Core the measurement was pinned to, if any
+    #[serde(default)]
+    pub core: Option<usize>,
+    /// Temperatures, clocks, RAM and GPU/VRAM readings taken while this test ran
+    #[serde(default)]
+    pub telemetry: Telemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +98,8 @@ pub struct InputLatencyTester {
     /// Latencies (ms) recorded from real stimulus/response pairs
     pub live_samples: Arc<Mutex<Vec<f64>>>,
     cancel: CancelFlag,
+    progress: Option<SharedProgress>,
+    sensors: Option<std::sync::Arc<Sampler>>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +120,21 @@ impl InputLatencyTester {
             last_response_time: Arc::new(Mutex::new(None)),
             live_samples: Arc::new(Mutex::new(Vec::new())),
             cancel: cancel::new_flag(),
+            progress: None,
+            sensors: None,
         }
+    }
+
+    /// Publish live progress to the GUI
+    pub fn with_progress(mut self, progress: SharedProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Attach a sensor sampler so every result carries temperatures / clocks
+    pub fn with_sensors(mut self, sampler: std::sync::Arc<Sampler>) -> Self {
+        self.sensors = Some(sampler);
+        self
     }
 
     /// Share a flag that stops the run early when set
@@ -119,9 +147,27 @@ impl InputLatencyTester {
         let system_info = crate::system_info::collect_system_info()?;
         let mut results = Vec::new();
 
+        if let Some(core) = self.config.pin_core {
+            if !crate::topology::pin_current_thread(core) {
+                tracing::warn!("could not pin the input test to core {}", core);
+            }
+        }
+        let total = self.config.test_modes.len();
+        progress::update(&self.progress, |p| {
+            *p = progress::RunProgress { total, started: Some(std::time::Instant::now()), ..Default::default() }
+        });
         for mode in self.config.test_modes.clone() {
             cancel::check(&self.cancel)?;
-            let result = self.run_mode(mode)?;
+            progress::update(&self.progress, |p| {
+                p.title = format!("{:?}{}", mode, self.config.pin_core.map(|c| format!(" · core {}", c)).unwrap_or_default());
+                p.detail = format!("{} samples", self.config.sample_count);
+            });
+            let t0 = self.sensors.as_ref().map(|s| s.now_ms());
+            let mut result = self.run_mode(mode)?;
+            if let (Some(s), Some(t0)) = (&self.sensors, t0) {
+                result.telemetry = s.window(t0, s.now_ms());
+            }
+            progress::update(&self.progress, |p| p.done += 1);
             results.push(result);
         }
 
@@ -371,6 +417,8 @@ impl InputLatencyTester {
             individual_samples: samples,
             timer_frequency: self.timer.frequency(),
             timer_overhead_ns: self.timer.measure_overhead(10000),
+            core: self.config.pin_core,
+            telemetry: Telemetry::default(),
         })
     }
 
@@ -416,6 +464,7 @@ pub fn run_click_to_photon_test(sample_count: u32) -> Result<Vec<f64>> {
         warmup_samples: 10,
         delay_range_ms: (500, 2000),
         measure_display_latency: true,
+        pin_core: None,
     };
     
     let mut tester = InputLatencyTester::new(config);
@@ -482,6 +531,7 @@ mod tests {
             warmup_samples: 0,
             delay_range_ms: (0, 0),
             measure_display_latency: false,
+            pin_core: None,
         };
         let mut tester = InputLatencyTester::new(config);
         let result = tester.run_jitter_test().unwrap();
