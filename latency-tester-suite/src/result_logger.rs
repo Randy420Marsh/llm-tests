@@ -3,7 +3,7 @@
 //! Ensures results are tamper-proof and verifiable
 
 use anyhow::Result;
-use hmac::{Hmac, Mac};
+use ed25519_dalek::{Signature as EdSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Write, Read};
 use std::path::Path;
 
-type HmacSha256 = Hmac<Sha256>;
 
 /// Serialize a JSON value with object keys sorted, giving a stable byte representation
 fn canonical_json(value: &serde_json::Value) -> Vec<u8> {
@@ -66,7 +65,8 @@ pub struct ResultHeader {
     pub timestamp: String,       // ISO 8601 UTC
     pub salt: String,            // Hex-encoded salt (32 bytes)
     pub nonce: String,           // Hex-encoded nonce (16 bytes)
-    pub algorithm: String,       // "HMAC-SHA256" or "HMAC-SHA512"
+    pub algorithm: String,       // "Ed25519"
+    pub prev_hash: String,       // SHA256 (hex) of the previous record's signature; chains the log
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,8 +80,8 @@ pub struct ResultPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signature {
-    pub hmac: String,            // Hex-encoded HMAC
-    pub public_key_hash: String, // SHA256 of public key (for future PKI)
+    pub sig: String,             // Hex-encoded Ed25519 signature
+    pub public_key: String,      // Hex-encoded Ed25519 public key of the signer
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +95,7 @@ pub struct VerificationResult {
 pub struct ResultLogger {
     pub(crate) app_version: String,
     pub app_hash: String,
-    pub(crate) private_key: [u8; 32],  // HMAC key (in production, use proper key management)
+    pub(crate) private_key: [u8; 32],  // Ed25519 signing-key seed
     pub(crate) output_dir: String,
 }
 
@@ -115,6 +115,37 @@ impl ResultLogger {
         })
     }
 
+    /// Best-effort permission hardening: read-only (and owner-only when `private`)
+    fn restrict_file(path: &Path, readable_by_others: bool) {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(if readable_by_others { 0o444 } else { 0o400 });
+            }
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+
+    fn signing_key(&self) -> SigningKey {
+        SigningKey::from_bytes(&self.private_key)
+    }
+
+    /// Public key (hex) that verifies this logger's results; share it to let others verify
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.signing_key().verifying_key().to_bytes())
+    }
+
+    /// SHA256 of the last logged record's signature (all zeros for an empty log)
+    fn chain_head(&self) -> String {
+        match self.load_all_results().ok().and_then(|r| r.last().cloned()) {
+            Some(last) => hex::encode(Sha256::digest(last.signature.sig.as_bytes())),
+            None => "0".repeat(64),
+        }
+    }
+
     pub fn compute_app_hash() -> Result<String> {
         // Get current executable path
         let exe_path = std::env::current_exe()?;
@@ -126,7 +157,7 @@ impl ResultLogger {
     }
 
     fn load_or_generate_key(output_dir: &str) -> Result<[u8; 32]> {
-        let key_path = Path::new(output_dir).join("hmac_key.bin");
+        let key_path = Path::new(output_dir).join("signing_key.bin");
         
         if key_path.exists() {
             let mut file = File::open(&key_path)?;
@@ -142,6 +173,7 @@ impl ResultLogger {
             std::fs::create_dir_all(output_dir)?;
             let mut file = File::create(&key_path)?;
             file.write_all(&key)?;
+            Self::restrict_file(&key_path, false);
             
             Ok(key)
         }
@@ -170,7 +202,8 @@ impl ResultLogger {
             timestamp: chrono::Utc::now().to_rfc3339(),
             salt: hex::encode(salt),
             nonce: hex::encode(nonce),
-            algorithm: "HMAC-SHA256".to_string(),
+            algorithm: "Ed25519".to_string(),
+            prev_hash: self.chain_head(),
         };
 
         let payload = ResultPayload {
@@ -196,31 +229,31 @@ impl ResultLogger {
         Ok(verified_result)
     }
 
-    fn sign(&self, header: &ResultHeader, payload: &ResultPayload) -> Result<Signature> {
-        // Serialize header and payload for signing
+    /// Bytes covered by the signature: salt || nonce || canonical header || canonical payload
+    fn signed_bytes(header: &ResultHeader, payload: &ResultPayload) -> Result<Vec<u8>> {
         // Canonical JSON (sorted keys) so the signature survives a save/load round trip,
         // regardless of HashMap iteration order
         let header_bytes = canonical_json(&serde_json::to_value(header)?);
         let payload_bytes = canonical_json(&serde_json::to_value(payload)?);
-        
-        // Combine with salt and nonce
         let salt = hex::decode(&header.salt)?;
         let nonce = hex::decode(&header.nonce)?;
-        
+
         let mut data = Vec::new();
         data.extend_from_slice(&salt);
         data.extend_from_slice(&nonce);
         data.extend_from_slice(&header_bytes);
         data.extend_from_slice(&payload_bytes);
+        Ok(data)
+    }
 
-        // Compute HMAC
-        let mut mac = HmacSha256::new_from_slice(&self.private_key)?;
-        mac.update(&data);
-        let hmac_result = mac.finalize().into_bytes();
+    fn sign(&self, header: &ResultHeader, payload: &ResultPayload) -> Result<Signature> {
+        let data = Self::signed_bytes(header, payload)?;
+        let key = self.signing_key();
+        let sig = key.sign(&data);
 
         Ok(Signature {
-            hmac: hex::encode(hmac_result),
-            public_key_hash: hex::encode(Sha256::digest(&self.private_key)),
+            sig: hex::encode(sig.to_bytes()),
+            public_key: hex::encode(key.verifying_key().to_bytes()),
         })
     }
 
@@ -242,6 +275,9 @@ impl ResultLogger {
         let json = serde_json::to_string_pretty(result)?;
         let mut file = File::create(&filepath)?;
         file.write_all(json.as_bytes())?;
+        drop(file);
+        // Saved results are immutable: make the file read-only
+        Self::restrict_file(&filepath, true);
         
         // Also append to a master log file (length-prefixed JSON records)
         self.append_to_master_log(result)?;
@@ -265,27 +301,49 @@ impl ResultLogger {
         Ok(())
     }
 
-    /// Verify a result file
-    pub fn verify_result(&self, result: &VerifiedResult) -> VerificationResult {
-        // Recompute signature
-        let expected_signature = match self.sign(&result.header, &result.payload) {
-            Ok(sig) => sig,
-            Err(e) => return VerificationResult {
-                valid: false,
-                message: format!("Failed to compute signature: {}", e),
-                header: None,
-                payload: None,
-            },
+    /// Check the Ed25519 signature of `result` against a trusted public key.
+    /// Does not depend on which build produced the result.
+    pub fn verify_with_public_key(result: &VerifiedResult, public_key: &[u8; 32]) -> VerificationResult {
+        let fail = |message: String| VerificationResult {
+            valid: false,
+            message,
+            header: Some(result.header.clone()),
+            payload: Some(result.payload.clone()),
         };
+        let trusted = match VerifyingKey::from_bytes(public_key) {
+            Ok(k) => k,
+            Err(e) => return fail(format!("Invalid public key: {}", e)),
+        };
+        if result.signature.public_key != hex::encode(public_key) {
+            return fail("Result was signed by a different key".to_string());
+        }
+        let sig_bytes: [u8; 64] = match hex::decode(&result.signature.sig)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+        {
+            Some(b) => b,
+            None => return fail("Malformed signature".to_string()),
+        };
+        let data = match Self::signed_bytes(&result.header, &result.payload) {
+            Ok(d) => d,
+            Err(e) => return fail(format!("Failed to encode result: {}", e)),
+        };
+        if trusted.verify(&data, &EdSignature::from_bytes(&sig_bytes)).is_err() {
+            return fail("Signature verification failed - data may have been tampered with".to_string());
+        }
+        VerificationResult {
+            valid: true,
+            message: "Signature valid".to_string(),
+            header: Some(result.header.clone()),
+            payload: Some(result.payload.clone()),
+        }
+    }
 
-        // Compare HMACs (constant-time comparison)
-        if !constant_time_eq(&result.signature.hmac, &expected_signature.hmac) {
-            return VerificationResult {
-                valid: false,
-                message: "HMAC verification failed - data may have been tampered with".to_string(),
-                header: Some(result.header.clone()),
-                payload: Some(result.payload.clone()),
-            };
+    /// Verify a result: signature against this logger's key, then the app hash
+    pub fn verify_result(&self, result: &VerifiedResult) -> VerificationResult {
+        let sig_check = Self::verify_with_public_key(result, &self.signing_key().verifying_key().to_bytes());
+        if !sig_check.valid {
+            return sig_check;
         }
 
         // Verify app hash matches current binary
@@ -314,6 +372,34 @@ impl ResultLogger {
             header: Some(result.header.clone()),
             payload: Some(result.payload.clone()),
         }
+    }
+
+    /// Verify the master log as a whole: every signature, and that the hash chain is
+    /// unbroken (detects edited, deleted, inserted or reordered records)
+    pub fn verify_log(&self) -> Result<VerificationResult> {
+        let results = self.load_all_results()?;
+        let mut prev = "0".repeat(64);
+        for (i, r) in results.iter().enumerate() {
+            let sig = self.verify_result(r);
+            if !sig.valid && !sig.message.starts_with("Application hash mismatch") {
+                return Ok(VerificationResult { message: format!("Record {}: {}", i + 1, sig.message), ..sig });
+            }
+            if r.header.prev_hash != prev {
+                return Ok(VerificationResult {
+                    valid: false,
+                    message: format!("Record {}: hash chain broken (record removed, inserted or reordered)", i + 1),
+                    header: Some(r.header.clone()),
+                    payload: None,
+                });
+            }
+            prev = hex::encode(Sha256::digest(r.signature.sig.as_bytes()));
+        }
+        Ok(VerificationResult {
+            valid: true,
+            message: format!("{} record(s) verified, chain intact", results.len()),
+            header: None,
+            payload: None,
+        })
     }
 
     /// Verify a result from file
@@ -457,7 +543,7 @@ Nonce: {}
         result.payload.system_info.virtualization.bios_virtualization_enabled,
         serde_json::to_string_pretty(&result.payload.benchmark_config).unwrap_or_default(),
         serde_json::to_string_pretty(&result.payload.benchmark_results).unwrap_or_default(),
-        result.signature.hmac,
+        result.signature.sig,
         result.header.salt,
         result.header.nonce,
     )
@@ -658,7 +744,7 @@ mod tests {
 
         let loaded = logger.load_all_results().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].signature.hmac, signed.signature.hmac);
+        assert_eq!(loaded[0].signature.sig, signed.signature.sig);
         assert!(logger.verify_result(&loaded[0]).valid);
     }
 
@@ -704,7 +790,7 @@ mod tests {
             .unwrap();
         let v = logger.verify_result(&signed);
         let text = generate_shareable_summary(&signed, &v);
-        assert!(text.contains(&signed.signature.hmac));
+        assert!(text.contains(&signed.signature.sig));
     }
 
     #[test]
@@ -724,5 +810,88 @@ mod tests {
 
         let loaded = logger.load_all_results().unwrap();
         assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn test_public_key_verification_needs_no_secret() {
+        let (dir, logger, info) = logger_and_info();
+        let v = serde_json::json!({"x": 1});
+        let signed = logger.log_result("cpu", &info, &v, &v, HashMap::new()).unwrap();
+        let pk: [u8; 32] = hex::decode(logger.public_key_hex()).unwrap().try_into().unwrap();
+        assert!(ResultLogger::verify_with_public_key(&signed, &pk).valid);
+
+        // a different key must not validate it
+        let other = tempdir().unwrap();
+        let other_logger = ResultLogger::new("1".into(), other.path().to_string_lossy().into()).unwrap();
+        let other_pk: [u8; 32] = hex::decode(other_logger.public_key_hex()).unwrap().try_into().unwrap();
+        assert!(!ResultLogger::verify_with_public_key(&signed, &other_pk).valid);
+
+        // re-signing edited data with a different key is detected because the key no longer matches
+        let mut forged = signed.clone();
+        forged.payload.benchmark_results = serde_json::json!({"x": 999});
+        forged.signature = other_logger.sign(&forged.header, &forged.payload).unwrap();
+        assert!(!ResultLogger::verify_with_public_key(&forged, &pk).valid);
+        drop(dir);
+    }
+
+    #[test]
+    fn test_saved_result_files_are_read_only() {
+        let (dir, logger, info) = logger_and_info();
+        logger.log_result("cpu", &info, &serde_json::json!({}), &serde_json::json!({}), HashMap::new()).unwrap();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().map_or(false, |e| e == "json") || path.file_name().unwrap() == "signing_key.bin" {
+                assert!(std::fs::metadata(&path).unwrap().permissions().readonly(), "{:?}", path);
+                assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err() || is_root());
+            }
+        }
+    }
+
+    fn is_root() -> bool {
+        #[cfg(unix)]
+        {
+            unsafe { libc::geteuid() == 0 }
+        }
+        #[cfg(not(unix))]
+        false
+    }
+
+    #[test]
+    fn test_hash_chain_detects_tampering() {
+        let (dir, logger, info) = logger_and_info();
+        let v = serde_json::json!({});
+        for t in ["memory", "cpu", "gpu"] {
+            logger.log_result(t, &info, &v, &v, HashMap::new()).unwrap();
+        }
+        assert!(logger.verify_log().unwrap().valid);
+
+        // Delete the middle record from the master log
+        let log = dir.path().join("results_master.log");
+        let all = logger.load_all_results().unwrap();
+        assert_eq!(all[1].header.prev_hash, hex::encode(Sha256::digest(all[0].signature.sig.as_bytes())));
+        let mut out = Vec::new();
+        for r in [&all[0], &all[2]] {
+            let data = serde_json::to_vec(r).unwrap();
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&data);
+        }
+        std::fs::write(&log, out).unwrap();
+        let verdict = logger.verify_log().unwrap();
+        assert!(!verdict.valid, "{}", verdict.message);
+        assert!(verdict.message.contains("chain"));
+    }
+
+    #[test]
+    fn test_edited_master_log_record_is_detected() {
+        let (dir, logger, info) = logger_and_info();
+        let v = serde_json::json!({"x": 1});
+        logger.log_result("cpu", &info, &v, &v, HashMap::new()).unwrap();
+        let mut r = logger.load_all_results().unwrap().remove(0);
+        r.payload.benchmark_results = serde_json::json!({"x": 2});
+        let data = serde_json::to_vec(&r).unwrap();
+        let mut out = (data.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&data);
+        std::fs::write(dir.path().join("results_master.log"), out).unwrap();
+        assert!(!logger.verify_log().unwrap().valid);
     }
 }

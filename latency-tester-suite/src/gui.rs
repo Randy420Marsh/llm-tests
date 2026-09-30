@@ -389,9 +389,9 @@ impl LatencyTesterApp {
                 let verification = logger.verify_result(&verified);
                 self.last_logged = Some((verified.clone(), verification.clone()));
                 self.log(&format!(
-                    "Result logged and verified: {} (HMAC: {}...)",
+                    "Result logged and verified: {} (signature: {}...)",
                     verification.message,
-                    &verified.signature.hmac[..16]
+                    &verified.signature.sig[..16]
                 ));
             }
             Err(e) => {
@@ -899,6 +899,14 @@ impl LatencyTesterApp {
                 self.log_last_result();
             }
             
+            if ui.button("Verify Entire Log (signatures + chain)").clicked() {
+                match self.logger.as_ref().map(|l| l.verify_log()) {
+                    Some(Ok(v)) => self.log(&format!("Log verification: {} - {}", if v.valid { "OK" } else { "FAILED" }, v.message)),
+                    Some(Err(e)) => self.log(&format!("Log verification error: {}", e)),
+                    None => self.log("No result logger available"),
+                }
+            }
+
             if ui.button("Refresh Results").clicked() {
                 match self.logger.as_ref().map(|l| l.load_all_results()) {
                     Some(Ok(results)) => {
@@ -916,7 +924,8 @@ impl LatencyTesterApp {
             ui.heading("Last Logged Result");
             ui.label(format!("Valid: {}", verification.valid));
             ui.label(format!("Message: {}", verification.message));
-            ui.label(format!("HMAC: {}", &verified.signature.hmac));
+            ui.label(format!("Signature: {}", &verified.signature.sig));
+            ui.label(format!("Public key: {}", &verified.signature.public_key));
             ui.label(format!("Salt: {}", &verified.header.salt));
             ui.label(format!("Nonce: {}", &verified.header.nonce));
             ui.label(format!("App hash: {}", &verified.header.app_hash));
@@ -937,7 +946,7 @@ impl LatencyTesterApp {
                         ui.label(format!("#{}: {}", i + 1, r.payload.test_type));
                         ui.label(&r.header.timestamp);
                         ui.label(&r.header.app_version);
-                        ui.label(format!("HMAC: {}...", &r.signature.hmac[..16]));
+                        ui.label(format!("sig: {}...", &r.signature.sig[..16]));
                     });
                 }
             });

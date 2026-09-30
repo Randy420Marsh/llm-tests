@@ -163,6 +163,13 @@ pub fn run(args: &[String]) -> Result<()> {
             .unwrap_or_else(|e| failures.push(e.to_string()));
     }
 
+    println!("Signing public key: {}", logger.public_key_hex());
+    match logger.verify_log() {
+        Ok(v) if v.valid => println!("Log integrity: {}", v.message),
+        Ok(v) => failures.push(format!("log integrity: {}", v.message)),
+        Err(e) => failures.push(format!("log integrity: {}", e)),
+    }
+
     if failures.is_empty() {
         println!("All requested suites completed.");
         Ok(())
