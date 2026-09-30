@@ -195,6 +195,15 @@ sample with one column per sensor, and `phases.csv` lists each test's start and 
   refresh anyway, and in the precise window 1 ms white becomes exactly one frame, every cycle. It shows the
   refresh rate, the frames per phase, frame-time p50/p99 and late (dropped) frames. `Esc` closes, `I` hides the text.
   (`latency-tester --pattern --on-ms 1 --off-ms 500 [--cycles N] [--windowed]` starts it directly.)
+  - **Ghosting test:** instead of flashes it can sweep a vertical line left → right, a horizontal line top → bottom,
+    both at once, or a square, with a settable width and sweep time. Every sweep is a whole, even number of frames,
+    so with *both* the two lines meet exactly at the centre of the screen on the middle frame. Look for trails
+    (slow pixel response) or bright/dark halos (overdrive) behind the moving edge.
+  - **Display** picks the monitor it opens on (on Windows it is placed on that monitor's exact pixels, then goes
+    full screen there), and **Start after** gives a black lead-in (5 s by default) to get the camera or sensor
+    ready; the refresh rate is measured during it.
+  - `latency-tester --pattern --motion both|vertical|horizontal|square --width 8 --sweep-ms 2000 --display 2
+    --delay-ms 5000` starts it directly.
 - **Timers.** The Dashboard shows the time source and the timer resolution. On Windows the QPC frequency tells
   the source (10 MHz = invariant TSC, 14.318 MHz = HPET forced with `bcdedit /set useplatformclock true`,
   3.58 MHz = ACPI PM timer), and the app requests the finest system timer resolution (usually 0.5 ms) while it
@@ -232,6 +241,25 @@ Notes on the numbers:
   self-contained `report.html` (no external resources: e-mail it or open it offline). The page shows each
   file's signature status (valid / edited / signed by another key), the system info, per-test results, sweeps
   and the sensor timeline, with per-series toggles.
+
+## Mouse polling and the reflex game
+
+- **Mouse polling** (Input tab): move the mouse, fast circles work best, for a few seconds. Every report the mouse
+  sends is timestamped on arrival, like MouseTester: on Windows through raw input (WM_INPUT) on a
+  high-priority thread with QueryPerformanceCounter, on Linux through evdev with the kernel's own timestamps
+  (needs the `input` group). The result is the real polling rate (from the median interval) and the setting
+  it matches, the interval spread (jitter, 1 % / 99 %), how many reports arrived on time (±10 %) or a whole
+  interval late, and the counts per report, with *interval vs time* and *x counts vs time* charts. Runs are
+  saved in the session (`mouse_polling.csv`).
+- The **OS timing suite** below it never read the mouse: its modes time the app's own wake-ups. They are now named
+  for what they measure (*Sleep 100 µs wake-up*, *Sleep 50 µs wake-up*, *Poll loop*, *1 ms busy-wait jitter*;
+  saved files keep the old `MouseMove` / `RawInput` / `PollingRate` / `Jitter` names).
+- **Reflex game** (Input tab): click red circles as fast as you can, 100 by default, one at a time or several at
+  a time (each hit brings a new one), with a settable circle size and a soft sound on each hit (can be turned
+  off). It reports the time per circle (average, median, 90 %, best, worst), misses and accuracy, how far from the
+  centre the hits land, circles per second and the Fitts' law throughput (bits/s), with a chart of every hit.
+  The times include everything from seeing the circle to the click reaching the app. Saved in the session
+  (`reflex_game.csv`, one row per circle).
 
 ## Automated input-latency rig (optional)
 

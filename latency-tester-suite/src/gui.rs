@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 mod core_select;
 mod input_ui;
 mod memory_ui;
+mod polling_ui;
+mod aim_ui;
 mod results_ui;
 mod run_all_ui;
 mod suites_ui;
@@ -99,6 +101,10 @@ pub struct LatencyTesterApp {
     // Input latency interactive state
     show_log_panel: bool,
     input_test: input_ui::InputTestUi,
+    /// Input tab, "Mouse polling"
+    polling: polling_ui::PollingUi,
+    /// Input tab, "Reflex game"
+    aim: aim_ui::AimUi,
     display_whole_area: bool,
     log_text: String,
     log_saved_note: String,
@@ -212,6 +218,8 @@ impl LatencyTesterApp {
             gpu_custom_k: 512,
             show_log_panel: true,
             input_test: input_ui::InputTestUi::new(),
+            polling: polling_ui::PollingUi::new(),
+            aim: aim_ui::AimUi::new(),
             display_whole_area: false,
             log_text: String::new(),
             log_saved_note: String::new(),
@@ -477,6 +485,8 @@ impl LatencyTesterApp {
             memory_extra_configs: &self.mem_extra_configs,
             cpu_extra_configs: &self.cpu_extra_configs,
             run_info,
+            mouse_polling: &self.polling.results,
+            reflex_game: &self.aim.results,
         }
     }
 

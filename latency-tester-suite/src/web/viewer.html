@@ -131,6 +131,8 @@ function telemetryValues(t) {
   put('gpu_power', t.gpu_power_max_w); put('vram_used', t.vram_used_max_mb); put('vram_total', t.vram_total_mb);
   return v;
 }
+// the timing-suite modes time the app's own wake-ups; their old names suggested device input
+const MODE_LABELS = { MouseMove: 'Sleep 100 µs wake-up', RawInput: 'Sleep 50 µs wake-up', PollingRate: 'Poll loop (sleep 100 µs)', Jitter: '1 ms busy-wait jitter', MouseClick: 'Click (simulated)', KeyPress: 'Key press (simulated)' };
 const KINDS = {
   memory: {
     title: 'Memory', logX: true, xLabel: 'buffer size', xFmt: v => humanSize(2 ** v),
@@ -188,12 +190,29 @@ const KINDS = {
     })); },
   },
   input_timing_suite: {
-    title: 'Input timing suite',
+    title: 'OS timing suite (no device input: sleep / wake-up precision)',
     metrics: [['avg_ms','Average','time'],['p99_ms','p99','time'],['max_ms','Worst','time'],['jitter_ms','Jitter','time'],['polling_hz','Loop rate','Hz'],['samples','Samples','']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map((r, i) => ({
-      series: String(r.mode), x: r.core ?? i, xLabel: r.core !== null && r.core !== undefined ? `core ${r.core}` : 'OS scheduled',
+      series: MODE_LABELS[r.mode] || String(r.mode), x: r.core ?? i, xLabel: r.core !== null && r.core !== undefined ? `core ${r.core}` : 'OS scheduled',
       values: Object.assign({ avg_ms: r.avg_latency_ms * 1e6, p99_ms: r.percentile_99_ms * 1e6, max_ms: r.max_latency_ms * 1e6, jitter_ms: r.jitter_ms * 1e6, samples: r.sample_count, ...(r.polling_rate_hz ? { polling_hz: r.polling_rate_hz } : {}) }, telemetryValues(r.telemetry)),
     })); },
+  },
+  mouse_polling: {
+    title: 'Mouse polling (you moved the mouse)',
+    metrics: [['rate_hz','Polling rate','Hz'],['nominal_hz','Set rate','Hz'],['median_us','Median interval','time'],['jitter_us','Interval jitter (std dev)','time'],['p99_us','p99 interval','time'],['on_time','On time (±10 %)','%'],['skipped','Late / merged','%'],['counts','Counts per report (avg)',''],['reports','Reports','']],
+    rows(sec) { return (sec.runs || []).map((r, i) => ({
+      series: 'Mouse polling', x: i + 1, xLabel: `run ${i + 1}`,
+      values: { rate_hz: r.rate_hz, nominal_hz: r.nominal_hz, median_us: r.interval_median_us * 1e3, jitter_us: r.jitter_us * 1e3, p99_us: r.interval_p99_us * 1e3, on_time: r.on_time_pct, skipped: r.skipped_pct, counts: r.counts_avg, reports: r.reports },
+    })); },
+  },
+  reflex_game: {
+    title: 'Reflex game (click the red circles)',
+    metrics: [['time','Time per circle','time']],
+    rows(sec) {
+      const rows = [];
+      (sec.runs || []).forEach((g, gi) => (g.times_ms || []).forEach((t, i) => rows.push({ series: `Game ${gi + 1} · ${g.mode} · ${Math.round(g.radius)} px · ${fmt(g.accuracy_pct)} % accuracy`, x: i + 1, xLabel: `circle ${i + 1}`, values: { time: t * 1e6 } })));
+      return rows;
+    },
   },
   input_trials: {
     title: 'Click / key-press trials',
@@ -289,7 +308,7 @@ async function select(name, multi) {
 // ------------------------------------------------------------------------------------------------
 function sectionsOf(doc) {
   const p = doc.payload || {}; const br = p.benchmark_results || {}; const t = p.test_type;
-  const known = ['memory','cpu','gpu','input_timing_suite','input_trials','sensors','virtualization'];
+  const known = ['memory','cpu','gpu','input_timing_suite','input_trials','mouse_polling','reflex_game','sensors','virtualization'];
   if (t === 'session' || known.some(k => br[k] !== undefined && typeof br[k] === 'object')) {
     const s = {}; known.forEach(k => { if (br[k] !== undefined) s[k] = br[k]; }); return s;
   }
@@ -993,7 +1012,7 @@ function overview(doc, name, meta) {
 // page
 // ------------------------------------------------------------------------------------------------
 let lastRender = null;
-const KIND_ORDER = ['memory', 'cpu', 'gpu', 'input_timing_suite', 'input_trials'];
+const KIND_ORDER = ['memory', 'cpu', 'gpu', 'input_timing_suite', 'input_trials', 'mouse_polling', 'reflex_game'];
 const entriesFor = k => lastRender.perDoc.filter(p => p.sections[k]).map(p => ({ label: p.label, sec: p.sections[k] }));
 
 function render() {

@@ -31,6 +31,10 @@ mod timer_info;
 mod pattern_window;
 mod render_setup;
 mod lhm;
+mod mouse_poll;
+mod aim_game;
+mod sound;
+mod displays;
 
 use anyhow::Result;
 use eframe::egui;

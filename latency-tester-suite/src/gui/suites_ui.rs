@@ -479,13 +479,13 @@ impl LatencyTesterApp {
     pub(super) fn input_suite_options(&mut self, ui: &mut Ui) {
         ui.add_enabled_ui(!self.is_running(), |ui| {
             egui::CollapsingHeader::new("Timing-suite options").id_salt("input_opts").show(ui, |ui| {
-                ui.label(RichText::new("Measures the OS timing / scheduling stack (not real hardware input). Pin it to a core, or sweep every core to spot one with bad timer jitter.").weak().small());
+                ui.label(RichText::new("Times the OS's own wake-ups (sleep precision, scheduler): no mouse or keyboard is read. The real mouse test is the Mouse polling tab. Pin it to a core, or sweep every core to spot one with bad timer jitter.").weak().small());
                 self.input_ui.cores.ui(ui);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Samples per test:");
                     ui.add(egui::DragValue::new(&mut self.input_ui.samples).range(10..=100_000));
                     for (m, on) in self.input_ui.modes.iter_mut() {
-                        ui.checkbox(on, format!("{:?}", m));
+                        ui.checkbox(on, m.label()).on_hover_text(m.describe());
                     }
                 });
             });

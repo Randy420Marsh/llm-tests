@@ -34,6 +34,32 @@ pub enum InputTestMode {
     Jitter,           // Measure input jitter
 }
 
+impl InputTestMode {
+    /// What the mode really measures. The four timing-suite modes do not read any device: they time the
+    /// app's own wake-ups (sleep precision, scheduler), which bounds how precisely input can be handled.
+    /// The real mouse test is the "Mouse polling" tab (`mouse_poll`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            InputTestMode::MouseClick => "Click (simulated)",
+            InputTestMode::KeyPress => "Key press (simulated)",
+            InputTestMode::MouseMove => "Sleep 100 µs wake-up",
+            InputTestMode::RawInput => "Sleep 50 µs wake-up",
+            InputTestMode::PollingRate => "Poll loop (sleep 100 µs)",
+            InputTestMode::Jitter => "1 ms busy-wait jitter",
+        }
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match self {
+            InputTestMode::MouseClick | InputTestMode::KeyPress => "Fixed simulated reaction times, no real input (the real tests are the Mouse click / Keyboard press tabs)",
+            InputTestMode::MouseMove => "How long a 100 µs sleep really takes: the OS timer resolution and scheduler wake-up delay (was called \"MouseMove\"; it never read the mouse)",
+            InputTestMode::RawInput => "How long a 50 µs sleep really takes (was called \"RawInput\"; it never read any device)",
+            InputTestMode::PollingRate => "Turns per second of a loop that sleeps 100 µs each turn, and how even they are",
+            InputTestMode::Jitter => "Spread of 1 ms intervals timed by busy-waiting on the high-resolution timer",
+        }
+    }
+}
+
 impl Default for InputLatencyConfig {
     fn default() -> Self {
         Self {

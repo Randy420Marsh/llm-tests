@@ -286,7 +286,7 @@ pub(super) fn input_rows(results: &[InputLatencyResult]) -> Vec<Row> {
             telemetry_values(&r.telemetry, &mut v);
             let x = r.core.map(|c| c as f64).unwrap_or(i as f64);
             Row {
-                series: format!("{:?}", r.mode),
+                series: r.mode.label().to_string(),
                 x,
                 x_label: r.core.map(|c| format!("core {}", c)).unwrap_or_else(|| "OS scheduled".into()),
                 values: v,

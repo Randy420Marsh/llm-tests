@@ -70,6 +70,10 @@ pub struct SessionData<'a> {
     pub cpu_extra_configs: &'a [CpuBenchmarkConfig],
     /// How a "run all tests" run was set up and how it ended
     pub run_info: Option<Value>,
+    /// Mouse polling runs (the user moved the mouse; `mouse_poll`)
+    pub mouse_polling: &'a [crate::mouse_poll::MousePollResult],
+    /// Reflex game results (`aim_game`)
+    pub reflex_game: &'a [crate::aim_game::AimResult],
 }
 
 /// Timeline points kept in the saved record (a long run has tens of thousands of samples)
@@ -180,6 +184,12 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
                 .collect();
             config.insert("input_trials".into(), json!({ "rig_calibration": data.calibration }));
             results.insert("input_trials".into(), json!({ "runs": runs }));
+        }
+        if !data.mouse_polling.is_empty() {
+            results.insert("mouse_polling".into(), json!({ "runs": data.mouse_polling }));
+        }
+        if !data.reflex_game.is_empty() {
+            results.insert("reflex_game".into(), json!({ "runs": data.reflex_game }));
         }
     }
     if scope.includes(Scope::Sensors) && !data.timeline.is_empty() {
@@ -297,6 +307,29 @@ pub fn csv_files(data: &SessionData) -> Vec<(String, String)> {
         }
     }
     add("input_trials.csv", trials);
+    // one row per run; the per-report series stay in the signed record
+    add(
+        "mouse_polling.csv",
+        data.mouse_polling
+            .iter()
+            .map(|r| {
+                let mut v = to_value(r);
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("intervals");
+                    o.remove("x_counts");
+                }
+                v
+            })
+            .collect(),
+    );
+    // one row per circle hit
+    let mut hits = Vec::new();
+    for (g, r) in data.reflex_game.iter().enumerate() {
+        for (i, t) in r.times_ms.iter().enumerate() {
+            hits.push(json!({ "game": g + 1, "mode": r.mode, "radius_px": r.radius, "circle": i + 1, "time_ms": t }));
+        }
+    }
+    add("reflex_game.csv", hits);
     add("sensors.csv", downsample_timeline(data.timeline, data.timeline.len().max(1)));
     add(
         "phases.csv",
@@ -369,6 +402,21 @@ mod tests {
             gpu: Some(GpuSensors { name: "g".into(), temp_c: Some(40.0), vram_used_mb: Some(500.0), ..Default::default() }),
             sensors: vec![crate::sensors::SensorReading { name: "nct6798: VRM MOS".into(), kind: crate::sensors::SensorKind::Temp, value: 61.5 }, crate::sensors::SensorReading { name: "RAPL: package-0".into(), kind: crate::sensors::SensorKind::Power, value: 88.0 }],
         }
+    }
+
+    #[test]
+    fn mouse_polling_runs_are_saved_and_exported() {
+        let reports: Vec<crate::mouse_poll::Report> = (1..=200).map(|i| crate::mouse_poll::Report { t_ns: i * 1_000_000, dx: 2, dy: 0 }).collect();
+        let r = crate::mouse_poll::analyze(&reports, "test").unwrap();
+        let runs = vec![r];
+        let data = SessionData { mouse_polling: &runs, ..Default::default() };
+        let (_, res) = build(&data, Scope::Input);
+        assert_eq!(res["mouse_polling"]["runs"][0]["nominal_hz"], 1000.0);
+        let files = csv_files(&data);
+        let (name, csv) = files.iter().find(|f| f.0 == "mouse_polling.csv").unwrap();
+        assert_eq!(name, "mouse_polling.csv");
+        assert!(csv.contains("rate_hz") && !csv.contains("intervals"), "the per-report series stay out of the CSV");
+        assert!(!build(&data, Scope::Memory).1.as_object().unwrap().contains_key("mouse_polling"));
     }
 
     #[test]
