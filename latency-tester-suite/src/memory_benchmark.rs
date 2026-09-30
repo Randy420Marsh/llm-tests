@@ -208,9 +208,9 @@ impl AccessPattern {
     /// What the pattern actually does, for the progress display
     pub fn describe(&self) -> &'static str {
         match self {
-            AccessPattern::SequentialRead => "Reads the buffer front to back: best case for the prefetcher, shows read bandwidth",
-            AccessPattern::SequentialWrite => "Writes the buffer front to back: shows write bandwidth",
-            AccessPattern::SequentialReadWrite => "Reads then writes every byte in order (read-modify-write)",
+            AccessPattern::SequentialRead => "Reads the buffer front to back in 64-bit words (AVX2 where available): best case for the prefetcher, shows read bandwidth",
+            AccessPattern::SequentialWrite => "Writes the buffer front to back in 64-bit words: shows write bandwidth",
+            AccessPattern::SequentialReadWrite => "Reads and writes back every word in order (read-modify-write)",
             AccessPattern::RandomRead => "Reads one byte per cache line in random order: defeats the prefetcher, shows random-access cost",
             AccessPattern::RandomWrite => "Writes one byte per cache line in random order",
             AccessPattern::StridedRead { .. } => "Reads with a fixed stride: probes cache-line / page (TLB) behaviour",
@@ -218,9 +218,9 @@ impl AccessPattern {
             AccessPattern::DependentRead => "Follows a sequential chain of dependent loads: latency with a prefetch-friendly layout",
             AccessPattern::IndependentRead => "Reads cache lines with 4 independent accumulators: overlaps misses, shows memory-level parallelism",
             AccessPattern::StreamCopy => "STREAM copy: dst = src",
-            AccessPattern::StreamScale => "STREAM scale: a = b * k",
-            AccessPattern::StreamAdd => "STREAM add: a = b + c",
-            AccessPattern::StreamTriad => "STREAM triad: a = b + c * d",
+            AccessPattern::StreamScale => "STREAM scale: a = a · k (in place, 64-bit words)",
+            AccessPattern::StreamAdd => "STREAM add: a = a + b (two buffers, 64-bit words: 2 reads + 1 write)",
+            AccessPattern::StreamTriad => "STREAM triad: a = a + k · b (two buffers, 64-bit words: 2 reads + 1 write)",
         }
     }
 
@@ -325,30 +325,198 @@ enum Prepared {
     None,
     Indices(Vec<usize>),
     PerThread(Vec<Vec<usize>>),
-    Chain { chain: Vec<usize>, starts: Vec<usize> },
+    /// `pos`: where each thread's chase stands; it carries on from there in the next pass and run,
+    /// so a big buffer is walked through instead of the same few MB being revisited (which then sit
+    /// in the cache and made "1 GB" report L3 latency)
+    Chain { chain: Vec<usize>, pos: Vec<std::sync::atomic::AtomicUsize> },
 }
 
-/// Split `buf` into `tc` contiguous, disjoint, mutable chunks (remainder spread over the first chunks)
+/// Split `buf` into `tc` contiguous, disjoint, mutable chunks, the same ranges as [`share`]
 fn split_mut(mut buf: &mut [u8], tc: usize) -> Vec<&mut [u8]> {
     let tc = tc.max(1);
-    let base = buf.len() / tc;
-    let rem = buf.len() % tc;
+    let n = buf.len();
     let mut out = Vec::with_capacity(tc);
     for i in 0..tc {
-        let len = base + usize::from(i < rem);
-        let (head, tail) = buf.split_at_mut(len);
+        let (head, tail) = buf.split_at_mut(share(n, tc, i).len());
         out.push(head);
         buf = tail;
     }
     out
 }
 
-/// Range of items owned by worker `i` when `n` items are shared between `tc` workers
+/// Bytes of one cache line: threads split buffers on line boundaries, so no two threads ever write
+/// the same line (false sharing made tiny buffers with many threads look several times slower)
+const LINE: usize = 64;
+
+/// Range of bytes owned by worker `i` when `n` bytes are shared between `tc` workers: whole cache
+/// lines each (the last worker also takes the tail); falls back to plain bytes for tiny buffers
 fn share(n: usize, tc: usize, i: usize) -> std::ops::Range<usize> {
-    let base = n / tc;
-    let rem = n % tc;
-    let start = i * base + i.min(rem);
-    start..start + base + usize::from(i < rem)
+    let tc = tc.max(1);
+    let units = |n: usize, i: usize| {
+        let base = n / tc;
+        let rem = n % tc;
+        let start = i * base + i.min(rem);
+        start..start + base + usize::from(i < rem)
+    };
+    let lines = n / LINE;
+    if lines < tc {
+        return units(n, i);
+    }
+    let r = units(lines, i);
+    r.start * LINE..if i + 1 == tc { n } else { r.end * LINE }
+}
+
+/// A buffer whose data starts at a chosen offset from a 4 KB page boundary
+#[derive(Default)]
+pub(crate) struct AlignedBuf {
+    raw: Vec<u8>,
+    off: usize,
+    len: usize,
+}
+
+impl std::ops::Deref for AlignedBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.raw[self.off..self.off + self.len]
+    }
+}
+
+impl std::ops::DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.raw[self.off..self.off + self.len]
+    }
+}
+
+/// Offset of the second (STREAM) buffer from a page boundary. Two page-aligned buffers put src[i] and
+/// dst[i] at the same position within a 4 KB page, so every load looks like it may depend on the store
+/// just before it ("4K aliasing"); where the allocator happened to do that, StreamCopy dipped to half
+/// speed at one size. Half a page plus a few lines keeps the two streams apart.
+const AUX_OFFSET: usize = 2048 + 3 * LINE;
+
+/// 64-bit words of a byte slice (the unaligned head and tail bytes stay outside)
+fn words(b: &[u8]) -> (&[u8], &[u64], &[u8]) {
+    // SAFETY: every bit pattern is a valid u64
+    unsafe { b.align_to::<u64>() }
+}
+
+fn words_mut(b: &mut [u8]) -> (&mut [u8], &mut [u64], &mut [u8]) {
+    // SAFETY: every bit pattern is a valid u64
+    unsafe { b.align_to_mut::<u64>() }
+}
+
+/// Defines a kernel twice: compiled for AVX2 (used when the CPU has it) and for the default x86-64
+/// target, which only uses SSE2 and so halves what one core can pull from L1 / L2
+macro_rules! kernel {
+    ($(#[$m:meta])* fn $name:ident($($a:ident: $t:ty),*) $(-> $r:ty)? $body:block) => {
+        $(#[$m])*
+        fn $name($($a: $t),*) $(-> $r)? {
+            #[inline(always)]
+            fn portable($($a: $t),*) $(-> $r)? $body
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[target_feature(enable = "avx2")]
+                unsafe fn avx2($($a: $t),*) $(-> $r)? {
+                    portable($($a),*)
+                }
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    // SAFETY: the CPU supports AVX2 (checked above)
+                    return unsafe { avx2($($a),*) };
+                }
+            }
+            portable($($a),*)
+        }
+    };
+}
+
+kernel! {
+    /// Sum of all words with independent accumulators, so the adds never wait on each other
+    fn k_sum(w: &[u64]) -> u64 {
+        let mut acc = [0u64; 8];
+        let mut it = w.chunks_exact(8);
+        for c in &mut it {
+            for k in 0..8 {
+                acc[k] = acc[k].wrapping_add(c[k]);
+            }
+        }
+        let rest = it.remainder().iter().fold(0u64, |a, &b| a.wrapping_add(b));
+        acc.iter().fold(rest, |a, &b| a.wrapping_add(b))
+    }
+}
+
+kernel! {
+    /// Plain stores of a changing value (a constant would be turned into memset)
+    fn k_fill(w: &mut [u64], seed: u64) {
+        for (i, x) in w.iter_mut().enumerate() {
+            *x = seed ^ i as u64;
+        }
+    }
+}
+
+kernel! {
+    fn k_inc(w: &mut [u64]) {
+        for x in w.iter_mut() {
+            *x = x.wrapping_add(1);
+        }
+    }
+}
+
+kernel! {
+    fn k_scale(w: &mut [u64]) {
+        for x in w.iter_mut() {
+            *x = x.wrapping_mul(3);
+        }
+    }
+}
+
+kernel! {
+    /// a += b, or a += 3·b for the triad
+    fn k_add(a: &mut [u64], b: &[u64], triad: bool) {
+        if triad {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x = x.wrapping_add(y.wrapping_mul(3));
+            }
+        } else {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x = x.wrapping_add(*y);
+            }
+        }
+    }
+}
+
+fn sum_bytes(b: &[u8]) -> u64 {
+    let (head, mid, tail) = words(b);
+    let edge = head.iter().chain(tail).fold(0u64, |a, &x| a.wrapping_add(x as u64));
+    edge.wrapping_add(k_sum(mid))
+}
+
+fn fill_bytes(b: &mut [u8], seed: u64) {
+    let (head, mid, tail) = words_mut(b);
+    head.iter_mut().chain(tail.iter_mut()).for_each(|x| *x = seed as u8);
+    k_fill(mid, seed);
+}
+
+/// Word-wise update of `b` in place: +1 (read-modify-write) or ×3 (STREAM scale)
+fn update_bytes(b: &mut [u8], scale: bool) {
+    let (head, mid, tail) = words_mut(b);
+    for x in head.iter_mut().chain(tail.iter_mut()) {
+        *x = if scale { x.wrapping_mul(3) } else { x.wrapping_add(1) };
+    }
+    if scale { k_scale(mid) } else { k_inc(mid) }
+}
+
+/// dst += src (or dst += 3·src), word-wise when both have the same alignment
+fn add_bytes(dst: &mut [u8], src: &[u8], triad: bool) {
+    let n = dst.len().min(src.len());
+    let (dst, src) = (&mut dst[..n], &src[..n]);
+    let byte = |x: u8, y: u8| if triad { x.wrapping_add(y.wrapping_mul(3)) } else { x.wrapping_add(y) };
+    if dst.as_ptr() as usize % 8 != src.as_ptr() as usize % 8 {
+        dst.iter_mut().zip(src).for_each(|(x, y)| *x = byte(*x, *y));
+        return;
+    }
+    let (dh, dm, dt) = words_mut(dst);
+    let (sh, sm, st) = words(src);
+    dh.iter_mut().zip(sh).chain(dt.iter_mut().zip(st)).for_each(|(x, y)| *x = byte(*x, *y));
+    k_add(dm, sm, triad);
 }
 
 impl MemoryBenchmark {
@@ -442,7 +610,7 @@ impl MemoryBenchmark {
         } else {
             sizes.iter().flat_map(|&s| (0..groups.len()).map(move |g| (s, g))).collect()
         };
-        let (mut data, mut aux, mut have) = (Vec::new(), Vec::new(), None::<usize>);
+        let (mut data, mut aux, mut have) = (AlignedBuf::default(), AlignedBuf::default(), None::<usize>);
         for (size, gi) in order {
             cancel::check(&self.cancel)?;
             if have != Some(size) {
@@ -458,7 +626,7 @@ impl MemoryBenchmark {
                 drop(std::mem::take(&mut aux));
                 data = self.allocate_buffer(size)?;
                 if needs_aux {
-                    aux = self.allocate_buffer(size)?;
+                    aux = self.allocate_at(size, AUX_OFFSET)?;
                 }
                 have = Some(size);
             }
@@ -632,12 +800,16 @@ impl MemoryBenchmark {
         })
     }
 
-    /// Allocate a page-touched buffer with non-constant contents
-    fn allocate_buffer(&mut self, size: usize) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(size)
+    /// Allocate a page-touched buffer with non-constant contents, starting `offset` bytes after a
+    /// 4 KB page boundary
+    fn allocate_at(&mut self, size: usize, offset: usize) -> Result<AlignedBuf> {
+        const PAGE: usize = 4096;
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(size + PAGE + offset)
             .map_err(|e| anyhow::anyhow!("Failed to allocate {} bytes: {}", size, e))?;
-        buf.resize(size, 0);
+        raw.resize(size + PAGE + offset, 0);
+        let off = (PAGE - raw.as_ptr() as usize % PAGE) % PAGE + offset;
+        let mut buf = AlignedBuf { raw, off, len: size };
         // Cheap non-constant fill that also faults every page in (no lazy zero pages)
         let seed: u8 = self.rng.gen();
         for (i, chunk) in buf.chunks_mut(4096).enumerate() {
@@ -647,6 +819,11 @@ impl MemoryBenchmark {
             }
         }
         Ok(buf)
+    }
+
+    /// The main buffer: page aligned
+    fn allocate_buffer(&mut self, size: usize) -> Result<AlignedBuf> {
+        self.allocate_at(size, 0)
     }
 
     /// Pin worker `i` to its configured core (no-op when no cores were selected)
@@ -759,24 +936,16 @@ impl MemoryBenchmark {
     fn sequential_read(&self, buffer: &[u8], tc: usize) -> (u64, f64) {
         self.run_parallel(tc, |i| {
             let r = share(buffer.len(), tc, i);
-            let mut sum = 0u64;
-            for &val in &buffer[r.clone()] {
-                sum = sum.wrapping_add(val as u64);
-            }
-            std::hint::black_box(sum);
+            std::hint::black_box(sum_bytes(&buffer[r.clone()]));
             r.len()
         })
     }
 
     // Sequential write - measures memory write bandwidth
     fn sequential_write(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
-        let base = buffer.len() / tc;
-        let rem = buffer.len() % tc;
         self.run_parallel_mut(buffer, tc, |i, chunk| {
-            let start = i * base + i.min(rem);
-            for (j, byte) in chunk.iter_mut().enumerate() {
-                *byte = ((start + j) & 0xFF) as u8;
-            }
+            fill_bytes(chunk, 0x9E37_79B9_7F4A_7C15 ^ i as u64);
+            std::hint::black_box(&*chunk);
             chunk.len()
         })
     }
@@ -784,9 +953,8 @@ impl MemoryBenchmark {
     // Sequential read-write
     fn sequential_read_write(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
         self.run_parallel_mut(buffer, tc, |_, chunk| {
-            for byte in chunk.iter_mut() {
-                *byte = byte.wrapping_add(1);
-            }
+            update_bytes(chunk, false);
+            std::hint::black_box(&*chunk);
             chunk.len() * 2 // Read + write
         })
     }
@@ -821,15 +989,17 @@ impl MemoryBenchmark {
                 for i in 0..lines {
                     chain[perm[i] * 8] = perm[(i + 1) % lines] * 8;
                 }
-                let starts = (0..tc).map(|i| perm[i % lines] * 8).collect();
-                Prepared::Chain { chain, starts }
+                // threads start evenly spread around the cycle (adjacent starts would make every
+                // thread walk right behind the first one and find its lines already cached)
+                let pos = (0..tc).map(|i| std::sync::atomic::AtomicUsize::new(perm[(i * lines / tc.max(1)) % lines] * 8)).collect();
+                Prepared::Chain { chain, pos }
             }
             AccessPattern::DependentRead => {
                 // Sequential chain: node i -> node i+1, last wraps to 0
                 let num_nodes = (size / 8).max(tc);
                 let chain = (0..num_nodes).map(|i| (i + 1) % num_nodes).collect();
-                let starts = (0..tc).map(|i| (i * num_nodes) / tc).collect();
-                Prepared::Chain { chain, starts }
+                let pos = (0..tc).map(|i| std::sync::atomic::AtomicUsize::new((i * num_nodes) / tc.max(1))).collect();
+                Prepared::Chain { chain, pos }
             }
             _ => Prepared::None,
         }
@@ -889,14 +1059,15 @@ impl MemoryBenchmark {
     }
 
     fn chase(&self, tc: usize, prep: &Prepared) -> (u64, f64) {
-        let Prepared::Chain { chain, starts } = prep else { return (0, 1.0) };
-        let steps: usize = 1 << 16; // Chase depth per thread (latency-bound)
+        use std::sync::atomic::Ordering::Relaxed;
+        let Prepared::Chain { chain, pos } = prep else { return (0, 1.0) };
+        let steps: usize = 1 << 16; // Chase depth per thread per pass (latency-bound)
         self.run_parallel(tc, |i| {
-            let mut current = starts[i];
+            let mut current = pos[i % pos.len()].load(Relaxed);
             for _ in 0..steps {
                 current = chain[current];
             }
-            std::hint::black_box(current);
+            pos[i % pos.len()].store(current, Relaxed);
             steps * 8
         })
     }
@@ -927,44 +1098,34 @@ impl MemoryBenchmark {
         })
     }
 
-    // Stream scale - a = b * scalar
+    // Stream scale - a = a * scalar
     fn stream_scale(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
         self.run_parallel_mut(buffer, tc, |_, chunk| {
-            for byte in chunk.iter_mut() {
-                *byte = byte.wrapping_mul(3);
-            }
+            update_bytes(chunk, true);
+            std::hint::black_box(&*chunk);
             chunk.len() * 2 // Read + write
         })
     }
 
-    // Stream add - a = b + c (reads `src`, writes `dst`)
+    // Stream add - a = a + b (reads `dst` and `src`, writes `dst`: the same traffic as STREAM's c = a + b)
     fn stream_add(&self, src: &[u8], dst: &mut [u8], tc: usize) -> (u64, f64) {
         let n = src.len();
         self.run_parallel_mut(dst, tc, |i, chunk| {
             let start = share(n, tc, i).start;
-            for (j, byte) in chunk.iter_mut().enumerate() {
-                let i = start + j;
-                let a = src[i];
-                let b = src[if i + 1 == n { 0 } else { i + 1 }];
-                *byte = a.wrapping_add(b);
-            }
+            add_bytes(chunk, &src[start..(start + chunk.len()).min(n)], false);
+            std::hint::black_box(&*chunk);
             chunk.len() * 3 // 2 reads + 1 write
         })
     }
 
-    // Stream triad - a = b + c * d (reads `src`, writes `dst`)
+    // Stream triad - a = a + k·b (2 reads + 1 write, like STREAM's a = b + k·c)
     fn stream_triad(&self, src: &[u8], dst: &mut [u8], tc: usize) -> (u64, f64) {
         let n = src.len();
         self.run_parallel_mut(dst, tc, |i, chunk| {
             let start = share(n, tc, i).start;
-            for (j, byte) in chunk.iter_mut().enumerate() {
-                let i = start + j;
-                let b = src[i];
-                let c = src[if i + 1 >= n { i + 1 - n } else { i + 1 }];
-                let d = src[if i + 2 >= n { i + 2 - n } else { i + 2 }];
-                *byte = b.wrapping_add(c.wrapping_mul(d));
-            }
-            chunk.len() * 4 // 3 reads + 1 write
+            add_bytes(chunk, &src[start..(start + chunk.len()).min(n)], true);
+            std::hint::black_box(&*chunk);
+            chunk.len() * 3 // 2 reads + 1 write
         })
     }
 }
@@ -1039,6 +1200,27 @@ mod tests {
         MemoryBenchmark::new(MemoryBenchmarkConfig::default())
     }
 
+    /// Prints ns/access and GB/s per pattern and size (cargo test --release probe_patterns -- --ignored --nocapture)
+    #[test]
+    #[ignore]
+    fn probe_patterns() {
+        let sizes: Vec<usize> = std::env::var("PROBE_SIZES").ok().map(|v| v.split(',').filter_map(|x| x.parse::<usize>().ok()).map(|k| k << 10).collect()).unwrap_or_else(|| vec![16 << 10, 128 << 10, 256 << 10, 512 << 10, 4 << 20, 64 << 20, 256 << 20]);
+        let threads: Vec<usize> = std::env::var("PROBE_THREADS").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| vec![1]);
+        let cfg = MemoryBenchmarkConfig {
+            sizes: sizes.clone(),
+            patterns: AccessPattern::all_default(),
+            iterations: 5,
+            warmup_iterations: 1,
+            thread_counts: threads,
+            time_budget_ms: 0,
+            ..MemoryBenchmarkConfig::default()
+        };
+        let s = MemoryBenchmark::new(cfg).run().unwrap();
+        for r in &s.results {
+            println!("{:<22} {:>2}T {:>7} KB  {:>8.2} ns/access  {:>8.1} GB/s  max/min {:.2}", r.pattern.label(), r.thread_count, r.size >> 10, r.ns_per_access, r.bandwidth_gb_s, r.max_latency_ns / r.min_latency_ns);
+        }
+    }
+
     #[test]
     fn test_sequential_read() {
         let mut b = bench();
@@ -1099,7 +1281,7 @@ mod tests {
         let src = b.allocate_buffer(1001).unwrap();
         let mut dst = vec![0u8; 1001];
         b.stream_copy(&src, &mut dst, 4);
-        assert_eq!(src, dst);
+        assert_eq!(&src[..], &dst[..]);
     }
 
     #[test]
@@ -1150,7 +1332,7 @@ mod tests {
         let s = b.run().unwrap();
         assert!(started.elapsed().as_secs_f64() < 5.0, "budget ignored: {:?}", started.elapsed());
         let n = s.results[0].iterations;
-        assert!(n >= 3 && n < 100_000, "iterations = {}", n);
+        assert!((3..100_000).contains(&n), "iterations = {}", n);
     }
 
     #[test]
@@ -1278,15 +1460,75 @@ mod tests {
     fn test_pointer_chase_visits_whole_cycle() {
         let b = bench();
         let prep = b.prepare(AccessPattern::PointerChase, 64 * 1024, 1);
-        let Prepared::Chain { chain, starts } = prep else { panic!() };
+        let Prepared::Chain { chain, pos } = prep else { panic!() };
         let lines = 64 * 1024 / 64;
         let mut seen = std::collections::HashSet::new();
-        let mut cur = starts[0];
+        let start = pos[0].load(std::sync::atomic::Ordering::Relaxed);
+        let mut cur = start;
         for _ in 0..lines {
             assert!(seen.insert(cur), "revisited a line before completing the cycle");
             cur = chain[cur];
         }
-        assert_eq!(cur, starts[0]);
+        assert_eq!(cur, start);
+    }
+
+    #[test]
+    fn chase_carries_on_and_threads_start_apart() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = bench();
+        // 64 MB = 1 M lines: one pass of 65536 hops must not return to where it began
+        let prep = b.prepare(AccessPattern::PointerChase, 64 << 20, 4);
+        let Prepared::Chain { chain, pos } = &prep else { panic!() };
+        let before: Vec<usize> = pos.iter().map(|p| p.load(Relaxed)).collect();
+        b.pointer_chase(4, &prep);
+        let after: Vec<usize> = pos.iter().map(|p| p.load(Relaxed)).collect();
+        assert!(before.iter().zip(&after).all(|(a, b)| a != b), "each thread moved on");
+        // thread 1 starts a quarter of the cycle after thread 0, not one hop behind it
+        let (mut cur, mut hops) = (before[0], 0usize);
+        while cur != before[1] {
+            cur = chain[cur];
+            hops += 1;
+        }
+        assert_eq!(hops, (64 << 20) / 64 / 4);
+    }
+
+    #[test]
+    fn threads_split_on_cache_lines() {
+        // 4 KB between 24 threads: 64 lines, no line shared by two threads
+        for i in 0..24 {
+            let r = share(4096, 24, i);
+            assert_eq!(r.start % 64, 0);
+            assert!(r.end % 64 == 0 || r.end == 4096);
+        }
+        assert_eq!((0..24).map(|i| share(4096, 24, i).len()).sum::<usize>(), 4096);
+        assert_eq!((0..3).map(|i| share(1000, 3, i).len()).sum::<usize>(), 1000);
+        assert_eq!(share(100, 3, 2).end, 100, "tiny buffers still split");
+    }
+
+    #[test]
+    fn kernels_compute_what_they_claim() {
+        let mut b = bench();
+        let mut a = b.allocate_at(4096 + 13, 0).unwrap();
+        let mut c = b.allocate_at(4096 + 13, AUX_OFFSET).unwrap();
+        assert_eq!(a.as_ptr() as usize % 4096, 0);
+        assert_eq!(c.as_ptr() as usize % 4096, AUX_OFFSET);
+        // the read kernel adds whole 64-bit words (plus any unaligned edge bytes)
+        let (h, w, t) = words(&a);
+        let expect = w.iter().chain(h.iter().chain(t).map(|&b| b as u64).collect::<Vec<_>>().iter()).fold(0u64, |x, &y| x.wrapping_add(y));
+        assert_eq!(sum_bytes(&a), expect);
+        let (a0, c0) = (a.to_vec(), c.to_vec());
+        add_bytes(&mut c, &a, true);
+        // word-wise arithmetic (carries cross bytes): check through u64 lanes
+        let (_, cw, _) = words(&c);
+        let (_, c0w, _) = words(&c0);
+        let (_, aw, _) = words(&a0);
+        assert!(cw.iter().zip(c0w).zip(aw).all(|((x, y), z)| *x == y.wrapping_add(z.wrapping_mul(3))));
+        update_bytes(&mut a, false);
+        let (_, a1, _) = words(&a);
+        assert!(a1.iter().zip(aw).all(|(x, y)| *x == y.wrapping_add(1)));
+        fill_bytes(&mut a, 5);
+        let (_, a2, _) = words(&a);
+        assert!(a2.iter().enumerate().all(|(i, x)| *x == 5 ^ i as u64));
     }
 
     #[test]

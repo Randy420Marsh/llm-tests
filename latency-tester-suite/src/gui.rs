@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 mod core_select;
 mod input_ui;
 mod memory_ui;
+mod polling_ui;
+mod aim_ui;
+mod bench3d_ui;
+mod measure_ui;
 mod results_ui;
 mod run_all_ui;
 mod suites_ui;
@@ -99,6 +103,12 @@ pub struct LatencyTesterApp {
     // Input latency interactive state
     show_log_panel: bool,
     input_test: input_ui::InputTestUi,
+    /// Input tab, "Mouse polling"
+    polling: polling_ui::PollingUi,
+    /// Input tab, "Reflex game"
+    aim: aim_ui::AimUi,
+    /// GPU tab, "3D graphics benchmark"
+    bench3d: bench3d_ui::Bench3dUi,
     display_whole_area: bool,
     log_text: String,
     log_saved_note: String,
@@ -120,6 +130,9 @@ pub struct LatencyTesterApp {
     lhm_fetch: Arc<std::sync::Mutex<Option<Result<String, String>>>>,
     lhm_fetching: bool,
     lhm_note: String,
+    /// Installed PawnIO driver version (Windows; LibreHardwareMonitor ≥ 0.9.5 needs it)
+    pawnio: Option<String>,
+    pawnio_installing: bool,
 }
 
 /// See `LatencyTesterApp::session_snapshot`
@@ -161,7 +174,7 @@ impl LatencyTesterApp {
             config_dir.to_string_lossy().to_string(),
         ).ok();
 
-        let core_kinds = crate::topology::detect_core_kinds();
+        let core_kinds = crate::topology::cached_core_kinds().map(|k| k.to_vec());
 
         Self {
             tab: Tab::Dashboard,
@@ -209,6 +222,9 @@ impl LatencyTesterApp {
             gpu_custom_k: 512,
             show_log_panel: true,
             input_test: input_ui::InputTestUi::new(),
+            polling: polling_ui::PollingUi::new(),
+            aim: aim_ui::AimUi::new(),
+            bench3d: bench3d_ui::Bench3dUi::new(),
             display_whole_area: false,
             log_text: String::new(),
             log_saved_note: String::new(),
@@ -225,6 +241,8 @@ impl LatencyTesterApp {
             lhm_fetch: Arc::new(std::sync::Mutex::new(None)),
             lhm_fetching: false,
             lhm_note: String::new(),
+            pawnio: crate::lhm::pawnio_version(),
+            pawnio_installing: false,
         }
     }
 
@@ -399,6 +417,7 @@ impl LatencyTesterApp {
             }
         }
         
+        self.poll_bench3d();
         if let Some(result) = COMPLETE_GPU_RESULT.lock().unwrap().take() {
             self.task_status = "Idle".to_string();
             match result {
@@ -472,6 +491,9 @@ impl LatencyTesterApp {
             memory_extra_configs: &self.mem_extra_configs,
             cpu_extra_configs: &self.cpu_extra_configs,
             run_info,
+            mouse_polling: &self.polling.results,
+            reflex_game: &self.aim.results,
+            gpu3d: self.bench3d.last.as_ref(),
         }
     }
 
@@ -553,7 +575,8 @@ impl LatencyTesterApp {
                 ui.end_row();
                 
                 ui.label("Features:");
-                ui.label(sys.cpu.features.join(", "));
+                // a long list: wrap at the window edge instead of running off it
+                ui.add(egui::Label::new(sys.cpu.features.join(", ")).wrap());
                 ui.end_row();
                 
                 ui.label("Memory:");
@@ -690,11 +713,15 @@ impl LatencyTesterApp {
     fn lhm_panel(&mut self, ui: &mut Ui) {
         let fetched = self.lhm_fetch.lock().unwrap().take();
         if let Some(r) = fetched {
+            let pawn = std::mem::take(&mut self.pawnio_installing);
             self.lhm_fetching = false;
             self.lhm_note = match r {
-                Ok(t) => format!("{} · used from the next test on", t.lines().last().unwrap_or("done")),
-                Err(e) => format!("download failed: {}", e.lines().last().unwrap_or("")),
+                Ok(t) => format!("{} · sensor helper restarted", t.lines().last().unwrap_or("done")),
+                Err(e) => format!("{} failed: {}", if pawn { "PawnIO install" } else { "download" }, e.lines().last().unwrap_or("")),
             };
+            self.pawnio = crate::lhm::pawnio_version();
+            // the helper opened LibreHardwareMonitor before the library or the driver existed
+            crate::sensors::restart_windows_helpers();
             let n = self.lhm_note.clone();
             self.log(&format!("LibreHardwareMonitor: {}", n));
         }
@@ -738,12 +765,42 @@ impl LatencyTesterApp {
                 }
             });
         }
+        if cfg!(target_os = "windows") {
+            ui.horizontal_wrapped(|ui| {
+                match &self.pawnio {
+                    Some(v) => ui.label(format!("PawnIO driver: {}", v)),
+                    None => ui.label(
+                        RichText::new("PawnIO driver: not installed. LibreHardwareMonitor 0.9.5+ needs it for CPU core temperatures, board (VRM, fans, voltages) and memory sensors")
+                            .color(Color32::from_rgb(255, 170, 60)),
+                    ),
+                };
+                if self.pawnio.is_none()
+                    && ui
+                        .add_enabled(!self.lhm_fetching && crate::lhm::dir().is_some(), egui::Button::new("Install PawnIO"))
+                        .on_hover_text("Runs the PawnIO setup that ships inside LibreHardwareMonitor.exe (signed driver by namazso, pawnio.eu), the same way LibreHardwareMonitor does on its first start. Needs administrator rights.")
+                        .clicked()
+                {
+                    self.lhm_fetching = true;
+                    self.pawnio_installing = true;
+                    self.lhm_note = "installing PawnIO…".into();
+                    let slot = self.lhm_fetch.clone();
+                    thread::spawn(move || {
+                        let r = crate::lhm::install_pawnio();
+                        *slot.lock().unwrap() = Some(r);
+                    });
+                }
+            });
+        }
         if !self.lhm_note.is_empty() {
             ui.label(RichText::new(&self.lhm_note).weak().small());
         }
     }
 
     fn render_gpu_tab(&mut self, ui: &mut Ui) {
+        egui::ScrollArea::vertical().id_salt("gpu_tab").auto_shrink([false, false]).show(ui, |ui| self.gpu_tab_body(ui));
+    }
+
+    fn gpu_tab_body(&mut self, ui: &mut Ui) {
         ui.heading("GPU Benchmark (Vulkan)");
         ui.separator();
         
@@ -803,20 +860,20 @@ impl LatencyTesterApp {
             ui.label(format!("Vulkan device: {} ({})", vulkan_info.device_name, vulkan_info.device_type));
             ui.label(format!("API: {} Driver: {}", vulkan_info.api_version, vulkan_info.driver_version));
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for result in summary.results.iter().take(20) {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} elements", result.workload_size));
-                        ui.label(format!("{:.3} ms avg", result.avg_latency_ms));
-                        ui.label(format!("p95: {:.3} ms", result.percentile_95_ms));
-                        ui.label(format!("p99: {:.3} ms", result.percentile_99_ms));
-                        ui.label(format!("{:.1} GOPS", result.throughput_geops));
-                    });
-                }
-            });
+            for result in summary.results.iter().take(20) {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} elements", result.workload_size));
+                    ui.label(format!("{:.3} ms avg", result.avg_latency_ms));
+                    ui.label(format!("p95: {:.3} ms", result.percentile_95_ms));
+                    ui.label(format!("p99: {:.3} ms", result.percentile_99_ms));
+                    ui.label(format!("{:.1} GOPS", result.throughput_geops));
+                });
+            }
         } else {
-            ui.label("No GPU results yet. Requires a Vulkan driver (a software driver such as lavapipe also works).");
+            ui.label("No GPU compute results yet. Requires a Vulkan driver (a software driver such as lavapipe also works).");
         }
+        ui.separator();
+        self.bench3d_panel(ui);
     }
 
     fn render_virtualization_tab(&mut self, ui: &mut Ui) {
@@ -1094,14 +1151,14 @@ impl eframe::App for LatencyTesterApp {
         
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("⚡ Latency Tester Suite v1.0");
+                ui.heading(concat!("⚡ Latency Tester Suite v", env!("CARGO_PKG_VERSION")));
                 
                 if self.is_running() {
                     self.stop_button(ui);
                 }
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{}", self.task_status));
+                    ui.label(self.task_status.to_string());
                     if ui.button("🔄 Refresh Info").clicked() {
                         self.refresh_system_info();
                     }
@@ -1130,10 +1187,10 @@ impl eframe::App for LatencyTesterApp {
             ui.heading("Tabs:");
             ui.separator();
             if ui.button("📊 Dashboard").clicked() { self.tab = Tab::Dashboard; }
-            if ui.button("🧠 Memory").clicked() { self.tab = Tab::Memory; }
-            if ui.button("⚙️ CPU").clicked() { self.tab = Tab::Cpu; }
+            if ui.button("💾 Memory").clicked() { self.tab = Tab::Memory; }
+            if ui.button("⚙ CPU").clicked() { self.tab = Tab::Cpu; }
             if ui.button("🎮 GPU (Vulkan)").clicked() { self.tab = Tab::Gpu; }
-            if ui.button("🖱️ Input Latency").clicked() { self.tab = Tab::Input; }
+            if ui.button("🖱 Input Latency").clicked() { self.tab = Tab::Input; }
             if ui.button("🔒 Virtualization").clicked() { self.tab = Tab::Virtualization; }
             if ui.button("📈 Results & Graphs").clicked() { self.tab = Tab::Graphs; }
             if ui.button("📋 Signed Log & Verify").clicked() { self.tab = Tab::Results; }
@@ -1187,11 +1244,49 @@ pub(crate) static COMPLETE_GPU_RESULT: Mutex<Option<Result<crate::gpu_benchmark:
     Mutex::new(None);
 pub(crate) static COMPLETE_INPUT_RESULT: Mutex<Option<Result<crate::input_latency::InputLatencySummary, anyhow::Error>>> = 
     Mutex::new(None);
-static COMPLETE_SYSINFO: Mutex<
-    Option<(
-        Result<SystemInfo, anyhow::Error>,
-        Result<VirtualizationStatus, anyhow::Error>,
-    )>,
-> = Mutex::new(None);
+type SysinfoResult = (Result<SystemInfo, anyhow::Error>, Result<VirtualizationStatus, anyhow::Error>);
+static COMPLETE_SYSINFO: Mutex<Option<SysinfoResult>> = Mutex::new(None);
 static COMPLETE_QUICK_MEMORY: Mutex<Option<Result<QuickMemoryResult, anyhow::Error>>> = Mutex::new(None);
 static COMPLETE_PROBE: Mutex<Option<(Vec<String>, crate::sensors::Snapshot)>> = Mutex::new(None);
+
+#[cfg(test)]
+mod tests {
+    /// Every symbol the UI text uses must exist in egui's bundled fonts, or it shows as an empty box
+    #[test]
+    fn ui_symbols_exist_in_the_bundled_fonts() {
+        let sources = [
+            include_str!("gui.rs"),
+            include_str!("gui/aim_ui.rs"),
+            include_str!("gui/bench3d_ui.rs"),
+            include_str!("gui/core_select.rs"),
+            include_str!("gui/input_ui.rs"),
+            include_str!("gui/measure_ui.rs"),
+            include_str!("gui/memory_ui.rs"),
+            include_str!("gui/polling_ui.rs"),
+            include_str!("gui/results_ui.rs"),
+            include_str!("gui/run_all_ui.rs"),
+            include_str!("gui/suites_ui.rs"),
+        ];
+        let ctx = eframe::egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut missing = std::collections::BTreeSet::new();
+        for src in sources {
+            for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                // only text inside string literals reaches the screen
+                for (i, part) in line.split('"').enumerate() {
+                    if i % 2 == 0 {
+                        continue;
+                    }
+                    for c in part.chars().filter(|c| !c.is_ascii()) {
+                        let font = eframe::egui::FontId::proportional(14.0);
+                        // U+FE0F (emoji presentation) has no glyph of its own and draws as a box too
+                        if c == '\u{FE0F}' || !ctx.fonts(|f| f.has_glyph(&font, c)) {
+                            missing.insert(format!("{:?} U+{:04X} in {:?}", c, c as u32, part));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "no glyph for:\n{}", missing.into_iter().collect::<Vec<_>>().join("\n"));
+    }
+}

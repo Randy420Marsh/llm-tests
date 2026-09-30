@@ -48,6 +48,10 @@
   label.chip.on { border-color:var(--accent); background:#22344a; }
   label.chip input { display:none; }
   .serlist { max-height:150px; overflow:auto; padding:2px 0; flex:1 1 100%; display:flex; flex-wrap:wrap; gap:3px 14px; }
+  .sergrid { display:grid; gap:1px 12px; align-items:center; max-height:280px; overflow:auto; flex:1 1 100%; padding:2px 0; }
+  .sergrid .sgrow { display:contents; }
+  .sergrid .chk { justify-content:center; }
+  .sergrid button.small { text-align:left; }
   .ctools { display:flex; flex-wrap:wrap; gap:6px 8px; align-items:center; margin:8px 0 4px; }
   .ctools .hint { color:var(--dim); font-size:12px; }
   .ctools .zinfo { color:var(--accent); font-size:12px; }
@@ -55,6 +59,12 @@
   .chartbox.big { height:84vh; }
   .chartbox.drag { cursor:grabbing; }
   .chartbox svg { display:block; }
+  .mtools { display:inline-flex; gap:4px; align-items:center; margin-left:6px; padding-left:8px; border-left:1px solid var(--line); }
+  .mtools button.on { border-color:var(--accent); background:#22344a; }
+  .meas { margin:6px 0 2px; font-size:12px; }
+  .meas table { font-size:12px; }
+  .meas input.mname { width:90px; background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:1px 4px; }
+  .meas h4 { margin:8px 0 3px; font-size:12px; color:var(--dim); font-weight:600; }
   .tip { position:absolute; pointer-events:none; background:#0b0d11ee; border:1px solid var(--line); border-radius:6px; padding:4px 9px; font-size:12px; line-height:1.35; white-space:nowrap; z-index:5; }
   .bars { padding:6px 10px; }
   .bh { color:var(--dim); font-size:12px; margin:8px 0 2px; text-transform:uppercase; letter-spacing:.04em; }
@@ -111,6 +121,7 @@ const TELEMETRY = [
   ['cpu_freq','CPU clock (avg)','MHz'],['cpu_usage','CPU load (avg)','%'],['ram_used','RAM used (max)','MB'],
   ['gpu_temp','GPU temp (max)','°C'],['gpu_util','GPU load (avg)','%'],['gpu_clock','GPU clock (avg)','MHz'],
   ['gpu_power','GPU power (max)','W'],['vram_used','VRAM used (max)','MB'],['vram_total','VRAM total','MB'],
+  ['others_cpu','Other programs: CPU (avg)','%'],['others_gpu','Other programs: GPU (avg)','%'],
 ];
 function telemetryValues(t) {
   const v = {};
@@ -125,8 +136,13 @@ function telemetryValues(t) {
   put('cpu_freq', t.cpu_freq_avg_mhz); put('cpu_usage', t.cpu_usage_avg_pct); put('ram_used', t.ram_used_max_mb);
   put('gpu_temp', t.gpu_temp_max_c); put('gpu_util', t.gpu_util_avg_pct); put('gpu_clock', t.gpu_clock_avg_mhz);
   put('gpu_power', t.gpu_power_max_w); put('vram_used', t.vram_used_max_mb); put('vram_total', t.vram_total_mb);
+  put('others_cpu', t.others_cpu_avg_pct); put('others_gpu', t.others_gpu_avg_pct);
+  // not a chart value: which programs they were ("chrome.exe 12 % CPU")
+  if (t.others_top && t.others_top.length) v.__others = t.others_top.filter(o => o[1] >= 0.5 || o[2] >= 0.5).map(o => `${o[0]} ${[o[1] >= 0.5 ? fmt(o[1]) + ' % CPU' : '', o[2] >= 0.5 ? fmt(o[2]) + ' % GPU' : ''].filter(Boolean).join(' / ')}`).join(', ');
   return v;
 }
+// the timing-suite modes time the app's own wake-ups; their old names suggested device input
+const MODE_LABELS = { MouseMove: 'Sleep 100 µs wake-up', RawInput: 'Sleep 50 µs wake-up', PollingRate: 'Poll loop (sleep 100 µs)', Jitter: '1 ms busy-wait jitter', MouseClick: 'Click (simulated)', KeyPress: 'Key press (simulated)' };
 const KINDS = {
   memory: {
     title: 'Memory', logX: true, xLabel: 'buffer size', xFmt: v => humanSize(2 ** v),
@@ -140,15 +156,40 @@ const KINDS = {
   },
   cpu: {
     title: 'CPU',
-    metrics: [['mcalls','Throughput','M calls/s'],['ns_per_call','Time per call','time'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
-    rows(sec) { return (sec.results || []).map((r, i) => {
-      const mask = Number(r.core_mask);
-      const single = Number.isFinite(mask) && mask > 0 && mask < 2**53 && Math.log2(mask) % 1 === 0 ? Math.log2(mask) : null;
-      const v = Object.assign({ mcalls: r.operations_per_second/1e6, ns_per_call: r.latency_ns, threads: r.thread_count }, telemetryValues(r.telemetry));
-      if (r.frequency_mhz > 0) v.clock = r.frequency_mhz;
-      if (single !== null && r.telemetry && r.telemetry.core_temp_max_c) { const t = r.telemetry.core_temp_max_c.find(c => c[0] === single); if (t) v.this_core_temp = t[1]; }
-      return { series: String(r.workload), x: single !== null ? single : i, xLabel: r.cores || (single !== null ? `Core ${single}` : `#${i+1}`), values: v };
-    }); },
+    metrics: [['mcalls','Throughput','M calls/s'],['mcalls_thread','Throughput per thread','M calls/s'],['ns_per_call','Time per call','time'],['run_spread','Run-to-run spread','%'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
+    // per-core runs next to all-core runs: the all-core total (24 threads) would dwarf every core, so
+    // the chart starts on the per-thread value; the total stays in the table and the value chips
+    defaultChart: rows => rows.some(r => r.core !== undefined) && rows.some(r => r.core === undefined) ? 'mcalls_thread' : 'mcalls',
+    rows(sec) {
+      const res = sec.results || [];
+      const topo = sec.core_topology || {};
+      const pSet = new Set(topo.performance_cores || []), eSet = new Set(topo.efficiency_cores || []);
+      const cls = c => pSet.size && eSet.size ? (pSet.has(c) ? 'P' : eSet.has(c) ? 'E' : '') : '';
+      const singleOf = r => { const mask = Number(r.core_mask); return Number.isFinite(mask) && mask > 0 && mask < 2**53 && Math.log2(mask) % 1 === 0 ? Math.log2(mask) : null; };
+      const anySingle = res.some(r => singleOf(r) !== null);
+      const multiKeys = [...new Set(res.filter(r => singleOf(r) === null).map(r => `${r.thread_count}|${r.cores || ''}`))];
+      return res.map(r => {
+        const single = singleOf(r);
+        const threads = Math.max(1, r.thread_count || 1);
+        const v = Object.assign({ mcalls: r.operations_per_second/1e6, mcalls_thread: r.operations_per_second/1e6/threads, ns_per_call: r.latency_ns, threads: r.thread_count }, telemetryValues(r.telemetry));
+        if (r.frequency_mhz > 0) v.clock = r.frequency_mhz;
+        const runs = (r.iteration_results || []).filter(it => it.duration_ns > 0).map(it => it.operations / it.duration_ns * 1e3);
+        if (runs.length > 1) { const m = runs.reduce((a, b) => a + b, 0) / runs.length; v.run_spread = m > 0 ? Math.sqrt(runs.reduce((a, b) => a + (b - m) ** 2, 0) / runs.length) / m * 100 : 0; }
+        if (single !== null) {
+          if (r.telemetry && r.telemetry.core_temp_max_c) { const t = r.telemetry.core_temp_max_c.find(c => c[0] === single); if (t) v.this_core_temp = t[1]; }
+          const c = cls(single);
+          return { series: String(r.workload), x: single, core: single, coreClass: c, xLabel: `Core ${single}` + (c ? ` · ${c}` : ''), values: v, runs };
+        }
+        const allCores = !r.cores || String(r.cores).startsWith('All cores');
+        if (!anySingle) {
+          // thread-count sweep: threads on the x axis
+          return { series: String(r.workload) + (allCores ? '' : ` · ${r.cores}`), x: threads, xLabel: `${threads} thread${threads === 1 ? '' : 's'}`, values: v, runs };
+        }
+        // next to per-core runs: own line, own slot left of core 0 (never drawn at a core's position)
+        const where = allCores ? 'all cores' : r.cores;
+        return { series: `${r.workload} · ${threads}T ${where}`, x: -2 - multiKeys.indexOf(`${r.thread_count}|${r.cores || ''}`), xLabel: `${threads}T ${where}`, values: v, runs };
+      });
+    },
   },
   gpu: {
     title: 'GPU (Vulkan compute)', logX: true, xLabel: 'elements per dispatch', xFmt: v => humanCount(2 ** v),
@@ -158,13 +199,47 @@ const KINDS = {
       values: Object.assign({ avg_ms: r.avg_latency_ms * 1e6, p95_ms: r.percentile_95_ms * 1e6, p99_ms: r.percentile_99_ms * 1e6, min_ms: r.min_latency_ms * 1e6, gops: r.throughput_geops }, telemetryValues(r.telemetry)),
     })); },
   },
+  gpu3d: {
+    title: '3D graphics (wgpu, rendered off screen)',
+    metrics: [['fps_avg','Average FPS','FPS'],['fps_1pct','1 % low','FPS'],['fps_01pct','0.1 % low','FPS'],['ft_avg','Frame time avg','time'],['ft_p99','Frame time p99','time'],['ft_max','Worst frame','time'],['lat_avg','Latency (submit to done)','time'],['lat_p99','Latency p99','time'],['gpu_ms','GPU time per frame','time']].concat(TELEMETRY),
+    rows(sec) { return (sec.results || []).map(r => ({
+      series: `${String(r.detail || '').split(' (')[0]} · MSAA ${r.msaa}×`, x: r.height, xLabel: r.name,
+      values: Object.assign({ fps_avg: r.fps_avg, fps_1pct: r.fps_1pct_low, fps_01pct: r.fps_01pct_low, ft_avg: r.frametime_avg_ms * 1e6, ft_p99: r.frametime_p99_ms * 1e6, ft_max: r.frametime_max_ms * 1e6, lat_avg: r.latency_avg_ms * 1e6, lat_p99: r.latency_p99_ms * 1e6 }, r.gpu_time_avg_ms != null ? { gpu_ms: r.gpu_time_avg_ms * 1e6 } : {}, telemetryValues(r.telemetry)),
+    })); },
+  },
+  gpu3d_frames: {
+    title: '3D graphics: every frame (spikes are stutters)',
+    metrics: [['ft','Frame time','time']],
+    rows(sec) {
+      const rows = [];
+      (sec.results || []).forEach(r => (r.frametimes_ms || []).forEach((t, i) => rows.push({ series: `${r.name} (${r.width}×${r.height})`, x: i + 1, xLabel: `frame ${i + 1}`, values: { ft: t * 1e6 } })));
+      return rows;
+    },
+  },
   input_timing_suite: {
-    title: 'Input timing suite',
+    title: 'OS timing suite (no device input: sleep / wake-up precision)',
     metrics: [['avg_ms','Average','time'],['p99_ms','p99','time'],['max_ms','Worst','time'],['jitter_ms','Jitter','time'],['polling_hz','Loop rate','Hz'],['samples','Samples','']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map((r, i) => ({
-      series: String(r.mode), x: r.core ?? i, xLabel: r.core !== null && r.core !== undefined ? `core ${r.core}` : 'OS scheduled',
+      series: MODE_LABELS[r.mode] || String(r.mode), x: r.core ?? i, xLabel: r.core !== null && r.core !== undefined ? `core ${r.core}` : 'OS scheduled',
       values: Object.assign({ avg_ms: r.avg_latency_ms * 1e6, p99_ms: r.percentile_99_ms * 1e6, max_ms: r.max_latency_ms * 1e6, jitter_ms: r.jitter_ms * 1e6, samples: r.sample_count, ...(r.polling_rate_hz ? { polling_hz: r.polling_rate_hz } : {}) }, telemetryValues(r.telemetry)),
     })); },
+  },
+  mouse_polling: {
+    title: 'Mouse polling (you moved the mouse)',
+    metrics: [['rate_hz','Polling rate','Hz'],['nominal_hz','Set rate','Hz'],['median_us','Median interval','time'],['jitter_us','Interval jitter (std dev)','time'],['p99_us','p99 interval','time'],['on_time','On time (±10 %)','%'],['skipped','Late / merged','%'],['counts','Counts per report (avg)',''],['reports','Reports','']],
+    rows(sec) { return (sec.runs || []).map((r, i) => ({
+      series: 'Mouse polling', x: i + 1, xLabel: `run ${i + 1}`,
+      values: { rate_hz: r.rate_hz, nominal_hz: r.nominal_hz, median_us: r.interval_median_us * 1e3, jitter_us: r.jitter_us * 1e3, p99_us: r.interval_p99_us * 1e3, on_time: r.on_time_pct, skipped: r.skipped_pct, counts: r.counts_avg, reports: r.reports },
+    })); },
+  },
+  reflex_game: {
+    title: 'Reflex game (click the red circles)',
+    metrics: [['time','Time per circle','time']],
+    rows(sec) {
+      const rows = [];
+      (sec.runs || []).forEach((g, gi) => (g.times_ms || []).forEach((t, i) => rows.push({ series: `Game ${gi + 1} · ${g.mode} · ${Math.round(g.radius)} px · ${fmt(g.accuracy_pct)} % accuracy`, x: i + 1, xLabel: `circle ${i + 1}`, values: { time: t * 1e6 } })));
+      return rows;
+    },
   },
   input_trials: {
     title: 'Click / key-press trials',
@@ -260,9 +335,11 @@ async function select(name, multi) {
 // ------------------------------------------------------------------------------------------------
 function sectionsOf(doc) {
   const p = doc.payload || {}; const br = p.benchmark_results || {}; const t = p.test_type;
-  const known = ['memory','cpu','gpu','input_timing_suite','input_trials','sensors','virtualization'];
+  const known = ['memory','cpu','gpu','gpu3d','input_timing_suite','input_trials','mouse_polling','reflex_game','sensors','virtualization'];
   if (t === 'session' || known.some(k => br[k] !== undefined && typeof br[k] === 'object')) {
-    const s = {}; known.forEach(k => { if (br[k] !== undefined) s[k] = br[k]; }); return s;
+    const s = {}; known.forEach(k => { if (br[k] !== undefined) s[k] = br[k]; });
+    if (s.gpu3d) s.gpu3d_frames = s.gpu3d;   // the same results, drawn frame by frame
+    return s;
   }
   // older single-suite files: benchmark_results is the suite's summary
   if (t === 'input') return { input_timing_suite: br };
@@ -324,6 +401,25 @@ function logTicks(lo, hi) {
   }
   return out;
 }
+const meas = {};               // chart id -> { mode, markers, ranges, thresholds, cross }: kept across redraws
+const MEAS_COLORS = ['#ff5d8f', '#ffd166', '#06d6a0', '#4cc9f0', '#f77f00', '#c77dff', '#90be6d', '#f94144'];
+const measOf = id => (meas[id] ??= { mode: null, markers: [], ranges: [], thresholds: [], cross: false, seq: 0 });
+// value of a line at x: exact point, or linear between its neighbours; null outside it
+function valueAt(pts, x) {
+  if (!pts.length || x < pts[0][0] - 1e-9 || x > pts[pts.length - 1][0] + 1e-9) return null;
+  let lo = 0, hi = pts.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (pts[m][0] <= x) lo = m; else hi = m; }
+  const a = pts[lo], b = pts[hi];
+  if (Math.abs(a[0] - x) < 1e-9) return a[1];
+  if (Math.abs(b[0] - x) < 1e-9) return b[1];
+  return b[0] === a[0] ? a[1] : a[1] + (b[1] - a[1]) * (x - a[0]) / (b[0] - a[0]);
+}
+function statsOf(v) {
+  if (!v.length) return null;
+  const s = [...v].sort((a, b) => a - b), n = s.length, mean = v.reduce((a, b) => a + b, 0) / n;
+  const at = p => s[Math.min(n - 1, Math.floor(n * p))];
+  return { n, min: s[0], max: s[n - 1], avg: mean, median: n % 2 ? s[n >> 1] : (s[n / 2 - 1] + s[n / 2]) / 2, p1: at(0.01), p99: at(0.99), sd: Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / n), first: v[0], last: v[n - 1] };
+}
 const views = {};              // chart id -> { x:[lo,hi]|null, y:[f0,f1]|null, ysig }
 const liveCharts = new Map();  // chart id -> Chart
 const pendingSpecs = new Map();
@@ -336,6 +432,7 @@ class Chart {
     views[spec.id] = this.view;
     el.innerHTML = '<div class="svghost"></div><div class="tip" hidden></div>';
     this.host = el.firstChild; this.tip = el.lastChild;
+    this.m = measOf(spec.id);
     this.domains();
     this.ro = new ResizeObserver(() => { cancelAnimationFrame(this.raf); this.raf = requestAnimationFrame(() => this.draw()); });
     this.ro.observe(el);
@@ -415,6 +512,10 @@ class Chart {
   down(e) {
     if (e.button !== 0 && e.button !== 1) return;
     const p = this.local(e); if (!this.inPlot(p)) return;
+    if (e.button === 0 && (this.m.mode === 'marker' || this.m.mode === 'range')) {
+      this.el.setPointerCapture(e.pointerId); this.pointers.set(e.pointerId, p);
+      this.drag = { mode: 'm-' + this.m.mode, start: p, last: p }; this.tip.hidden = true; return;
+    }
     // double press = reset (a real dblclick event is lost because every redraw replaces the svg)
     const now = performance.now(), ld = this.lastDown;
     if (ld && now - ld.t < 400 && Math.hypot(p.x - ld.x, p.y - ld.y) < 8) { this.lastDown = null; this.pointers.clear(); this.drag = null; this.el.classList.remove('drag'); this.reset(); return; }
@@ -434,12 +535,21 @@ class Chart {
         this.zoomAt({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, d1 / d2);
       } else if (this.drag && this.drag.mode === 'pan') {
         this.panBy(p.x - this.drag.last.x, p.y - this.drag.last.y); this.drag.last = p;
-      } else if (this.drag && this.drag.mode === 'box') { this.drag.last = p; this.drawOverlay(); }
+      } else if (this.drag && (this.drag.mode === 'box' || this.drag.mode === 'm-range')) { this.drag.last = p; this.drawOverlay(); }
       return;
     }
     if (!this.drag) this.hover(p);
   }
   up(e) {
+    if (this.drag && this.drag.mode.startsWith('m-')) {
+      const a = this.drag.start, b = this.drag.last, moved = Math.abs(a.x - b.x) > 6;
+      if (this.drag.mode === 'm-marker' && !moved) this.addMarker(a.x);
+      if (this.drag.mode === 'm-range') {
+        if (moved) this.addRange(this.dataX(Math.min(a.x, b.x)), this.dataX(Math.max(a.x, b.x)));
+        else { const band = (this.bandHits || []).find(h => a.x >= h.x0 && a.x <= h.x1); if (band) this.addRange(band.b.x0, band.b.x1, band.b.label); }
+      }
+      this.pointers.delete(e.pointerId); this.drag = null; this.el.classList.remove('drag'); this.draw(); return;
+    }
     if (this.drag && this.drag.mode === 'box' && this.pointers.size === 1) {
       const a = this.drag.start, b = this.drag.last, g = this.geo;
       if (Math.abs(a.x - b.x) > 6 && Math.abs(a.y - b.y) > 6) {
@@ -456,7 +566,21 @@ class Chart {
   }
   setHighlight(name, pt) { this.hlSeries = name; this.hlPoint = pt || null; this.drawOverlay(); }
   hover(p) {
-    if (!this.hit || !this.inPlot(p)) { this.tip.hidden = true; this.setHighlight(null); return; }
+    if (!this.hit || !this.inPlot(p)) { this.tip.hidden = true; this.cross = null; this.setHighlight(null); return; }
+    if (this.m.cross) {
+      // every line's value at the cursor
+      const x = this.dataX(p.x), s = this.spec, many = s.lines.some(o => o.metric !== s.lines[0].metric);
+      const rows = s.lines.map(l => [l, valueAt(l.pts, x)]).filter(r => r[1] != null).slice(0, 16);
+      const band = (this.bandHits || []).find(h => p.x >= h.x0 && p.x <= h.x1);
+      this.tip.innerHTML = `<b>${esc(s.xFmt ? s.xFmt(x) : fmt(x))}</b>` + (band ? ` <span style="color:${band.b.color}">· ${esc(band.b.label)}</span>` : '') +
+        rows.map(([l, v]) => `<br><span style="color:${l.color}">●</span> ${esc(l.name)}${many && l.metric !== l.name ? ' · ' + esc(l.metric) : ''}: <b>${fmt(v, l.unit)}</b>`).join('') + (s.lines.length > rows.length ? `<br><span style="color:var(--dim)">(${s.lines.length - rows.length} more have no value here)</span>` : '');
+      this.tip.hidden = false;
+      const tw = this.tip.offsetWidth, th = this.tip.offsetHeight;
+      this.tip.style.left = (p.x + 16 + tw < this.W ? p.x + 16 : p.x - tw - 16) + 'px';
+      this.tip.style.top = Math.min(Math.max(4, p.y - th / 2), this.H - th - 4) + 'px';
+      this.cross = p.x; this.drawOverlay();
+      return;
+    }
     let best = null, bd = 22 * 22;
     for (const h of this.hit) { const d = (h.x - p.x) ** 2 + (h.y - p.y) ** 2; if (d < bd) { bd = d; best = h; } }
     const band = (this.bandHits || []).find(h => p.x >= h.x0 && p.x <= h.x1);
@@ -476,6 +600,117 @@ class Chart {
     this.tip.style.left = Math.min(Math.max(4, best.x + 14), this.W - tw - 4) + 'px';
     this.tip.style.top = Math.min(Math.max(4, best.y - th - 10), this.H - th - 4) + 'px';
     this.setHighlight(l.series, best);
+  }
+  dataX(px) { const g = this.geo, [lo, hi] = this.xr; return lo + (Math.min(Math.max(px, g.L), g.L + g.pw) - g.L) / g.pw * (hi - lo); }
+  nextName(prefix) { return prefix + (++this.m.seq); }
+  addMarker(px) {
+    // snap to the nearest measured x when one is close (categories such as buffer sizes or cores)
+    let x = this.dataX(px), best = 14;
+    for (const h of this.hit || []) { const d = Math.abs(h.x - px); if (d < best) { best = d; x = h.p[0]; } }
+    const k = this.m.markers.length;
+    this.m.markers.push({ id: 'm' + (++this.m.seq), name: String.fromCharCode(65 + (k % 26)) + (k >= 26 ? Math.floor(k / 26) : ''), x, color: MEAS_COLORS[k % MEAS_COLORS.length] });
+  }
+  addRange(x0, x1, label) {
+    const k = this.m.ranges.length;
+    this.m.ranges.push({ id: 'r' + (++this.m.seq), name: label ? label.slice(0, 48) : `R${k + 1}`, x0, x1, color: MEAS_COLORS[(k + 3) % MEAS_COLORS.length] });
+  }
+  addThreshold() {
+    const axes = this.spec.axes;
+    let k = 0;
+    if (axes.length > 1) {
+      const pick = prompt('Which axis? ' + axes.map((a, i) => `${i + 1} = ${a.unit || a.label}`).join(', '), '1');
+      if (pick === null) return;
+      k = Math.max(0, Math.min(axes.length - 1, (parseInt(pick, 10) || 1) - 1));
+    }
+    const v = prompt(`Threshold on the ${axes[k].unit || 'value'} axis (e.g. 90):`, '');
+    if (v === null || v.trim() === '' || !Number.isFinite(parseFloat(v))) return;
+    const n = this.m.thresholds.length;
+    this.m.thresholds.push({ id: 't' + (++this.m.seq), name: `T${n + 1}`, axis: k, y: parseFloat(v), color: MEAS_COLORS[(n + 5) % MEAS_COLORS.length] });
+    this.draw();
+  }
+  // markers, ranges and thresholds drawn over the data
+  measSvg(sx, sy) {
+    const { L, T, pw, ph } = this.geo, m = this.m; let g = '';
+    for (const r of m.ranges) {
+      const a = Math.max(L, sx(r.x0)), b = Math.min(L + pw, sx(r.x1)); if (b <= L || a >= L + pw) continue;
+      g += `<rect x="${a.toFixed(1)}" y="${T}" width="${Math.max(1, b - a).toFixed(1)}" height="${ph}" fill="${r.color}" fill-opacity="0.10" stroke="${r.color}" stroke-dasharray="4 3"/>` +
+        `<text x="${(a + 4).toFixed(1)}" y="${T + 13}" style="fill:${r.color}">${esc(r.name)}</text>`;
+    }
+    for (const k of m.markers) {
+      const x = sx(k.x); if (x < L || x > L + pw) continue;
+      g += `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${T}" y2="${T + ph}" stroke="${k.color}" stroke-width="1.5" stroke-dasharray="5 3"/>` +
+        `<rect x="${(x - 11).toFixed(1)}" y="${T + 2}" width="22" height="15" rx="3" fill="${k.color}"/><text x="${x.toFixed(1)}" y="${T + 13}" text-anchor="middle" style="fill:#111;font-weight:700">${esc(k.name.slice(0, 3))}</text>`;
+    }
+    for (const t of m.thresholds) {
+      if (t.axis >= this.spec.axes.length) continue;
+      const yv = this.tr(t.y); if (yv === null) continue;
+      const y = sy(t.axis, yv); if (y < T || y > T + ph) continue;
+      g += `<line x1="${L}" x2="${L + pw}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${t.color}" stroke-width="1.5" stroke-dasharray="8 4"/>` +
+        `<text x="${L + pw - 4}" y="${(y - 4).toFixed(1)}" text-anchor="end" style="fill:${t.color}">${esc(t.name)}: ${esc(fmt(t.y, this.spec.axes[t.axis].unit))}</text>`;
+    }
+    return g;
+  }
+  // the tables under the chart
+  renderMeas() {
+    const panel = document.querySelector(`[data-meas="${CSS.escape(this.spec.id)}"]`); if (!panel) return;
+    const s = this.spec, m = this.m, lines = s.lines.slice(0, 40), xf = x => s.xFmt ? s.xFmt(x) : fmt(x);
+    const timeX = /second/.test(s.xLabel || '');
+    const many = s.lines.some(o => o.metric !== s.lines[0].metric);
+    const lname = l => `<span class="sw" style="background:${l.color}"></span> ${esc(l.name)}${many && l.metric !== l.name ? ' · ' + esc(l.metric) : ''}`;
+    const head = (it, extra) => `<span class="sw" style="background:${it.color}"></span> <input class="mname" data-mname="${it.id}" value="${esc(it.name)}"> <button class="small" data-mdel="${it.id}" title="Remove">×</button>${extra ? '<br><span style="color:var(--dim)">' + esc(extra) + '</span>' : ''}`;
+    const csv = [];
+    let h = '';
+    if (m.mode === 'marker') h += '<div style="color:var(--accent)">📍 Click the chart to drop a marker (it snaps to a measured point nearby). Click 📍 again to stop.</div>';
+    if (m.mode === 'range') h += `<div style="color:var(--accent)">↔ Drag across the chart to measure a range${s.bands ? ", or click a test's band to measure that test" : ''}. Click ↔ again to stop.</div>`;
+    if (m.markers.length) {
+      const mk = [...m.markers].sort((a, b) => a.x - b.x), A = mk[0], B = mk[mk.length - 1];
+      h += '<h4>Markers</h4><div class="scroll"><table><thead><tr><th>Line</th>' + mk.map(k => `<th>${head(k, xf(k.x))}</th>`).join('') +
+        (mk.length >= 2 ? `<th>${esc(B.name)} − ${esc(A.name)}</th><th>change</th>${timeX ? '<th>per second</th>' : ''}` : '') + '</tr></thead><tbody>';
+      csv.push(['line', ...mk.map(k => `${k.name} @ ${xf(k.x)}`)].join(','));
+      for (const l of lines) {
+        const v = mk.map(k => valueAt(l.pts, k.x)), a = v[0], b = v[v.length - 1], d = a != null && b != null ? b - a : null;
+        h += `<tr><td>${lname(l)}</td>` + v.map(x => `<td>${fmt(x, l.unit)}</td>`).join('');
+        if (mk.length >= 2) h += `<td>${d == null ? '—' : (d > 0 ? '+' : '') + fmt(d, l.unit)}</td><td>${d == null || !a ? '—' : (d > 0 ? '+' : '') + fmt(d / Math.abs(a) * 100) + ' %'}</td>` + (timeX ? `<td>${d == null || B.x === A.x ? '—' : fmt(d / (B.x - A.x), l.unit)}</td>` : '');
+        h += '</tr>';
+        csv.push([JSON.stringify(l.name + (many ? ' · ' + l.metric : '')), ...v.map(x => x ?? '')].join(','));
+      }
+      h += '</tbody></table></div>';
+    }
+    for (const r of m.ranges) {
+      h += `<h4>Range ${head(r, xf(r.x0) + ' – ' + xf(r.x1) + (timeX ? ` (${fmt(r.x1 - r.x0)} s)` : ''))}</h4><div class="scroll"><table><thead><tr><th>Line</th><th>points</th><th>min</th><th>average</th><th>median</th><th>1 %</th><th>99 %</th><th>max</th><th>std dev</th><th>first → last</th></tr></thead><tbody>`;
+      csv.push(''); csv.push([`range ${r.name}`, 'points', 'min', 'average', 'median', 'p1', 'p99', 'max', 'sd', 'first_to_last'].join(','));
+      for (const l of lines) {
+        const st = statsOf(l.pts.filter(q => q[0] >= r.x0 - 1e-9 && q[0] <= r.x1 + 1e-9).map(q => q[1]));
+        if (!st) { h += `<tr><td>${lname(l)}</td><td colspan="9" style="color:var(--dim)">no points in this range</td></tr>`; continue; }
+        const d = st.last - st.first;
+        h += `<tr><td>${lname(l)}</td><td>${st.n}</td>` + [st.min, st.avg, st.median, st.p1, st.p99, st.max, st.sd].map(x => `<td>${fmt(x, l.unit)}</td>`).join('') + `<td>${(d > 0 ? '+' : '') + fmt(d, l.unit)}</td></tr>`;
+        csv.push([JSON.stringify(l.name), st.n, st.min, st.avg, st.median, st.p1, st.p99, st.max, st.sd, d].join(','));
+      }
+      h += '</tbody></table></div>';
+    }
+    for (const t of m.thresholds) {
+      const ax = s.axes[t.axis] || s.axes[0], mine = lines.filter(l => l.axis === t.axis);
+      h += `<h4>Threshold ${head(t, fmt(t.y, ax.unit))}</h4><div class="scroll"><table><thead><tr><th>Line</th><th>points above</th>${timeX ? '<th>time above</th>' : ''}<th>crossings</th><th>highest</th></tr></thead><tbody>`;
+      csv.push(''); csv.push([`threshold ${t.name} = ${t.y}`, 'share_above_pct', 'time_above_s', 'crossings', 'max'].join(','));
+      for (const l of mine) {
+        const p = l.pts; if (!p.length) continue;
+        let above = 0, time = 0, cross = 0;
+        for (let i = 0; i < p.length; i++) {
+          if (p[i][1] > t.y) { above++; if (i + 1 < p.length) time += p[i + 1][0] - p[i][0]; }
+          if (i && (p[i][1] > t.y) !== (p[i - 1][1] > t.y)) cross++;
+        }
+        const mx = Math.max(...p.map(q => q[1]));
+        h += `<tr><td>${lname(l)}</td><td>${fmt(above / p.length * 100)} %</td>${timeX ? `<td>${fmt(time)} s</td>` : ''}<td>${cross}</td><td class="${mx > t.y ? 'warn' : ''}">${fmt(mx, l.unit)}</td></tr>`;
+        csv.push([JSON.stringify(l.name), above / p.length * 100, timeX ? time : '', cross, mx].join(','));
+      }
+      h += '</tbody></table></div>';
+    }
+    if (csv.length) h += `<div class="row"><button class="small" data-mcsv>Copy measurements (CSV)</button></div>`;
+    panel.innerHTML = h;
+    const find = id => [m.markers, m.ranges, m.thresholds].find(a => a.some(x => x.id === id));
+    panel.querySelectorAll('[data-mname]').forEach(el => el.onchange = () => { const a = find(el.dataset.mname); const it = a && a.find(x => x.id === el.dataset.mname); if (it) { it.name = el.value.trim() || it.name; this.draw(); } });
+    panel.querySelectorAll('[data-mdel]').forEach(el => el.onclick = () => { const a = find(el.dataset.mdel); if (a) { a.splice(a.findIndex(x => x.id === el.dataset.mdel), 1); this.draw(); } });
+    const c = panel.querySelector('[data-mcsv]'); if (c) c.onclick = () => { navigator.clipboard && navigator.clipboard.writeText(csv.join('\n')); c.textContent = 'Copied'; };
   }
   ticksX(xr, pw) {
     const s = this.spec; let xt;
@@ -514,6 +749,8 @@ class Chart {
         const x0 = Math.max(L, sx(b.x0)), x1 = Math.min(L + pw, sx(b.x1));
         if (x1 <= L || x0 >= L + pw) continue;
         bg += `<rect x="${x0.toFixed(1)}" y="${T}" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${ph}" fill="${b.color}" fill-opacity="${state.phaseOpacity}"/>`;
+        // where one test ends and the next begins, when there is room to see it
+        if (x1 - x0 > 3) bg += `<line x1="${x0.toFixed(1)}" x2="${x0.toFixed(1)}" y1="${T}" y2="${T + ph}" stroke="${b.color}" stroke-opacity="${Math.min(1, state.phaseOpacity * 2.5)}"/>`;
         this.bandHits.push({ x0, x1, b });
       }
       g = bg + g;
@@ -545,9 +782,10 @@ class Chart {
         if (q[0] < L - 4 || q[0] > L + pw + 4 || q[1] < T - 4 || q[1] > T + ph + 4) continue;
         this.hit.push({ x: q[0], y: q[1], p: q[2], line: l, li });
         if (drawMarkers) markers += markerSvg(l.shape, +q[0].toFixed(1), +q[1].toFixed(1), 3.3, l.color);
+        if (s.marks && s.marks.has(l.series + '|' + q[2][0])) markers += `<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="8" fill="none" stroke="#ff5d5d" stroke-width="1.8"/>`;
       }
     });
-    g += `<g clip-path="url(#${sid})">${body}${markers}</g><g id="ov" clip-path="url(#${sid})"></g>`;
+    g += `<g clip-path="url(#${sid})">${body}${markers}${this.measSvg(sx, sy)}</g><g id="ov" clip-path="url(#${sid})"></g>`;
     if (s.legend && s.legend.length) {
       const rowH = 15, lw = Math.min(pw - 20, Math.max(...s.legend.map(e => e.label.length)) * 6.3 + 48);
       g += `<g><rect x="${L + 8}" y="${T + 6}" width="${lw}" height="${s.legend.length * rowH + 6}" rx="5" fill="#12141ad9" stroke="#343a46"/>` + s.legend.map((e, i) => {
@@ -556,7 +794,7 @@ class Chart {
       }).join('') + '</g>';
     }
     this.host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`;
-    this.drawOverlay(); this.updateInfo();
+    this.drawOverlay(); this.updateInfo(); this.renderMeas();
   }
   drawOverlay() {
     const ov = this.host.querySelector('#ov'); if (!ov) return;
@@ -568,6 +806,11 @@ class Chart {
         h += `<polyline fill="none" stroke="${l.color}" stroke-width="3.4" stroke-linejoin="round" ${l.dash ? `stroke-dasharray="${l.dash}"` : ''} points="${pts.map(q => q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(' ')}"/>`;
       });
       if (this.hlPoint) h += `<circle cx="${this.hlPoint.x}" cy="${this.hlPoint.y}" r="6.5" fill="none" stroke="#fff" stroke-width="1.6"/>`;
+    }
+    if (this.m.cross && this.cross != null) h += `<line x1="${this.cross}" x2="${this.cross}" y1="${T}" y2="${T + ph}" stroke="#c8ccd6" stroke-opacity="0.7" stroke-dasharray="3 3"/>`;
+    if (this.drag && this.drag.mode === 'm-range' && this.drag.last) {
+      const a = Math.min(this.drag.start.x, this.drag.last.x), b = Math.max(this.drag.start.x, this.drag.last.x);
+      h += `<rect x="${a}" y="${T}" width="${b - a}" height="${ph}" fill="#ffd16622" stroke="#ffd166" stroke-dasharray="4 3"/>`;
     }
     if (this.drag && this.drag.mode === 'box' && this.drag.last) {
       const a = this.drag.start, b = this.drag.last;
@@ -588,6 +831,17 @@ class Chart {
   }
 }
 
+// Esc leaves marker / range mode
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  for (const [id, m] of Object.entries(meas)) {
+    if (!m.mode) continue;
+    m.mode = null;
+    document.querySelectorAll(`[data-mm][data-for="${CSS.escape(id)}"]`).forEach(o => o.classList.remove('on'));
+    const c = liveCharts.get(id); if (c) { c.el.style.cursor = ''; c.draw(); }
+  }
+});
+
 function mountCharts(root) {
   root.querySelectorAll('.chartbox[data-chart]').forEach(el => {
     const id = el.dataset.chart, spec = pendingSpecs.get(id); if (!spec) return;
@@ -601,6 +855,20 @@ function mountCharts(root) {
     if (a === 'big') { c.el.classList.toggle('big'); b.textContent = c.el.classList.contains('big') ? '⤡ shrink' : '⤢ expand'; c.draw(); }
     if (a === 'svg') download(c.spec.id.replace(/\W/g, '_') + '.svg', c.svgText(), 'image/svg+xml');
   });
+  root.querySelectorAll('[data-mm]').forEach(b => {
+    const m = measOf(b.dataset.for), a = b.dataset.mm;
+    if (a === m.mode) b.classList.add('on');
+    b.onclick = () => {
+      const c = liveCharts.get(b.dataset.for); if (!c) return;
+      if (a === 'clear') { m.markers = []; m.ranges = []; m.thresholds = []; m.mode = null; }
+      else if (a === 'thr') { c.addThreshold(); return; }
+      else m.mode = m.mode === a ? null : a;
+      root.querySelectorAll(`[data-mm][data-for="${CSS.escape(b.dataset.for)}"]`).forEach(o => o.classList.toggle('on', o.dataset.mm === m.mode));
+      c.el.style.cursor = m.mode ? 'crosshair' : '';
+      c.draw();
+    };
+  });
+  root.querySelectorAll('[data-mx]').forEach(cb => cb.onchange = () => { const m = measOf(cb.dataset.for); m.cross = cb.checked; const c = liveCharts.get(cb.dataset.for); if (c) { c.cross = null; c.draw(); } });
   root.querySelectorAll('[data-wheel]').forEach(cb => cb.onchange = () => { state.wheelZoom = cb.checked; document.querySelectorAll('[data-wheel]').forEach(o => o.checked = cb.checked); });
   root.querySelectorAll('[data-hl]').forEach(el => {
     el.onmouseenter = () => liveCharts.get(el.dataset.for)?.setHighlight(el.dataset.hl);
@@ -612,8 +880,16 @@ function chartTools(id) {
   return `<div class="ctools"><button class="small" data-z="in" data-for="${esc(id)}" title="Zoom in">＋</button><button class="small" data-z="out" data-for="${esc(id)}" title="Zoom out">－</button>` +
     `<button class="small" data-z="reset" data-for="${esc(id)}">⟲ reset zoom</button><button class="small" data-z="big" data-for="${esc(id)}">⤢ expand</button><button class="small" data-z="svg" data-for="${esc(id)}" title="Save the chart as it is shown">SVG</button>` +
     `<label class="chk" title="Otherwise hold Ctrl while scrolling"><input type="checkbox" data-wheel ${state.wheelZoom ? 'checked' : ''}>zoom with the mouse wheel</label>` +
+    `<span class="mtools">Measure: ` +
+    `<button class="small" data-mm="marker" data-for="${esc(id)}" title="Click the chart to drop a named marker: the value of every line there, and the change between markers">📍 marker</button>` +
+    `<button class="small" data-mm="range" data-for="${esc(id)}" title="Drag across the chart to measure a range: min / average / max … of every line in it. On the timeline, a click on a test's band measures that test">↔ range</button>` +
+    `<button class="small" data-mm="thr" data-for="${esc(id)}" title="A horizontal line at a value: how long / how often each line is above it and how often it crosses it">― threshold</button>` +
+    `<label class="chk" title="A vertical line that follows the mouse and lists every line's value there"><input type="checkbox" data-mx data-for="${esc(id)}" ${measOf(id).cross ? 'checked' : ''}>crosshair</label>` +
+    `<button class="small" data-mm="clear" data-for="${esc(id)}" title="Remove this chart's markers, ranges and thresholds">clear</button></span>` +
     `<span class="hint">Ctrl + wheel or ＋/－ = zoom · drag = pan · Shift + drag = box zoom · double-click = reset · hover a point for its value</span><span class="zinfo" data-zinfo="${esc(id)}"></span></div>`;
 }
+// a chart with its tools above and its measurements below
+const chartBlock = (id, big) => chartTools(id) + `<div class="chartbox${big ? ' big' : ''}" data-chart="${id}"></div><div class="meas" data-meas="${id}"></div>`;
 
 function barsHtml(items, unit) {
   const max = Math.max(...items.map(i => i.value), 0) || 1;
@@ -653,30 +929,124 @@ function autoTimeUnits(metrics, rows) {
   });
 }
 
+// "12T" after "2T", "Core 10" after "Core 9"
+const natCmp = new Intl.Collator('en', { numeric: true, sensitivity: 'base' }).compare;
+// "StreamAdd · 12T" -> { base: 'StreamAdd', col: '12T' }; lines without a thread count keep col ''
+function splitSeries(s) {
+  const seg = s.split(' · '), k = seg.findIndex(x => /^\d+T\b/.test(x));
+  return k < 0 ? { base: s, col: '' } : { base: seg.filter((_, i) => i !== k).join(' · '), col: seg[k] };
+}
+// Line switches: a grid (one row per test, one column per thread count, row and column names toggle the
+// whole group) when the lines have both, otherwise a plain list
+function seriesPicker(kindKey, series, hid, q) {
+  const cell = (s, inner) => `<label class="chk" data-serlabel="${esc(s.toLowerCase())}" data-hl="${esc(s)}" data-for="chart_${kindKey}" title="${esc(s)}" ${q && !s.toLowerCase().includes(q) ? 'style="display:none"' : ''}><input type="checkbox" data-ser="${esc(s)}" ${hid(s) ? '' : 'checked'}>${styleSwatch(series.indexOf(s))}${inner}</label>`;
+  const parts = series.map(s => ({ s, ...splitSeries(s) }));
+  const bases = [...new Set(parts.map(p => p.base))].sort(natCmp), cols = [...new Set(parts.map(p => p.col))].sort(natCmp);
+  if (bases.length < 2 || cols.length < 2) return '<div class="serlist">' + series.map(s => cell(s, esc(s))).join('') + '</div>';
+  let h = `<div class="sergrid" style="grid-template-columns:auto repeat(${cols.length}, auto)"><div class="sgrow"><span style="color:var(--dim);font-size:12px">click a name to switch its group</span>` +
+    cols.map(c => `<button class="small" data-sercol="${esc(c)}" title="Show / hide every ${esc(c || 'single-thread')} line">${esc(c || '—')}</button>`).join('') + '</div>';
+  for (const b of bases) {
+    const mine = parts.filter(p => p.base === b);
+    const lbl = mine.map(p => p.s.toLowerCase()).join('|');
+    h += `<div class="sgrow" data-serlabel="${esc(lbl)}" ${q && !lbl.includes(q) ? 'style="display:none"' : ''}><button class="small" data-serrow="${esc(b)}" title="Show / hide every ${esc(b)} line">${esc(b)}</button>` +
+      cols.map(c => { const p = mine.find(x => x.col === c); return p ? cell(p.s, '') : '<span></span>'; }).join('') + '</div>';
+  }
+  return h + '</div>';
+}
+
+// ------------------------------------------------------------------ unusual values
+// Points that stand out from their neighbours on a line, cores that differ from cores of their own kind,
+// and results whose repeated runs disagree. Thresholds are deliberately loose: cache-level steps and
+// P-vs-E differences are expected, only what stands out from its own surroundings is listed.
+function findAnomalies(kindKey, rows) {
+  const out = [], med = a => { const s = [...a].sort((x, y) => x - y), h = Math.floor(s.length / 2); return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2; };
+  const add = (r, why, bad) => out.push({ series: r.series, x: r.x, xLabel: r.xLabel, why, bad });
+  const bySeries = new Map(); rows.forEach(r => { if (!bySeries.has(r.series)) bySeries.set(r.series, []); bySeries.get(r.series).push(r); });
+  // GPU: throughput, since the dispatch time grows with the size by design
+  const spikeKey = { memory: 'ns_per_access', gpu: 'gops', input_timing_suite: 'avg_ms' }[kindKey];
+  const spikeName = { memory: 'time per access', gpu: 'throughput', input_timing_suite: 'average' }[kindKey];
+  if (spikeKey) for (const rs of bySeries.values()) {
+    const pts = rs.filter(r => r.values[spikeKey] > 0).sort((a, b) => a.x - b.x);
+    if (pts.length < 4) continue;
+    const val = q => q.values[spikeKey];
+    const show = v => spikeKey === 'ns_per_access' ? fmt(v) + ' ns' : spikeKey === 'gops' ? fmt(v) + ' GOPS' : fmt(v / 1e6) + ' ms';
+    pts.forEach((r, i) => {
+      // the value the line would have here: between its neighbours on a log scale (geometric mean), or
+      // extrapolated from the next two at either end; so steady trends and cache steps are not flagged
+      const v = val(r), near = [pts[i - 1], pts[i + 1]].filter(Boolean).map(val);
+      const around = [pts[i - 2], pts[i - 1], pts[i + 1], pts[i + 2]].filter(Boolean).map(val);
+      const edge = near.length < 2;
+      const exp = !edge ? Math.sqrt(near[0] * near[1]) : i === 0 ? val(pts[1]) ** 2 / val(pts[2]) : val(pts[i - 1]) ** 2 / val(pts[i - 2]);
+      const f = edge ? 2.5 : 1.6;
+      // a spike must also beat its direct neighbours; a dip must be below every point within two places
+      if (v > exp * f && v > Math.max(...near) * 1.25) add(r, `${spikeName} ${(v / exp).toFixed(1)}× what the points around it suggest (${show(v)} vs ${show(exp)})`, v > exp * 3);
+      else if (v < exp / (f + 0.5) && v < Math.min(...around) / 1.5) add(r, `${spikeName} ${(exp / v).toFixed(1)}× lower than the points around it suggest (${show(v)} vs ${show(exp)})`, v < exp / 3);
+    });
+  }
+  if (kindKey === 'cpu') {
+    const peers = new Map();
+    rows.filter(r => r.core !== undefined).forEach(r => { const k = r.series + '|' + (r.coreClass || ''); if (!peers.has(k)) peers.set(k, []); peers.get(k).push(r); });
+    for (const rs of peers.values()) {
+      if (rs.length < 3) continue;
+      const m = med(rs.map(r => r.values.mcalls));
+      rs.forEach(r => {
+        const d = m > 0 ? r.values.mcalls / m - 1 : 0, kind = r.coreClass ? r.coreClass + '-core' : 'core';
+        if (Math.abs(d) > 0.08) add(r, `${Math.abs(d * 100).toFixed(0)}% ${d < 0 ? 'slower' : 'faster'} than the median ${kind}`, Math.abs(d) > 0.25);
+      });
+    }
+    rows.forEach(r => { if (r.values.run_spread > 5) add(r, `runs vary ±${r.values.run_spread.toFixed(1)}% (something else used the core, or the clock changed)`, r.values.run_spread > 15); });
+  }
+  rows.forEach(r => {
+    const v = r.values;
+    // another program was busy: the result may be lower than the machine can do
+    if ((v.others_cpu || 0) >= 8 || (v.others_gpu || 0) >= 8) {
+      const what = (v.others_gpu || 0) > (v.others_cpu || 0) ? `${fmt(v.others_gpu)} % of the GPU` : `${fmt(v.others_cpu)} % of the CPU`;
+      add(r, `other programs used ${what} during this test${v.__others ? ': ' + v.__others : ''}`, (v.others_cpu || 0) >= 25 || (v.others_gpu || 0) >= 25);
+    }
+    if (kindKey === 'memory' && v.p99_run > 0 && v.min_run > 0 && v.p99_run / v.min_run > 2) add(r, `unstable: slowest run ${(v.p99_run / v.min_run).toFixed(1)}× the best`, v.p99_run / v.min_run > 4);
+    if (kindKey === 'gpu' && v.p99_ms > 0 && v.avg_ms > 0 && v.p99_ms / v.avg_ms > 2) add(r, `p99 dispatch ${(v.p99_ms / v.avg_ms).toFixed(1)}× the average`, v.p99_ms / v.avg_ms > 4);
+    if (kindKey === 'gpu3d' && v.ft_p99 > 0 && v.ft_avg > 0 && v.ft_p99 / v.ft_avg > 2) add(r, `stutter: p99 frame ${(v.ft_p99 / v.ft_avg).toFixed(1)}× the average frame`, v.ft_p99 / v.ft_avg > 4);
+    if (kindKey === 'input_timing_suite' && v.p99_ms > 0 && v.avg_ms > 0 && v.p99_ms / v.avg_ms > 1.5) add(r, `p99 ${(v.p99_ms / v.avg_ms).toFixed(1)}× the average`, v.p99_ms / v.avg_ms > 3);
+  });
+  return out;
+}
+
+function anomaliesHtml(kindKey, list) {
+  if (!list.length) return `<div style="color:var(--dim);font-size:12px;margin:4px 0">✓ No unusual values: every point fits its neighbours and its runs agree.</div>`;
+  const bad = list.filter(a => a.bad).length, MAX = 60;
+  return `<details class="anoms" ${list.length <= 12 ? 'open' : ''}><summary class="${bad ? 'bad' : 'warn'}">⚠ ${list.length} unusual value${list.length === 1 ? '' : 's'}${bad ? ` (${bad} strong)` : ''}: ringed on the chart · hover one to highlight its line</summary>` +
+    '<div class="scroll" style="max-height:260px"><table><thead><tr><th>Line</th><th>At</th><th>Why it stands out</th></tr></thead><tbody>' +
+    list.slice(0, MAX).map(a => `<tr data-hl="${esc(a.series)}" data-for="chart_${kindKey}"><td>${esc(a.series)}</td><td>${esc(a.xLabel)}</td><td class="${a.bad ? 'bad' : 'warn'}">${esc(a.why)}</td></tr>`).join('') +
+    (list.length > MAX ? `<tr><td colspan="3" style="color:var(--dim)">… and ${list.length - MAX} more</td></tr>` : '') + '</tbody></table></div></details>';
+}
+
 function kindSection(kindKey, entries) {
   // entries: [{label, sec}] one per selected result
   const kind = KINDS[kindKey];
   const multi = entries.length > 1;
   const rows = entries.flatMap(e => kind.rows(e.sec).map(r => multi ? { ...r, series: `[${e.label}] ${r.series}` } : r));
-  const series = [...new Set(rows.map(r => r.series))].sort();
+  const series = [...new Set(rows.map(r => r.series))].sort(natCmp);
   const metrics = autoTimeUnits(kind.metrics, rows).filter(m => rows.some(r => r.values[m[0]] !== undefined && r.values[m[0]] !== null));
   const hid = (k) => state.hiddenSeries.has(kindKey + ':' + k), hidc = (k) => state.hiddenCols.has(kindKey + ':' + k);
   const shownMetrics = metrics.filter(m => !hidc(m[0]));
   let chosen = (state.chartMetrics[kindKey] || []).filter(k => shownMetrics.some(m => m[0] === k));
-  if (!chosen.length && shownMetrics.length) chosen = [shownMetrics[0][0]];
+  if (!chosen.length && shownMetrics.length) {
+    const d = kind.defaultChart && kind.defaultChart(rows);
+    chosen = [d && shownMetrics.some(m => m[0] === d) ? d : shownMetrics[0][0]];
+  }
   const chosenMetrics = shownMetrics.filter(m => chosen.includes(m[0]));   // catalogue order keeps dashes stable
   const id = 'sec_' + kindKey, o = optsOf(kindKey);
   const visRows = rows.filter(r => !hid(r.series));
   const q = (state.filters[kindKey] || '').toLowerCase();
   let html = `<h2>${esc(kind.title)} <span class="badge">${rows.length} result rows</span></h2>`;
   if (kindKey === 'memory' && entries.some(e => e.sec.complete === false)) html += `<div class="warn">⚠ The run was stopped early: ${entries.map(e => e.sec.tests_done + ' of ' + e.sec.tests_planned + ' tests').join(', ')} were completed.</div>`;
-  if (kindKey === 'cpu') html += slowCoreNotes(rows);
+  const anomalies = findAnomalies(kindKey, rows);
+  html += anomaliesHtml(kindKey, anomalies);
   html += flatTempWarning(rows);
   html += `<div class="card" id="${id}">`;
   html += `<div class="row"><b>Lines:</b> <button class="small" data-act="ser-all">all</button><button class="small" data-act="ser-none">none</button><button class="small" data-act="ser-only" title="Show only the lines matching the filter">only matching</button>` +
     `<input type="text" data-serfilter placeholder="filter lines (e.g. Stream, 12T)" value="${esc(state.filters[kindKey] || '')}" style="min-width:200px"><span style="color:var(--dim);font-size:12px">${series.length - series.filter(hid).length} of ${series.length} shown</span>` +
-    `<div class="serlist">` +
-    series.map((s, i) => `<label class="chk" data-serlabel="${esc(s.toLowerCase())}" data-hl="${esc(s)}" data-for="chart_${kindKey}" ${q && !s.toLowerCase().includes(q) ? 'style="display:none"' : ''}><input type="checkbox" data-ser="${esc(s)}" ${hid(s) ? '' : 'checked'}>${styleSwatch(i)}${esc(s)}</label>`).join('') + '</div></div>';
+    seriesPicker(kindKey, series, hid, q) + '</div>';
   html += `<details><summary>Show / hide values (columns)</summary><div class="row"><button class="small" data-act="col-all">all</button><button class="small" data-act="col-none">none</button><button class="small" data-act="col-perf">performance only</button><button class="small" data-act="col-sens">sensors only</button></div><div class="row">` +
     metrics.map(m => `<label class="chk"><input type="checkbox" data-col="${m[0]}" ${hidc(m[0]) ? '' : 'checked'}>${esc(m[1])} <span style="color:var(--dim)">(${esc(m[2])})</span></label>`).join('') + '</div></details>';
   const bySeries = new Map(); rows.forEach(r => { if (!bySeries.has(r.series)) bySeries.set(r.series, []); bySeries.get(r.series).push(r); });
@@ -718,9 +1088,10 @@ function kindSection(kindKey, entries) {
         id: cid, lines, axes, legend: many ? chosenMetrics.map((m, mi) => ({ label: `${m[1]} (${m[2]})`, color: valueColor(mi), dash: DASHES[mi % DASHES.length], axis: units.indexOf(m[2]) })) : null, ysig: chosenMetrics.map(m => m[0]).join('|') + '|' + o.zeroY + o.logY,
         xLabel: kind.xLabel || (kindKey === 'cpu' ? 'core' : ''), logY: o.logY, zeroY: o.zeroY, markers: o.markers,
         xFmt: kind.xFmt ? kind.xFmt : (v => labelAt.get(Math.round(v * 1000)) ?? fmt(v)),
+        marks: new Set(anomalies.map(a => a.series + '|' + a.x)),
         xInt: !!kind.logX, xTicks: !kind.logX && xs.length <= 40 ? xs : undefined,
       });
-      html += chartTools(cid) + `<div class="chartbox" data-chart="${cid}"></div>`;
+      html += chartBlock(cid);
     }
   } else html += '<div style="color:var(--dim)">All values are hidden.</div>';
   html += `<div class="row"><span style="color:var(--dim)">${visRows.length} rows</span><button class="small" data-act="csv">Copy CSV</button><button class="small" data-act="dl-csv">Download CSV</button></div>`;
@@ -728,18 +1099,6 @@ function kindSection(kindKey, entries) {
     visRows.map(r => `<tr><td>${styleSwatch(series.indexOf(r.series))}${esc(r.series)}</td><td>${esc(r.xLabel)}</td>${shownMetrics.map(m => `<td>${fmt(r.values[m[0]])}</td>`).join('')}</tr>`).join('') + '</tbody></table></div>';
   html += '</div>';
   return { html, rows, shownMetrics, kindKey, series, metrics };
-}
-
-function slowCoreNotes(rows) {
-  const by = {};
-  rows.forEach(r => { if (/^Core \d+$/.test(r.xLabel || '')) (by[r.series] ??= []).push([r.x, r.values.mcalls]); });
-  let out = '';
-  for (const [w, arr] of Object.entries(by)) {
-    if (arr.length < 3) continue;
-    const s = arr.map(a => a[1]).sort((a, b) => a - b), med = s[Math.floor(s.length / 2)];
-    arr.sort((a, b) => a[0] - b[0]).forEach(([core, v]) => { if (med > 0 && v < med * 0.92) out += `<div class="warn">⚠ ${esc(w)}: core ${core} is ${((1 - v / med) * 100).toFixed(0)}% slower than the median core</div>`; });
-  }
-  return out;
 }
 
 const SENSOR_DEFS = [
@@ -757,6 +1116,24 @@ const SENSOR_PRESETS = {
 const PHASE_COLORS = { memory: '#e5484d', cpu: '#3e8bff', gpu: '#30c070', input: '#f0b429' };
 const PHASE_NAMES = { memory: 'Memory', cpu: 'CPU', gpu: 'GPU', input: 'Input' };
 const phaseColor = k => PHASE_COLORS[k] || '#9aa3b2';
+// which test of its category a phase is ("CPU · IntegerAdd · 1 thread(s) · Core 3" -> "IntegerAdd")
+const phaseKey = p => { const s = String(p.label || '').split(' · '); return s[p.kind === 'memory' ? 2 : 1] ?? s[s.length - 1] ?? ''; };
+// shade i of n of a category colour: hue steps across ±30°, every other shade darker
+function phaseShade(kind, i, n) {
+  const hex = phaseColor(kind);
+  if (n <= 1) return hex;
+  const r = parseInt(hex.slice(1, 3), 16) / 255, g = parseInt(hex.slice(3, 5), 16) / 255, b = parseInt(hex.slice(5, 7), 16) / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+  let h = 0; const sat = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  if (d) h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  h = (h * 60 + ((i / (n - 1)) - 0.5) * 60 + 360) % 360;
+  return `hsl(${h.toFixed(0)} ${(sat * 100).toFixed(0)}% ${((i % 2 ? l * 0.62 : l) * 100).toFixed(0)}%)`;
+}
+function phaseKeys(phases) {
+  const m = {};
+  phases.forEach(p => { const k = phaseKey(p); (m[p.kind] ??= []).includes(k) || m[p.kind].push(k); });
+  return m;
+}
 const sensorValue = (p, key) => key.startsWith('x:') ? (p.sensors || {})[key.slice(2)] : p[key];
 
 function sensorDefs(sec) {
@@ -802,6 +1179,9 @@ function sensorsSection(entries) {
       `<label class="chk"><input type="checkbox" data-pkind="${esc(k)}" ${state.phaseHidden.has(k) ? '' : 'checked'}><span class="sw" style="background:${phaseColor(k)}"></span>${esc(PHASE_NAMES[k] || k)} (${phases.filter(p => p.kind === k).length})</label>`).join('') +
       `<label class="chk">opacity <input type="range" min="0" max="60" value="${Math.round(state.phaseOpacity * 100)}" data-popacity style="width:120px"> <span data-popv>${Math.round(state.phaseOpacity * 100)} %</span></label>` +
       '<span style="color:var(--dim);font-size:12px">hover a band to see which test ran</span></div>';
+    const keys = phaseKeys(phases);
+    html += '<details><summary>Test colours (one shade per test)</summary>' + kindsSeen.map(k => `<div class="row"><b>${esc(PHASE_NAMES[k] || k)}:</b>` +
+      keys[k].map((t, i) => `<span class="chk"><span class="sw" style="background:${phaseShade(k, i, keys[k].length)}"></span>${esc(t)}</span>`).join('') + '</div>').join('') + '</details>';
   }
   if (units.length > 1) html += '<div style="color:var(--dim);font-size:12px">Each unit has its own axis (first on the left, others on the right); lines on different axes use different dash patterns.</div>';
   const axes = units.map(u => ({ unit: u, label: sel.filter(d => d[2] === u).map(d => d[1]).slice(0, 2).join(' · ') + (sel.filter(d => d[2] === u).length > 2 ? ' …' : '') + ` (${u})` }));
@@ -809,10 +1189,22 @@ function sensorsSection(entries) {
     const st = seriesStyle(defs.indexOf(d));
     return { series: d[1], metric: d[1], unit: d[2], name: d[1], color: st.color, shape: 'circle', dash: DASHES[units.indexOf(d[2]) % DASHES.length], axis: units.indexOf(d[2]), pts: tl.filter(p => sensorValue(p, d[0]) != null).map(p => [p.t_s, sensorValue(p, d[0])]) };
   });
-  const bands = phases.filter(p => !state.phaseHidden.has(p.kind)).map(p => ({ x0: p.t0_s, x1: Math.max(p.t1_s, p.t0_s + 0.05), color: phaseColor(p.kind), label: p.label }));
+  const pkeys = phaseKeys(phases);
+  const bands = phases.filter(p => !state.phaseHidden.has(p.kind)).map(p => {
+    const ks = pkeys[p.kind] || [], i = Math.max(0, ks.indexOf(phaseKey(p)));
+    return { x0: p.t0_s, x1: Math.max(p.t1_s, p.t0_s + 0.05), color: phaseShade(p.kind, i, ks.length), label: p.label };
+  });
   const cid = 'chart_sensors';
   pendingSpecs.set(cid, { id: cid, lines, axes, bands, legend: sel.length > 1 && sel.length <= 12 ? lines.map(l => ({ label: l.name + ' (' + l.unit + ')', color: l.color, dash: l.dash, axis: l.axis })) : null, ysig: sel.map(d => d[0]).join('|'), xLabel: 'seconds since the test started', logY: false, zeroY: false, markers: false, xFmt: v => fmt(v) + ' s' });
-  html += chartTools(cid) + `<div class="chartbox big" data-chart="${cid}"></div>`;
+  html += chartBlock(cid, true);
+  const progs = (sec.programs || []).filter(p => p.cpu_avg_pct >= 0.1 || p.gpu_avg_pct >= 0.1);
+  if (sec.programs) {
+    html += '<h3>Other programs while the tests ran</h3>' + (progs.length
+      ? '<div style="color:var(--dim);font-size:12px">Share of the whole CPU (100 % = every core busy) and of the GPU\'s busiest engine, averaged over the run. Anything busy here competed with the tests; the rows of the tests it overlapped say so under "unusual values".</div>' +
+        `<div class="scroll" style="max-height:300px"><table><thead><tr><th>Program</th><th>CPU avg %</th><th>CPU max %</th><th>GPU avg %</th><th>GPU max %</th></tr></thead><tbody>` +
+        progs.map(p => `<tr><td>${esc(p.name)}</td><td class="${p.cpu_avg_pct >= 5 ? 'warn' : ''}">${fmt(p.cpu_avg_pct)}</td><td>${fmt(p.cpu_max_pct)}</td><td class="${p.gpu_avg_pct >= 5 ? 'warn' : ''}">${fmt(p.gpu_avg_pct)}</td><td>${fmt(p.gpu_max_pct)}</td></tr>`).join('') + '</tbody></table></div>'
+      : '<div style="color:var(--dim);font-size:12px">✓ No other program used a noticeable share of the CPU or GPU.</div>');
+  }
   const peaks = sec.core_peak_temps_c || [];
   if (peaks.length) {
     html += '<h3>Peak temperature per core</h3><div class="row">' + peaks.map(p => { const t = p[1], c = t > 85 ? 'bad' : t > 70 ? 'warn' : 'ok'; return `<span class="badge ${c === 'ok' ? 'ok' : c === 'warn' ? 'warn' : 'bad'}">core ${p[0]}: ${t.toFixed(0)} °C</span>`; }).join('') + '</div>';
@@ -859,7 +1251,7 @@ function overview(doc, name, meta) {
 // page
 // ------------------------------------------------------------------------------------------------
 let lastRender = null;
-const KIND_ORDER = ['memory', 'cpu', 'gpu', 'input_timing_suite', 'input_trials'];
+const KIND_ORDER = ['memory', 'cpu', 'gpu', 'gpu3d', 'gpu3d_frames', 'input_timing_suite', 'input_trials', 'mouse_polling', 'reflex_game'];
 const entriesFor = k => lastRender.perDoc.filter(p => p.sections[k]).map(p => ({ label: p.label, sec: p.sections[k] }));
 
 function render() {
@@ -904,6 +1296,15 @@ function wireKind(host, kindKey) {
   const card = host.querySelector('.card[id^=sec_]'); if (!card) return;
   const b = lastRender.built.find(x => x.kindKey === kindKey), redo = () => rebuildSection(kindKey);
   card.querySelectorAll('[data-ser]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.ser; el.checked ? state.hiddenSeries.delete(k) : state.hiddenSeries.add(k); redo(); });
+  // a whole row (test) or column (thread count): all shown -> hide them, otherwise show them all
+  const toggleGroup = pick => {
+    const group = b.series.filter(s => pick(splitSeries(s)));
+    const allOn = group.every(s => !state.hiddenSeries.has(kindKey + ':' + s));
+    group.forEach(s => allOn ? state.hiddenSeries.add(kindKey + ':' + s) : state.hiddenSeries.delete(kindKey + ':' + s));
+    redo();
+  };
+  card.querySelectorAll('[data-serrow]').forEach(el => el.onclick = () => toggleGroup(p => p.base === el.dataset.serrow));
+  card.querySelectorAll('[data-sercol]').forEach(el => el.onclick = () => toggleGroup(p => p.col === el.dataset.sercol));
   card.querySelectorAll('[data-col]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.col; el.checked ? state.hiddenCols.delete(k) : state.hiddenCols.add(k); redo(); });
   card.querySelectorAll('[data-opt]').forEach(el => el.onchange = () => { optsOf(kindKey)[el.dataset.opt] = el.checked; redo(); });
   card.querySelectorAll('[data-mchip]').forEach(el => el.onchange = () => {

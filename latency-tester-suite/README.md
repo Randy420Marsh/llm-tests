@@ -86,6 +86,27 @@ workloads), and every suite can still be run and saved by hand.
   128 KB StridedRead with a 4 KB stride used to show 255 ns per access in one of three runs; it now measures
   about 1 ns every time).
 
+## What the memory and CPU tests measure
+
+- **Sequential read / write / read-write and STREAM scale / add / triad** work on 64-bit words, compiled twice and
+  picked at run time: AVX2 when the CPU has it, SSE2 otherwise. They used to go byte by byte, which capped every
+  size (even L1) at the same ~10 GB/s, so they showed the loop, not the memory. STREAM add is `a = a + b` and triad
+  `a = a + k·b` over two buffers: the same 2 reads + 1 write per element as STREAM's three-array versions.
+- **Pointer chase** carries on from where the previous pass stopped, so a 1 GB buffer is walked through instead of
+  the same 65 536 lines being revisited (they then sat in L3, and "1 GB" reported cache latency). With several
+  threads each starts at its own point of the cycle. **Dependent read** does the same along its sequential chain.
+- Threads split a buffer on **cache-line boundaries**, so no two threads write the same line (false sharing made
+  4 KB with 24 threads look several times slower). The second STREAM buffer starts half a page after the first,
+  so `src[i]` and `dst[i]` never share a position within a 4 KB page (4K aliasing halved StreamCopy at one size).
+- **CPU integer workloads** keep the value in a register between steps. `std::hint::black_box` stored it to the
+  stack and loaded it back each time, so IntegerAdd measured store-to-load forwarding: on Arrow Lake the P-cores
+  came out 5× slower than the E-cores.
+- Results are compared per core type: the Results tab and the report flag a core only against the median of its
+  own kind (P with P, E with E), and label cores "Core 10 · P" / "Core 2 · E". P and E cores are read from what
+  the OS reports (Windows: each core's efficiency class; Linux: `cpu_core` / `cpu_atom`), CPUID only as a fallback.
+- All-core runs next to per-core runs get their own line and slot left of core 0 in the charts, and the chart starts
+  on *Throughput per thread* so they can be compared with single cores (the total stays in the table).
+
 ## Choosing what to test
 
 Every tab shows live progress (what is running right now, ETA) and fills its results in as tests finish;
@@ -117,18 +138,64 @@ also recorded as a *phase*, so the timeline shows which test was running when.
 
 **LibreHardwareMonitor on Windows.** `build.bat` downloads the official
 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) release (MPL-2.0) into
-`dist\LibreHardwareMonitor\`, and the Dashboard has a *Download LibreHardwareMonitor* button for an exe that was
-copied elsewhere. The app loads the library itself, so the LibreHardwareMonitor program does not have to run.
-Its driver, and with it the CPU, board and memory sensors, only loads for an administrator:
-use *Restart as administrator* on the Dashboard. Without the library the app reads the LibreHardwareMonitor or
-OpenHardwareMonitor app if one is running, and otherwise only the ACPI thermal zone.
+`dist\LibreHardwareMonitor\`, and the Dashboard has a *Download / Update LibreHardwareMonitor* button for an exe
+that was copied elsewhere. The app loads the library itself, so the LibreHardwareMonitor program does not have to
+run. Three things have to be in place, and the Dashboard's sensor notes say which one is missing:
+
+1. **The .NET Framework build.** Releases ship `LibreHardwareMonitor.zip` (.NET Framework) and
+   `LibreHardwareMonitor.NET.10.zip`; Windows PowerShell, which hosts the library, can only load the first. The
+   download picks it, replaces anything that was in the folder and checks that it loads. (Before 1.1 the script
+   could pick the .NET 10 build, and then no sensor appeared: press *Update LibreHardwareMonitor* once.)
+2. **The PawnIO driver.** Since LibreHardwareMonitor 0.9.5 the CPU (core temperatures, clocks, power), board
+   (Super I/O: VRM, fans, voltages) and memory (SPD) sensors are read through [PawnIO](https://pawnio.eu).
+   *Install PawnIO* on the Dashboard runs the PawnIO setup that ships inside `LibreHardwareMonitor.exe`, the same
+   way LibreHardwareMonitor does on its first start (or start `dist\LibreHardwareMonitor\LibreHardwareMonitor.exe`
+   once and accept its prompt). Without it only GPU and drive sensors appear.
+3. **Administrator rights:** use *Restart as administrator* on the Dashboard.
+
+Per-core sensors are placed on the right logical CPU: LibreHardwareMonitor names hybrid cores "P-Core #3" /
+"E-Core #1", which on Arrow Lake are CPU 10 and CPU 2 (P and E cores are interleaved). Its per-core clocks replace
+the performance-counter estimate. Without the library the app reads the LibreHardwareMonitor or
+OpenHardwareMonitor app if one is running (WMI), and otherwise only the ACPI thermal zone, which on many boards is
+a fixed value.
+
+**Measuring on the charts.** Every chart in the report has *Measure* tools next to its zoom buttons:
+
+- **📍 marker**: click to drop named, colour-coded markers (they snap to a measured point nearby); a table lists
+  every line's value at each marker and the change from the first to the last marker (absolute, %, per second on
+  the timeline). Rename a marker in its table; × removes it.
+- **↔ range**: drag across the chart to measure a range: points, min, average, median, 1 % / 99 %, max, standard
+  deviation and the change from first to last, for every line. On the timeline, clicking a test's background band
+  measures exactly that test.
+- **― threshold**: a horizontal line at a value (e.g. 90 °C) with, per line, the share of points above it, the time
+  above it and how often it was crossed.
+- **crosshair**: a vertical line that follows the mouse and lists every line's value there.
+- *Copy measurements (CSV)* copies all of it. The app's Results & Graphs charts have markers and ranges too
+  (click, click; Shift + click on the timeline measures the test under the pointer).
 
 **Report / viewer:** the *Sensors over time* chart can overlay any mix of sensors (presets: temperatures, fans,
 power, voltages, clocks, load, RAM/VRAM; filter box for names like "VRM" or "DIMM"). Each unit gets its own axis.
 Every test is drawn as a background band (memory red, CPU blue, GPU green, input amber) with an opacity slider
-and per-suite switches; hovering a band names the test. A table lists min / average / max of every sensor for the
-whole run. The app's **Results & Graphs** tab shows the same bands and sensor groups. `sensors.csv` holds every
+and per-suite switches; within a suite each test (workload, pattern, mode, size) gets its own shade and a thin line
+marks where one test ends and the next begins (*Test colours* lists them). Hovering names the test and its time. A table lists min / average / max of every sensor for the
+whole run. The app's **Results & Graphs** tab shows the same bands and sensor groups (hover the chart to see which test
+ran); its legend sits under the chart, and *Reset view* returns to the whole chart after zooming. `sensors.csv` holds every
 sample with one column per sensor, and `phases.csv` lists each test's start and end.
+
+## Other programs during the tests
+
+With every sensor sample the app also notes which other programs used the CPU and, on Windows, the GPU
+(Task Manager's figure: the busiest GPU engine of each process, from the *GPU Engine* performance counters).
+Processes with the same name are added up (a browser is dozens of processes); the app itself and its sensor helper
+are left out. CPU is a share of the whole CPU (100 % = every core busy).
+
+- Every result row carries *Other programs: CPU / GPU (avg)* for its own test, and a test where they used 8 % or
+  more is listed under *unusual values* with the programs by name, because its result may be lower than the
+  machine can do.
+- The busiest programs are also sensor lines (*Load* group in the app, `%` in the report), so they can be drawn on
+  the timeline next to clocks and temperatures.
+- When the tests finish, the log says which programs were busy on average (and their peak), and the report has an
+  *Other programs while the tests ran* table.
 
 ## Keeping the app out of the measurement
 
@@ -157,6 +224,15 @@ sample with one column per sensor, and `phases.csv` lists each test's start and 
   refresh anyway, and in the precise window 1 ms white becomes exactly one frame, every cycle. It shows the
   refresh rate, the frames per phase, frame-time p50/p99 and late (dropped) frames. `Esc` closes, `I` hides the text.
   (`latency-tester --pattern --on-ms 1 --off-ms 500 [--cycles N] [--windowed]` starts it directly.)
+  - **Ghosting test:** instead of flashes it can sweep a vertical line left → right, a horizontal line top → bottom,
+    both at once, or a square, with a settable width and sweep time. Every sweep is a whole, even number of frames,
+    so with *both* the two lines meet exactly at the centre of the screen on the middle frame. Look for trails
+    (slow pixel response) or bright/dark halos (overdrive) behind the moving edge.
+  - **Display** picks the monitor it opens on (on Windows it is placed on that monitor's exact pixels, then goes
+    full screen there), and **Start after** gives a black lead-in (5 s by default) to get the camera or sensor
+    ready; the refresh rate is measured during it.
+  - `latency-tester --pattern --motion both|vertical|horizontal|square --width 8 --sweep-ms 2000 --display 2
+    --delay-ms 5000` starts it directly.
 - **Timers.** The Dashboard shows the time source and the timer resolution. On Windows the QPC frequency tells
   the source (10 MHz = invariant TSC, 14.318 MHz = HPET forced with `bcdedit /set useplatformclock true`,
   3.58 MHz = ACPI PM timer), and the app requests the finest system timer resolution (usually 0.5 ms) while it
@@ -194,6 +270,41 @@ Notes on the numbers:
   self-contained `report.html` (no external resources: e-mail it or open it offline). The page shows each
   file's signature status (valid / edited / signed by another key), the system info, per-test results, sweeps
   and the sensor timeline, with per-series toggles.
+
+## 3D graphics benchmark
+
+GPU tab → *3D graphics benchmark* (also a step of *Run all*): a lit scene of spinning, textured cubes (Low 4 096
+cubes … Ultra 64 000, and a procedural texture with a set number of noise octaves per pixel) rendered with wgpu,
+Vulkan first, at **720p, 1080p, 1440p and 4K** (16:9), with or without 4× MSAA. It renders off screen, so the
+window, the monitor's refresh rate and VSync do not cap it: the numbers are what the GPU and driver can do.
+
+- **Frame times / FPS:** frames rendered back to back with two in flight, like a game with one frame queued. The
+  frame time is the gap between two frames finishing: average FPS, **1 % and 0.1 % lows** (average of the slowest
+  1 % / 0.1 % of frames), p50 / p95 / p99 / worst frame, and a frame-by-frame chart where stutters show as spikes.
+- **Latency:** one frame at a time, from submitting it to the GPU having finished it, the render part of
+  click-to-photon; plus the GPU's own time per frame from timestamp queries where the device supports them.
+- The GPU's temperature, clocks and power while each resolution ran are recorded like every other test, and a
+  thumbnail of the rendered scene is shown. Saved in the session (`gpu3d.csv`); the report adds a *3D graphics* and
+  a frame-by-frame section.
+
+## Mouse polling and the reflex game
+
+- **Mouse polling** (Input tab): move the mouse, fast circles work best, for a few seconds. Every report the mouse
+  sends is timestamped on arrival, like MouseTester: on Windows through raw input (WM_INPUT) on a
+  high-priority thread with QueryPerformanceCounter, on Linux through evdev with the kernel's own timestamps
+  (needs the `input` group). The result is the real polling rate (from the median interval) and the setting
+  it matches, the interval spread (jitter, 1 % / 99 %), how many reports arrived on time (±10 %) or a whole
+  interval late, and the counts per report, with *interval vs time* and *x counts vs time* charts. Runs are
+  saved in the session (`mouse_polling.csv`).
+- The **OS timing suite** below it never read the mouse: its modes time the app's own wake-ups. They are now named
+  for what they measure (*Sleep 100 µs wake-up*, *Sleep 50 µs wake-up*, *Poll loop*, *1 ms busy-wait jitter*;
+  saved files keep the old `MouseMove` / `RawInput` / `PollingRate` / `Jitter` names).
+- **Reflex game** (Input tab): click red circles as fast as you can, 100 by default, one at a time or several at
+  a time (each hit brings a new one), with a settable circle size and a soft sound on each hit (can be turned
+  off). It reports the time per circle (average, median, 90 %, best, worst), misses and accuracy, how far from the
+  centre the hits land, circles per second and the Fitts' law throughput (bits/s), with a chart of every hit.
+  The times include everything from seeing the circle to the click reaching the app. Saved in the session
+  (`reflex_game.csv`, one row per circle).
 
 ## Automated input-latency rig (optional)
 
@@ -250,6 +361,17 @@ flowchart TD
   server --> viewer["web/viewer.html"]
   browser(("Browser")) --> server
 ```
+
+## Changes in 1.1
+
+- Sensors: LibreHardwareMonitor loads (the .NET Framework build, with PawnIO installed from the Dashboard),
+  P- and E-cores are told apart everywhere, other programs' CPU and GPU use is logged during the tests.
+- Memory and CPU tests measure the memory system and the core rather than the harness (see
+  "What the memory and CPU tests measure"): results are not comparable with 1.0.
+- New tests: 3D graphics benchmark, mouse polling, reflex game, ghosting patterns on a chosen display.
+- Results & Graphs: legend under the chart, grouped line switches, unusual values ringed, a shade per test
+  on the sensor timeline, measuring tools and Reset view (the same in the web report).
+- The input test area stays black while the rig waits.
 
 ## Tests
 

@@ -123,6 +123,9 @@ impl LatencyTesterApp {
         *self.input_progress.lock().unwrap() = RunProgress::default();
         self.cpu_partial.lock().unwrap().clear();
         self.gpu_partial.lock().unwrap().clear();
+        *self.bench3d.progress.lock().unwrap() = RunProgress::default();
+        self.bench3d.partial.lock().unwrap().clear();
+        self.bench3d.set_result(None);
         self.last_memory_result = None;
         self.last_cpu_result = None;
         self.last_gpu_result = None;
@@ -174,6 +177,8 @@ impl LatencyTesterApp {
             cpu_partial: self.cpu_partial.clone(),
             gpu_progress: self.gpu_progress.clone(),
             gpu_partial: self.gpu_partial.clone(),
+            gpu3d_progress: self.bench3d.progress.clone(),
+            gpu3d_partial: self.bench3d.partial.clone(),
             input_progress: self.input_progress.clone(),
         };
         self.run_all.worker = Some(run_all::spawn(job, handles, sampler, self.cancel.clone(), self.run_all.status.clone()));
@@ -219,7 +224,7 @@ impl LatencyTesterApp {
                         let _ = h.join();
                     }
                     self.run_all_finalize(out);
-                } else if self.run_all.worker.as_ref().map_or(false, |h| h.is_finished()) {
+                } else if self.run_all.worker.as_ref().is_some_and(|h| h.is_finished()) {
                     // The worker ended without reporting: keep what finished
                     self.run_all.worker = None;
                     self.run_all_finalize(RunAllOutput {
@@ -282,6 +287,7 @@ impl LatencyTesterApp {
         self.last_input_result = out.input_suite;
         self.last_cpu_result = out.cpu_summary;
         self.last_gpu_result = out.gpu_summary;
+        self.bench3d.set_result(out.gpu3d_summary);
         self.last_mem_config = out.memory_configs.first().cloned();
         self.mem_extra_configs = out.memory_configs.iter().skip(1).cloned().collect();
         self.last_cpu_config = out.cpu_configs.first().cloned();
@@ -354,7 +360,7 @@ impl LatencyTesterApp {
         }
         let mut html = None;
         if let Some(path) = json_path {
-            let entries = crate::report::load_files(&[path.clone()]);
+            let entries = crate::report::load_files(std::slice::from_ref(path));
             if entries.is_empty() {
                 notes.push("Run all: the saved record could not be read back for the HTML report".into());
             } else {
@@ -514,6 +520,14 @@ impl LatencyTesterApp {
                 });
                 ui.end_row();
 
+                ui.checkbox(&mut plan.gpu3d, "3D graphics");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("720p, 1080p, 1440p and 4K, rendered for").weak());
+                    ui.add(egui::DragValue::new(&mut plan.gpu3d_duration_s).range(1.0..=300.0).suffix(" s"));
+                    ui.label(RichText::new("each (+ latency and warm-up)").weak());
+                });
+                ui.end_row();
+
                 ui.label("Per-core order");
                 ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut plan.core_by_core, false, "rotate cores between tests (cooler)");
@@ -642,6 +656,10 @@ impl LatencyTesterApp {
                     progress_panel(ui, &p, true);
                 }
                 Some(StepSpec::Gpu { .. }) => self.gpu_progress_and_partial(ui),
+                Some(StepSpec::Gpu3d { .. }) => {
+                    let p = self.bench3d.progress.lock().unwrap().clone();
+                    progress_panel(ui, &p, true);
+                }
                 Some(StepSpec::InputSuite { .. }) => {
                     let p = self.input_progress.lock().unwrap().clone();
                     progress_panel(ui, &p, true);

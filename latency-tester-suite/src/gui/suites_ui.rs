@@ -179,6 +179,26 @@ impl LatencyTesterApp {
                 self.sensor_notes = s.notes();
             }
             self.sampler_active = false;
+            // which other programs were busy meanwhile (they can pull results down)
+            if let Some(progs) = crate::sensors::program_usage(&self.last_timeline) {
+                let busy: Vec<String> = progs
+                    .iter()
+                    .filter(|p| p.1 >= 1.0 || p.3 >= 1.0)
+                    .take(6)
+                    .map(|p| {
+                        let mut s = format!("{} {:.1} % CPU (max {:.0} %)", p.0, p.1, p.2);
+                        if p.3 >= 0.5 {
+                            s.push_str(&format!(", {:.1} % GPU (max {:.0} %)", p.3, p.4));
+                        }
+                        s
+                    })
+                    .collect();
+                if busy.is_empty() {
+                    self.log("Other programs: none used more than 1 % of the CPU or GPU on average while the tests ran");
+                } else {
+                    self.log(&format!("Other programs while the tests ran (average): {}", busy.join(" · ")));
+                }
+            }
             if crate::app_core::is_active() {
                 let moves = crate::app_core::moves();
                 crate::app_core::release();
@@ -479,13 +499,13 @@ impl LatencyTesterApp {
     pub(super) fn input_suite_options(&mut self, ui: &mut Ui) {
         ui.add_enabled_ui(!self.is_running(), |ui| {
             egui::CollapsingHeader::new("Timing-suite options").id_salt("input_opts").show(ui, |ui| {
-                ui.label(RichText::new("Measures the OS timing / scheduling stack (not real hardware input). Pin it to a core, or sweep every core to spot one with bad timer jitter.").weak().small());
+                ui.label(RichText::new("Times the OS's own wake-ups (sleep precision, scheduler): no mouse or keyboard is read. The real mouse test is the Mouse polling tab. Pin it to a core, or sweep every core to spot one with bad timer jitter.").weak().small());
                 self.input_ui.cores.ui(ui);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Samples per test:");
                     ui.add(egui::DragValue::new(&mut self.input_ui.samples).range(10..=100_000));
                     for (m, on) in self.input_ui.modes.iter_mut() {
-                        ui.checkbox(on, format!("{:?}", m));
+                        ui.checkbox(on, m.label()).on_hover_text(m.describe());
                     }
                 });
             });

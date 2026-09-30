@@ -1,7 +1,9 @@
 [package]
 name = "latency-tester"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
+# eframe 0.29 / wgpu 22 need about this much anyway; clippy then only suggests APIs this version has
+rust-version = "1.80"
 description = "Cross-platform latency testing suite for CPU, memory, GPU, and input latency"
 authors = ["Latency Tester Suite"]
 license = "MIT"
@@ -47,9 +49,11 @@ crossbeam = "0.8"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bytemuck = "1.25.2"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
@@ -63,6 +67,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Power",
     "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_System_LibraryLoader",
+    "Win32_Media_Audio",
     "Win32_Graphics_Gdi",
 ] }
 

@@ -70,6 +70,12 @@ pub struct SessionData<'a> {
     pub cpu_extra_configs: &'a [CpuBenchmarkConfig],
     /// How a "run all tests" run was set up and how it ended
     pub run_info: Option<Value>,
+    /// Mouse polling runs (the user moved the mouse; `mouse_poll`)
+    pub mouse_polling: &'a [crate::mouse_poll::MousePollResult],
+    /// Reflex game results (`aim_game`)
+    pub reflex_game: &'a [crate::aim_game::AimResult],
+    /// 3D graphics benchmark (`bench3d`)
+    pub gpu3d: Option<&'a crate::bench3d::Bench3dSummary>,
 }
 
 /// Timeline points kept in the saved record (a long run has tens of thousands of samples)
@@ -79,7 +85,7 @@ pub fn downsample_timeline(tl: &[Snapshot], max_points: usize) -> Vec<Value> {
     if tl.is_empty() || max_points == 0 {
         return Vec::new();
     }
-    let step = ((tl.len() + max_points - 1) / max_points).max(1);
+    let step = tl.len().div_ceil(max_points).max(1);
     tl.iter()
         .step_by(step)
         .map(|s| {
@@ -160,6 +166,10 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
         config.insert("gpu".into(), to_value(&data.gpu_config));
         results.insert("gpu".into(), json!({ "vulkan": data.gpu_vulkan, "results": data.gpu }));
     }
+    if let Some(g) = data.gpu3d.filter(|g| scope.includes(Scope::Gpu) && !g.results.is_empty()) {
+        config.insert("gpu3d".into(), to_value(&g.config));
+        results.insert("gpu3d".into(), json!({ "adapter": g.adapter, "backend": g.backend, "driver": g.driver, "results": g.results }));
+    }
     if scope.includes(Scope::Input) {
         if let Some(s) = data.input_suite {
             config.insert("input_timing_suite".into(), to_value(&s.config));
@@ -181,6 +191,12 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
             config.insert("input_trials".into(), json!({ "rig_calibration": data.calibration }));
             results.insert("input_trials".into(), json!({ "runs": runs }));
         }
+        if !data.mouse_polling.is_empty() {
+            results.insert("mouse_polling".into(), json!({ "runs": data.mouse_polling }));
+        }
+        if !data.reflex_game.is_empty() {
+            results.insert("reflex_game".into(), json!({ "runs": data.reflex_game }));
+        }
     }
     if scope.includes(Scope::Sensors) && !data.timeline.is_empty() {
         config.insert("sensors".into(), json!({ "sample_interval_ms": 500, "max_points": MAX_TIMELINE_POINTS }));
@@ -191,6 +207,10 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
                 "samples_recorded": data.timeline.len(),
                 "duration_s": data.timeline.last().map(|s| s.t_ms as f64 / 1000.0),
                 "core_peak_temps_c": core_peaks(data.timeline),
+                // other programs over the whole run, busiest first
+                "programs": crate::sensors::program_usage(data.timeline).map(|v| v.into_iter().take(20).map(|p| json!({
+                    "name": p.0, "cpu_avg_pct": p.1, "cpu_max_pct": p.2, "gpu_avg_pct": p.3, "gpu_max_pct": p.4,
+                })).collect::<Vec<_>>()),
                 "sensor_kinds": sensor_kinds(data.timeline),
                 "phases": data.phases.iter().map(|p| json!({
                     "kind": p.kind,
@@ -219,7 +239,7 @@ pub fn build(data: &SessionData, scope: Scope) -> (Value, Value) {
 /// True if `build` would produce anything for this scope
 pub fn has_data(data: &SessionData, scope: Scope) -> bool {
     let (_, r) = build(data, scope);
-    r.as_object().map_or(false, |o| o.keys().any(|k| k != "virtualization"))
+    r.as_object().is_some_and(|o| o.keys().any(|k| k != "virtualization"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -280,6 +300,23 @@ pub fn csv_files(data: &SessionData) -> Vec<(String, String)> {
     add("memory.csv", data.memory.iter().map(to_value).collect());
     add("cpu.csv", data.cpu.iter().map(to_value).collect());
     add("gpu.csv", data.gpu.iter().map(to_value).collect());
+    add(
+        "gpu3d.csv",
+        data.gpu3d
+            .map(|g| {
+                g.results
+                    .iter()
+                    .map(|r| {
+                        let mut v = to_value(r);
+                        if let Some(o) = v.as_object_mut() {
+                            o.remove("frametimes_ms");
+                        }
+                        v
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
     add("input_timing.csv", data.input_suite.map(|s| s.results.iter().map(to_value).collect()).unwrap_or_default());
     let mut trials = Vec::new();
     for (i, (run, cal)) in data.trials.iter().enumerate() {
@@ -297,6 +334,29 @@ pub fn csv_files(data: &SessionData) -> Vec<(String, String)> {
         }
     }
     add("input_trials.csv", trials);
+    // one row per run; the per-report series stay in the signed record
+    add(
+        "mouse_polling.csv",
+        data.mouse_polling
+            .iter()
+            .map(|r| {
+                let mut v = to_value(r);
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("intervals");
+                    o.remove("x_counts");
+                }
+                v
+            })
+            .collect(),
+    );
+    // one row per circle hit
+    let mut hits = Vec::new();
+    for (g, r) in data.reflex_game.iter().enumerate() {
+        for (i, t) in r.times_ms.iter().enumerate() {
+            hits.push(json!({ "game": g + 1, "mode": r.mode, "radius_px": r.radius, "circle": i + 1, "time_ms": t }));
+        }
+    }
+    add("reflex_game.csv", hits);
     add("sensors.csv", downsample_timeline(data.timeline, data.timeline.len().max(1)));
     add(
         "phases.csv",
@@ -368,7 +428,23 @@ mod tests {
             ram_total_mb: 64000.0,
             gpu: Some(GpuSensors { name: "g".into(), temp_c: Some(40.0), vram_used_mb: Some(500.0), ..Default::default() }),
             sensors: vec![crate::sensors::SensorReading { name: "nct6798: VRM MOS".into(), kind: crate::sensors::SensorKind::Temp, value: 61.5 }, crate::sensors::SensorReading { name: "RAPL: package-0".into(), kind: crate::sensors::SensorKind::Power, value: 88.0 }],
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn mouse_polling_runs_are_saved_and_exported() {
+        let reports: Vec<crate::mouse_poll::Report> = (1..=200).map(|i| crate::mouse_poll::Report { t_ns: i * 1_000_000, dx: 2, dy: 0 }).collect();
+        let r = crate::mouse_poll::analyze(&reports, "test").unwrap();
+        let runs = vec![r];
+        let data = SessionData { mouse_polling: &runs, ..Default::default() };
+        let (_, res) = build(&data, Scope::Input);
+        assert_eq!(res["mouse_polling"]["runs"][0]["nominal_hz"], 1000.0);
+        let files = csv_files(&data);
+        let (name, csv) = files.iter().find(|f| f.0 == "mouse_polling.csv").unwrap();
+        assert_eq!(name, "mouse_polling.csv");
+        assert!(csv.contains("rate_hz") && !csv.contains("intervals"), "the per-report series stay out of the CSV");
+        assert!(!build(&data, Scope::Memory).1.as_object().unwrap().contains_key("mouse_polling"));
     }
 
     #[test]

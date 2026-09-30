@@ -38,6 +38,8 @@ pub enum SensorKind {
     Power,
     Voltage,
     Current,
+    /// A share of the machine in %, e.g. how much CPU or GPU another program used
+    Load,
 }
 
 impl SensorKind {
@@ -48,6 +50,7 @@ impl SensorKind {
             SensorKind::Power => "W",
             SensorKind::Voltage => "V",
             SensorKind::Current => "A",
+            SensorKind::Load => "%",
         }
     }
 
@@ -60,6 +63,7 @@ impl SensorKind {
                 SensorKind::Power => (0.0..5_000.0).contains(&v),
                 SensorKind::Voltage => (0.0..60.0).contains(&v),
                 SensorKind::Current => (0.0..500.0).contains(&v),
+                SensorKind::Load => (0.0..=400.0).contains(&v),
             }
     }
 
@@ -98,6 +102,19 @@ pub struct Phase {
     pub end_ms: u64,
 }
 
+/// Another program's share of the machine at one sample (processes with the same name added up)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProcUsage {
+    pub name: String,
+    /// % of all CPU cores together (100 = every core busy)
+    pub cpu_pct: f32,
+    /// % of the busiest GPU engine type (3D, compute, copy, video) it used, like Task Manager (Windows)
+    pub gpu_pct: f32,
+}
+
+/// Programs kept per sample (the busiest ones)
+const MAX_PROCS: usize = 8;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Milliseconds since the sampler started
@@ -114,6 +131,12 @@ pub struct Snapshot {
     /// Every other sensor found (see [`SensorReading`])
     #[serde(default)]
     pub sensors: Vec<SensorReading>,
+    /// The busiest other programs (this app and its sensor helper left out)
+    #[serde(default)]
+    pub procs: Vec<ProcUsage>,
+    /// Whether programs were sampled at all (an empty `procs` then means nothing else was busy)
+    #[serde(default)]
+    pub procs_sampled: bool,
 }
 
 impl Snapshot {
@@ -154,6 +177,61 @@ pub struct Telemetry {
     pub vram_total_mb: Option<f32>,
     pub gpu_power_max_w: Option<f32>,
     pub gpu_clock_avg_mhz: Option<f32>,
+    /// CPU share of every other program together during the test, average % of the whole CPU
+    #[serde(default)]
+    pub others_cpu_avg_pct: Option<f32>,
+    /// GPU share of every other program together, average % (Windows)
+    #[serde(default)]
+    pub others_gpu_avg_pct: Option<f32>,
+    /// The busiest other programs during the test: (name, average CPU %, average GPU %)
+    #[serde(default)]
+    pub others_top: Vec<(String, f32, f32)>,
+}
+
+impl Telemetry {
+    /// "chrome.exe 12 % CPU, obs64.exe 8 % GPU" (empty when nothing else was busy)
+    pub fn others_text(&self) -> String {
+        self.others_top
+            .iter()
+            .filter(|t| t.1 >= 0.5 || t.2 >= 0.5)
+            .map(|(n, c, g)| {
+                let mut parts = Vec::new();
+                if *c >= 0.5 {
+                    parts.push(format!("{:.0} % CPU", c));
+                }
+                if *g >= 0.5 {
+                    parts.push(format!("{:.0} % GPU", g));
+                }
+                format!("{} {}", n, parts.join(" / "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// (name, average CPU %, peak CPU %, average GPU %, peak GPU %) of one program
+pub type ProgramUsage = (String, f32, f32, f32, f32);
+
+/// Average use of every other program over `samples`, busiest first; None when programs were not sampled
+pub fn program_usage(samples: &[Snapshot]) -> Option<Vec<ProgramUsage>> {
+    let sampled: Vec<&Snapshot> = samples.iter().filter(|s| s.procs_sampled).collect();
+    if sampled.is_empty() {
+        return None;
+    }
+    let mut by: std::collections::BTreeMap<&str, (f32, f32, f32, f32)> = Default::default();
+    for s in &sampled {
+        for p in &s.procs {
+            let e = by.entry(&p.name).or_default();
+            e.0 += p.cpu_pct;
+            e.1 = e.1.max(p.cpu_pct);
+            e.2 += p.gpu_pct;
+            e.3 = e.3.max(p.gpu_pct);
+        }
+    }
+    let n = sampled.len() as f32;
+    let mut v: Vec<ProgramUsage> = by.into_iter().map(|(k, e)| (k.to_string(), e.0 / n, e.1, e.2 / n, e.3)).collect();
+    v.sort_by(|a, b| (b.1 + b.3).total_cmp(&(a.1 + a.3)));
+    Some(v)
 }
 
 fn avg(v: impl Iterator<Item = f32>) -> Option<f32> {
@@ -224,6 +302,12 @@ pub fn summarize(samples: &[Snapshot]) -> Telemetry {
     t.vram_total_mb = max(gpus().filter_map(|g| g.vram_total_mb));
     t.gpu_power_max_w = max(gpus().filter_map(|g| g.power_w));
     t.gpu_clock_avg_mhz = avg(gpus().filter_map(|g| g.clock_mhz));
+    if let Some(progs) = program_usage(samples) {
+        t.others_cpu_avg_pct = Some(progs.iter().map(|p| p.1).sum());
+        let gpu: f32 = progs.iter().map(|p| p.3).sum();
+        t.others_gpu_avg_pct = samples.iter().any(|s| s.procs.iter().any(|p| p.gpu_pct > 0.0)).then_some(gpu);
+        t.others_top = progs.iter().take(3).map(|p| (p.0.clone(), p.1, p.3)).collect();
+    }
     t
 }
 
@@ -271,7 +355,7 @@ pub fn read_hwmon(root: &Path) -> HwmonReading {
                 "k10temp" | "zenpower" => match label.as_str() {
                     "Tctl" | "Tdie" | "" => out.package_c = Some(out.package_c.map_or(c, |p: f32| p.max(c))),
                     l if l.starts_with("Tccd") => {
-                        if let Some(n) = l[4..].parse::<usize>().ok() {
+                        if let Ok(n) = l[4..].parse::<usize>() {
                             out.cores.push((n.saturating_sub(1), c));
                         }
                     }
@@ -456,13 +540,29 @@ pub struct WinSensors {
     pub zones_c: Vec<f32>,
     /// Every LibreHardwareMonitor temperature, fan, power, voltage and current sensor
     pub extra: Vec<SensorReading>,
+    /// LibreHardwareMonitor's library folder was passed to the helper
+    pub lhm_present: bool,
+    /// Why the library could not be loaded or opened
+    pub lhm_error: Option<String>,
+    /// Installed PawnIO driver version (LibreHardwareMonitor ≥ 0.9.5 reads CPU / board / memory through it)
+    pub pawnio: Option<String>,
+    /// P and E cores LibreHardwareMonitor names in its temperatures ("P-Core #n", "E-Core #n")
+    pub lhm_pe: Option<(usize, usize)>,
+    /// GPU use per process id, % of its busiest engine type ("GPU Engine" counters)
+    pub gpu_procs: Vec<(u32, f32)>,
 }
 
 const ACPI_SOURCE: &str = "ACPI thermal zone";
 
-/// Parse one JSON line printed by [`WIN_STREAM_SCRIPT`]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Parse one JSON line printed by [`WIN_STREAM_SCRIPT`] (per-core names placed by their number alone)
+#[cfg(test)]
 pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
+    parse_win_sensor_line_with(line, &crate::topology::CoreMap::default())
+}
+
+/// Parse one JSON line; `map` places per-core sensors ("P-Core #2", "E-Core #5") on logical CPUs
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn parse_win_sensor_line_with(line: &str, map: &crate::topology::CoreMap) -> Option<WinSensors> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let as_list = |v: &serde_json::Value| -> Vec<serde_json::Value> {
         match v {
@@ -479,10 +579,8 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
             continue;
         }
         let lower = name.to_lowercase();
-        if let Some(rest) = lower.strip_prefix("cpu core #") {
-            if let Ok(n) = rest.trim().parse::<usize>() {
-                w.cores.push((n.saturating_sub(1), val));
-            }
+        if let Some(cpus) = map.logical_for(name) {
+            w.cores.extend(cpus.into_iter().map(|c| (c, val)));
         } else if lower.contains("cpu package") || lower.contains("tctl") || lower.contains("core (tdie)") || lower == "core average" {
             w.package_c = Some(w.package_c.map_or(val, |p| p.max(val)));
         } else if lower == "gpu core" || lower.starts_with("gpu core") {
@@ -491,6 +589,12 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
     }
     w.cores.sort_by_key(|c| c.0);
     w.cores.dedup_by_key(|c| c.0);
+    let names: Vec<String> = as_list(&v["t"]).iter().filter_map(|t| t["n"].as_str().map(str::to_lowercase)).collect();
+    let count = |prefix: &str| names.iter().filter(|n| n.strip_prefix(prefix).is_some_and(|r| r.trim().parse::<usize>().is_ok())).count();
+    let (pc, ec) = (count("p-core #"), count("e-core #"));
+    if pc + ec > 0 {
+        w.lhm_pe = Some((pc, ec));
+    }
     // Actual clocks: every instance is "group,cpu"; % Processor Performance is relative to the base clock
     let base = v["base"].as_f64().unwrap_or(0.0);
     if base > 0.0 {
@@ -506,6 +610,38 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
         freqs.sort_by_key(|f| f.0);
         w.core_freq_mhz = freqs.into_iter().map(|f| f.1).collect();
     }
+    // LibreHardwareMonitor's own per-core clocks are better than the performance counter
+    let mut lhm_clocks: Vec<(usize, f32)> = Vec::new();
+    for c in as_list(&v["cl"]) {
+        let (Some(name), Some(mhz)) = (c["n"].as_str(), c["v"].as_f64()) else { continue };
+        if let Some(cpus) = map.logical_for(name).filter(|_| mhz > 100.0 && mhz < 10_000.0) {
+            lhm_clocks.extend(cpus.into_iter().map(|cpu| (cpu, mhz as f32)));
+        }
+    }
+    if let Some(n) = lhm_clocks.iter().map(|c| c.0 + 1).max() {
+        let mut f = vec![0.0f32; n.max(w.core_freq_mhz.len())];
+        f[..w.core_freq_mhz.len()].copy_from_slice(&w.core_freq_mhz);
+        for (cpu, mhz) in lhm_clocks {
+            f[cpu] = mhz;
+        }
+        w.core_freq_mhz = f;
+    }
+    // GPU Engine counters: one per process and engine; Task Manager's figure is the busiest engine type
+    let mut per: std::collections::HashMap<(u32, String), f32> = Default::default();
+    for g in as_list(&v["gp"]) {
+        let (Some(pid), Some(e), Some(val)) = (g["p"].as_u64(), g["e"].as_str(), g["v"].as_f64()) else { continue };
+        *per.entry((pid as u32, e.to_string())).or_default() += val as f32;
+    }
+    let mut by_pid: std::collections::HashMap<u32, f32> = Default::default();
+    for ((pid, _), v) in per {
+        let e = by_pid.entry(pid).or_default();
+        *e = e.max(v.min(100.0));
+    }
+    w.gpu_procs = by_pid.into_iter().collect();
+    w.gpu_procs.sort_by_key(|p| p.0);
+    w.lhm_present = v["lhm"].as_bool().unwrap_or(false);
+    w.lhm_error = v["lerr"].as_str().map(str::trim).filter(|e| !e.is_empty()).map(String::from);
+    w.pawnio = v["pawn"].as_str().map(str::trim).filter(|e| !e.is_empty()).map(String::from);
     if let Some(src) = v["src"].as_str().filter(|s| !s.is_empty()) {
         w.source = if src == "lib" {
             "LibreHardwareMonitor library"
@@ -545,7 +681,8 @@ pub fn parse_win_sensor_line(line: &str) -> Option<WinSensors> {
             w.source = ACPI_SOURCE.to_string();
         }
     }
-    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty() || !w.extra.is_empty()).then_some(w)
+    (w.package_c.is_some() || !w.cores.is_empty() || w.gpu_c.is_some() || !w.core_freq_mhz.is_empty() || !w.extra.is_empty() || w.lhm_error.is_some())
+        .then_some(w)
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -555,39 +692,73 @@ $base = (Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1).Ma
 $hp = '\Thermal Zone Information(*)\High Precision Temperature'
 $tzc = '\Thermal Zone Information(*)\Temperature'
 $pf = '\Processor Information(*)\% Processor Performance'
+# GPU use per process and engine (instances "pid_1234_luid_..._engtype_3D")
+$ge = '\GPU Engine(*)\Utilization Percentage'
 # A counter set that does not exist on this PC (no ACPI zones, older Windows) fails the whole call,
 # so fall back to smaller sets instead of losing the clocks as well
-$sets = @(@($hp, $tzc, $pf), @($tzc, $pf), @($pf))
+$sets = @(@($hp, $tzc, $pf, $ge), @($tzc, $pf, $ge), @($pf, $ge), @($hp, $tzc, $pf), @($tzc, $pf), @($pf))
 # 1) LibreHardwareMonitor's own library next to the exe ($env:LTS_LHM_DIR): no separate app needed.
-#    Without administrator rights it cannot load its driver, so CPU / board / memory sensors stay empty.
-$computer = $null
+#    Since v0.9.5 it reads CPU (MSR), board (Super I/O: VRM, fans, voltages) and memory (SPD) sensors
+#    through the PawnIO driver, which LibreHardwareMonitor.exe installs on its first start. Without
+#    PawnIO, or without administrator rights, only GPU, drive and similar sensors appear.
+$computer = $null; $lerr = ''
+$pawn = ''
+foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO') {
+  if (-not $pawn) { $pawn = [string](Get-ItemProperty $k -ErrorAction SilentlyContinue).DisplayVersion }
+}
 $lhm = $env:LTS_LHM_DIR
 if ($lhm -and (Test-Path (Join-Path $lhm 'LibreHardwareMonitorLib.dll'))) {
   try {
-    Get-ChildItem $lhm -Filter *.dll | ForEach-Object { try { [void][Reflection.Assembly]::LoadFrom($_.FullName) } catch {} }
+    $ErrorActionPreference = 'Stop'
+    if (Get-ChildItem $lhm -Filter '*.runtimeconfig.json') {
+      throw 'this is the .NET 10 build of LibreHardwareMonitor, which Windows PowerShell cannot load: press Update LibreHardwareMonitor on the Dashboard to get the .NET Framework build (LibreHardwareMonitor.zip)'
+    }
+    # files from a browser download carry a "downloaded from the internet" mark that blocks loading
+    Get-ChildItem $lhm -Recurse -File | ForEach-Object { try { Unblock-File $_.FullName } catch {} }
+    # the library's dependencies may want other versions than the ones next to it (the exe has
+    # binding redirects in its .config, PowerShell does not): hand over whatever is there
+    $resolve = [ResolveEventHandler]{
+      param($sender, $e)
+      $name = (New-Object Reflection.AssemblyName($e.Name)).Name
+      foreach ($a in [AppDomain]::CurrentDomain.GetAssemblies()) { if ($a.GetName().Name -eq $name) { return $a } }
+      $p = Join-Path $env:LTS_LHM_DIR ($name + '.dll')
+      if (Test-Path $p) { return [Reflection.Assembly]::UnsafeLoadFrom($p) }
+      return $null
+    }
+    [AppDomain]::CurrentDomain.add_AssemblyResolve($resolve)
+    [void][Reflection.Assembly]::UnsafeLoadFrom((Join-Path $lhm 'LibreHardwareMonitorLib.dll'))
     $computer = New-Object LibreHardwareMonitor.Hardware.Computer
     foreach ($p in 'IsCpuEnabled','IsGpuEnabled','IsMemoryEnabled','IsMotherboardEnabled','IsControllerEnabled','IsPsuEnabled','IsStorageEnabled','IsBatteryEnabled') {
       try { $computer.$p = $true } catch {}
     }
     $computer.Open()
-  } catch { $computer = $null }
+  } catch {
+    $lerr = [string]$_.Exception.GetBaseException().Message
+    if (-not $lerr) { $lerr = [string]$_ }
+    $computer = $null
+  }
+  $ErrorActionPreference = 'SilentlyContinue'
 }
 function Read-Lhm($hw, $out) {
   try { $hw.Update() } catch {}
   foreach ($sub in $hw.SubHardware) { Read-Lhm $sub $out }
   foreach ($s in $hw.Sensors) {
-    if ($s.Value -ne $null) { $out.Add(@{ h = [string]$hw.Name; n = [string]$s.Name; k = [string]$s.SensorType; v = [double]$s.Value }) }
+    if ($s.Value -ne $null) { $out.Add(@{ h = [string]$hw.Name; ht = [string]$hw.HardwareType; n = [string]$s.Name; k = [string]$s.SensorType; v = [double]$s.Value }) }
   }
 }
 while ($true) {
-  $ns = $null; $all = $null; $s = $null; $x = @(); $t = @()
+  $ns = $null; $all = $null; $s = $null; $x = @(); $t = @(); $cl = @(); $cpuT = $false
   if ($computer) {
     $list = New-Object System.Collections.ArrayList
     foreach ($hw in $computer.Hardware) { Read-Lhm $hw $list }
     $ns = 'lib'
-    $t = @($list | Where-Object { $_.k -eq 'Temperature' } | ForEach-Object { @{ n = $_.n; v = $_.v } })
+    $t = @($list | Where-Object { $_.k -eq 'Temperature' -and ($_.ht -eq 'Cpu' -or $_.ht -like 'Gpu*') } | ForEach-Object { @{ n = $_.n; v = $_.v } })
+    # per-core clocks ("P-Core #1", "E-Core #3", "CPU Core #2")
+    $cl = @($list | Where-Object { $_.k -eq 'Clock' -and $_.ht -eq 'Cpu' } | ForEach-Object { @{ n = $_.n; v = $_.v } })
     $x = @($list | Where-Object { 'Temperature','Fan','Power','Voltage','Current' -contains $_.k } | ForEach-Object { @{ n = "$($_.h): $($_.n)"; k = $_.k; v = $_.v } })
-  } else {
+    $cpuT = [bool]($list | Where-Object { $_.k -eq 'Temperature' -and $_.ht -eq 'Cpu' })
+  }
+  if (-not $cpuT) {
   # 2) the LibreHardwareMonitor / OpenHardwareMonitor app, if it runs, through WMI
   foreach ($n in 'root/LibreHardwareMonitor', 'root/OpenHardwareMonitor') {
     $all = Get-CimInstance -Namespace $n -ClassName Sensor
@@ -596,6 +767,7 @@ while ($true) {
   }
   if ($all) {
     $s = $all | Where-Object { $_.SensorType -eq 'Temperature' }
+    $cl = @($all | Where-Object { $_.SensorType -eq 'Clock' -and [string]$_.Parent -like '*cpu*' } | ForEach-Object { @{ n = [string]$_.Name; v = [double]$_.Value } })
     # every sensor with its hardware's name: "Nuvoton NCT6798D: VRM MOS", "DIMM #1: Temperature", "Corsair HX1000i: Total"
     $hw = @{}; Get-CimInstance -Namespace $ns -ClassName Hardware | ForEach-Object { $hw[[string]$_.Identifier] = $_.Name }
     $x = @($all | Where-Object { 'Temperature','Fan','Power','Voltage','Current' -contains $_.SensorType } | ForEach-Object {
@@ -603,7 +775,7 @@ while ($true) {
       @{ n = "$($h): $($_.Name)"; k = [string]$_.SensorType; v = [double]$_.Value } })
   }
   if ($s) { $t = @($s | ForEach-Object { @{ n = $_.Name; v = [double]$_.Value } }) }
-  $tz = @(); $tzh = @(); $perf = @(); $samples = $null
+  $tz = @(); $tzh = @(); $perf = @(); $gp = @(); $samples = $null
   foreach ($set in $sets) {
     try { $samples = (Get-Counter -Counter $set -ErrorAction Stop).CounterSamples; break } catch {}
   }
@@ -611,11 +783,67 @@ while ($true) {
     $tzh = @($samples | Where-Object { $_.Path -like '*\high precision temperature' } | ForEach-Object { [double]$_.CookedValue })
     $tz = @($samples | Where-Object { $_.Path -like '*thermal zone*' -and $_.Path -like '*\temperature' } | ForEach-Object { [double]$_.CookedValue })
     $perf = @($samples | Where-Object { $_.Path -like '*processor performance*' -and $_.InstanceName -notmatch '_total' } | ForEach-Object { @{ n = $_.InstanceName; v = [double]$_.CookedValue } })
+    $gp = @($samples | Where-Object { $_.Path -like '*gpu engine*' -and $_.CookedValue -gt 0.3 -and $_.InstanceName -match 'pid_(\d+)_.*engtype_(\w+)' } | ForEach-Object {
+      if ($_.InstanceName -match 'pid_(\d+)_.*engtype_(\w+)') { @{ p = [int]$matches[1]; e = $matches[2]; v = [double]$_.CookedValue } } })
   }
-  [pscustomobject]@{ src = $ns; t = $t; x = $x; tz = $tz; tzh = $tzh; perf = $perf; base = $base } | ConvertTo-Json -Compress -Depth 4
+  [pscustomobject]@{ src = $ns; t = $t; x = $x; cl = $cl; tz = $tz; tzh = $tzh; perf = $perf; gp = $gp; base = $base; lhm = [bool]$lhm; lerr = $lerr; pawn = $pawn } | ConvertTo-Json -Compress -Depth 4
   Start-Sleep -Milliseconds 500
 }
 "#;
+
+/// What is missing for LibreHardwareMonitor to deliver CPU / board / memory sensors, and whether it
+/// agrees with the suite about which cores are P and E cores
+fn lhm_notes(w: &WinSensors, admin: bool) -> Vec<String> {
+    let mut n = Vec::new();
+    if let Some((lp, le)) = w.lhm_pe {
+        let (sp, se) = match crate::topology::cached_core_kinds() {
+            Some(k) => (
+                k.iter().filter(|&&c| c == crate::topology::CoreKind::Performance).count(),
+                k.iter().filter(|&&c| c == crate::topology::CoreKind::Efficiency).count(),
+            ),
+            None => (0, 0),
+        };
+        let groups = crate::app_core::sibling_groups();
+        // LibreHardwareMonitor counts physical cores; with Hyper-Threading a P core has two threads
+        let phys = |want| {
+            groups.iter().filter(|g| crate::topology::cached_core_kinds().and_then(|k| k.get(g[0]).copied()) == Some(want)).count()
+        };
+        let (pp, pe) = (phys(crate::topology::CoreKind::Performance), phys(crate::topology::CoreKind::Efficiency));
+        if sp + se == 0 {
+            n.push(format!("LibreHardwareMonitor sees {} P-cores and {} E-cores, but the suite could not tell them apart on this PC", lp, le));
+        } else if (pp, pe) != (lp, le) {
+            n.push(format!("Core types differ: LibreHardwareMonitor sees {} P + {} E cores, the suite {} P + {} E", lp, le, pp, pe));
+        } else {
+            n.push(format!("Core types: {} P-cores and {} E-cores (the suite and LibreHardwareMonitor agree)", pp, pe));
+        }
+    }
+    let cpu_ok = !w.cores.is_empty();
+    if let Some(e) = &w.lhm_error {
+        n.push(format!("LibreHardwareMonitor library could not be loaded: {}", e));
+    } else if !w.lhm_present && !cpu_ok {
+        n.push("Per-core CPU, board, VRM, fan, memory and PSU sensors: press Download LibreHardwareMonitor on the Dashboard (or run the LibreHardwareMonitor app)".into());
+    }
+    if w.lhm_present && w.lhm_error.is_none() && !cpu_ok {
+        if w.pawnio.is_none() {
+            n.push("The PawnIO driver is not installed: LibreHardwareMonitor 0.9.5 and later read CPU, motherboard (VRM, fans, voltages) and memory sensors through it. Press Install PawnIO on the Dashboard, or start LibreHardwareMonitor.exe once and accept its PawnIO prompt.".into());
+        } else if !admin {
+            n.push("LibreHardwareMonitor needs administrator rights for CPU, board and memory sensors: restart the app as administrator".into());
+        } else {
+            n.push(format!(
+                "LibreHardwareMonitor is loaded (PawnIO {}) but reports no CPU temperature for this CPU; a newer LibreHardwareMonitor may add it",
+                w.pawnio.as_deref().unwrap_or("?")
+            ));
+        }
+    }
+    n
+}
+
+/// Physical cores of this PC (detected once: it briefly pins a thread to every logical CPU)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn core_map() -> &'static crate::topology::CoreMap {
+    static MAP: std::sync::OnceLock<crate::topology::CoreMap> = std::sync::OnceLock::new();
+    MAP.get_or_init(crate::topology::CoreMap::detect)
+}
 
 /// What the PowerShell reader thread has seen so far
 #[derive(Default)]
@@ -645,18 +873,28 @@ const WIN_STALE: Duration = Duration::from_secs(6);
 /// The helper is restarted after this long without any output, or as soon as it exits
 const WIN_HUNG: Duration = Duration::from_secs(12);
 
+/// Bumped to make every Windows sensor helper start over (new LibreHardwareMonitor or driver)
+static WIN_HELPER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Restart the Windows sensor helpers so they load LibreHardwareMonitor / PawnIO again
+pub fn restart_windows_helpers() {
+    WIN_HELPER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Long-running PowerShell child that prints one JSON line of sensor data every second or two
 struct WinStream {
     shared: Arc<Mutex<WinShared>>,
     child: Option<std::process::Child>,
     spawned: Instant,
+    generation: u64,
 }
 
 impl WinStream {
     fn start() -> Self {
         let shared = Arc::new(Mutex::new(WinShared::default()));
+        let generation = WIN_HELPER_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
         let child = Self::spawn(&shared);
-        Self { shared, child, spawned: Instant::now() }
+        Self { shared, child, spawned: Instant::now(), generation }
     }
 
     #[cfg(target_os = "windows")]
@@ -674,9 +912,10 @@ impl WinStream {
         if let Some(stdout) = child.stdout.take() {
             let shared = shared.clone();
             std::thread::spawn(move || {
+                let map = core_map();
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     let now = Instant::now();
-                    let parsed = parse_win_sensor_line(&line);
+                    let parsed = parse_win_sensor_line_with(&line, map);
                     if let Ok(mut sh) = shared.lock() {
                         sh.line_at = Some(now);
                         if let Some(w) = parsed {
@@ -727,7 +966,7 @@ impl WinStream {
 
     /// Has the helper ever delivered a usable reading?
     fn ever_delivered(&self) -> bool {
-        self.shared.lock().map_or(false, |s| s.reading_at.is_some())
+        self.shared.lock().is_ok_and(|s| s.reading_at.is_some())
     }
 
     /// Seconds since the helper was (re)started
@@ -743,13 +982,22 @@ impl WinStream {
         };
         let last_output = self.shared.lock().ok().and_then(|s| s.line_at).unwrap_or(self.spawned);
         let silent = last_output.elapsed() > WIN_HUNG;
-        if (exited || silent) && self.spawned.elapsed() > Duration::from_secs(5) {
+        let generation = WIN_HELPER_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        let asked = generation != self.generation;
+        if asked || ((exited || silent) && self.spawned.elapsed() > Duration::from_secs(5)) {
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();
                 let _ = c.wait();
             }
+            if asked {
+                // readings from the old helper describe the old setup
+                if let Ok(mut sh) = self.shared.lock() {
+                    *sh = WinShared::default();
+                }
+            }
             self.child = Self::spawn(&self.shared);
             self.spawned = Instant::now();
+            self.generation = generation;
         }
     }
 }
@@ -828,7 +1076,7 @@ impl FlatlineWatch {
             return;
         };
         self.samples.push_back((t_ms, temp, busiest_core_pct));
-        while self.samples.front().map_or(false, |f| t_ms.saturating_sub(f.0) > Self::WINDOW_MS) {
+        while self.samples.front().is_some_and(|f| t_ms.saturating_sub(f.0) > Self::WINDOW_MS) {
             self.samples.pop_front();
         }
     }
@@ -990,6 +1238,32 @@ impl Collector {
         }
     }
 
+    /// The busiest other programs right now; processes of the same name are added up (a browser is
+    /// dozens of processes). CPU is % of the whole CPU; GPU comes from `gpu_by_pid` (Windows).
+    fn sample_programs(&mut self, helper: Option<u32>, gpu_by_pid: &[(u32, f32)]) -> Vec<ProcUsage> {
+        self.sys.refresh_processes();
+        let ncpu = self.sys.cpus().len().max(1) as f32;
+        let me = std::process::id();
+        let mut by: std::collections::HashMap<String, (f32, f32)> = Default::default();
+        for (pid, p) in self.sys.processes() {
+            let pid = pid.as_u32();
+            if pid == me || Some(pid) == helper || p.parent().map(|pp| pp.as_u32()) == Some(me) {
+                continue;
+            }
+            let cpu = p.cpu_usage() / ncpu;
+            let gpu = gpu_by_pid.iter().find(|g| g.0 == pid).map_or(0.0, |g| g.1);
+            if cpu >= 0.2 || gpu >= 0.2 {
+                let e = by.entry(p.name().to_string()).or_default();
+                e.0 += cpu;
+                e.1 = (e.1 + gpu).min(100.0);
+            }
+        }
+        let mut v: Vec<ProcUsage> = by.into_iter().map(|(name, (c, g))| ProcUsage { name, cpu_pct: c.min(100.0), gpu_pct: g }).collect();
+        v.sort_by(|a, b| (b.cpu_pct + b.gpu_pct).total_cmp(&(a.cpu_pct + a.gpu_pct)));
+        v.truncate(MAX_PROCS);
+        v
+    }
+
     /// Keep the Windows sensor helper process on the app's core as well
     fn follow_app_core(&mut self) {
         // re-applied every sample: cheap, and covers a helper that was restarted meanwhile
@@ -1046,11 +1320,9 @@ impl Collector {
                         snap.core_temps_c = w.cores.clone();
                         cpu_source = w.source.clone();
                     }
+                    notes.extend(lhm_notes(&w, crate::lhm::is_admin()));
                     if w.cores.is_empty() {
-                        notes.push(format!(
-                            "CPU temperature: {} (package only). Per-core temperatures need LibreHardwareMonitor or OpenHardwareMonitor running.",
-                            w.source
-                        ));
+                        notes.push(format!("CPU temperature: {} (package only, no per-core values)", w.source));
                     } else {
                         notes.push(format!("CPU temperature: {} ({} per-core sensors)", w.source, w.cores.len()));
                     }
@@ -1071,9 +1343,13 @@ impl Collector {
             }
         }
         if snap.cpu_package_c.is_none() && snap.core_temps_c.is_empty() {
-            let starting = self.win.as_ref().map_or(false, |w| !w.ever_delivered() && w.age_s() < 10.0);
+            let starting = self.win.as_ref().is_some_and(|w| !w.ever_delivered() && w.age_s() < 10.0);
             if !starting && !notes.iter().any(|n| n.contains("stopped updating")) {
-                notes.push("CPU temperature: no sensor available (Windows: run LibreHardwareMonitor for per-core values)".into());
+                notes.push(if cfg!(target_os = "windows") {
+                    "CPU temperature: no sensor available (press Download LibreHardwareMonitor and Install PawnIO on the Dashboard, and run the app as administrator)".into()
+                } else {
+                    "CPU temperature: no sensor available (no coretemp / k10temp / zenpower hwmon driver loaded)".into()
+                });
             }
         }
 
@@ -1084,7 +1360,7 @@ impl Collector {
         if let Some(secs) = self.flat.flat_for_s() {
             notes.push(if cpu_source == ACPI_SOURCE {
                 format!(
-                    "CPU temperature has not changed for {} s while the CPU was busy: this PC's ACPI thermal zone reports a fixed value, not the real CPU temperature. Run LibreHardwareMonitor (or OpenHardwareMonitor) for live readings.",
+                    "CPU temperature has not changed for {} s while the CPU was busy: this PC's ACPI thermal zone reports a fixed value, not the real CPU temperature. For live readings press Download LibreHardwareMonitor and Install PawnIO on the Dashboard and run the app as administrator.",
                     secs
                 )
             } else {
@@ -1098,11 +1374,26 @@ impl Collector {
         // Everything else the machine exposes
         snap.sensors = read_hwmon_all(&self.hwmon_root);
         snap.sensors.extend(self.rapl.read(&self.powercap_root));
-        if let Some(w) = self.win.as_ref().and_then(|w| w.fresh()) {
-            snap.sensors.extend(w.extra);
+        let win_now = self.win.as_ref().and_then(|w| w.fresh());
+        if let Some(w) = &win_now {
+            snap.sensors.extend(w.extra.clone());
         }
         snap.sensors.truncate(MAX_EXTRA_SENSORS);
-        if !snap.sensors.is_empty() {
+
+        // Other programs: which ones used the CPU / GPU while the tests ran
+        let helper = self.win.as_ref().and_then(|w| w.child.as_ref().map(|c| c.id()));
+        let gpu_by_pid = win_now.as_ref().map(|w| w.gpu_procs.clone()).unwrap_or_default();
+        snap.procs = self.sample_programs(helper, &gpu_by_pid);
+        snap.procs_sampled = true;
+        for p in snap.procs.iter().take(5) {
+            if p.cpu_pct >= 1.0 {
+                snap.sensors.push(SensorReading { name: format!("Program {}: CPU", p.name), kind: SensorKind::Load, value: p.cpu_pct });
+            }
+            if p.gpu_pct >= 1.0 {
+                snap.sensors.push(SensorReading { name: format!("Program {}: GPU", p.name), kind: SensorKind::Load, value: p.gpu_pct });
+            }
+        }
+        if snap.sensors.iter().any(|r| r.kind != SensorKind::Load) {
             let count = |k: SensorKind| snap.sensors.iter().filter(|r| r.kind == k).count();
             notes.push(format!(
                 "Other sensors: {} temperatures, {} fans, {} power, {} voltages, {} currents",
@@ -1113,7 +1404,7 @@ impl Collector {
                 count(SensorKind::Current)
             ));
         } else if cfg!(target_os = "windows") {
-            notes.push("Board, memory, VRM, fan and power sensors: run LibreHardwareMonitor to have them logged".into());
+            notes.push("Board, memory, VRM, fan and power sensors: none yet (see the LibreHardwareMonitor notes above)".into());
         }
 
         // GPU
@@ -1160,6 +1451,75 @@ mod tests {
     fn write(dir: &Path, file: &str, content: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(file), content).unwrap();
+    }
+
+    #[test]
+    fn other_programs_are_averaged_per_test() {
+        let prog = |n: &str, c: f32, g: f32| ProcUsage { name: n.into(), cpu_pct: c, gpu_pct: g };
+        let a = Snapshot { t_ms: 0, procs: vec![prog("chrome.exe", 20.0, 0.0), prog("obs64.exe", 2.0, 30.0)], procs_sampled: true, ..Default::default() };
+        let b = Snapshot { t_ms: 500, procs: vec![prog("chrome.exe", 10.0, 0.0)], procs_sampled: true, ..Default::default() };
+        let t = summarize(&[a, b]);
+        assert_eq!(t.others_cpu_avg_pct, Some(16.0), "15 % chrome + 1 % obs");
+        assert_eq!(t.others_gpu_avg_pct, Some(15.0));
+        assert_eq!(t.others_top[0], ("obs64.exe".to_string(), 1.0, 15.0), "busiest (CPU + GPU) first");
+        assert_eq!(t.others_text(), "obs64.exe 1 % CPU / 15 % GPU, chrome.exe 15 % CPU");
+        // not sampled at all: unknown, not zero
+        assert_eq!(summarize(&[Snapshot::default()]).others_cpu_avg_pct, None);
+        let quiet = summarize(&[Snapshot { procs_sampled: true, ..Default::default() }]);
+        assert_eq!((quiet.others_cpu_avg_pct, quiet.others_gpu_avg_pct), (Some(0.0), None));
+    }
+
+    #[test]
+    fn gpu_engine_counters_become_per_process_use() {
+        // pid 42: 3D engines 30 + 25 = 55 %, copy 10 %  ->  55 %; pid 7: video decode 12 %
+        let line = r#"{"src":null,"t":[],"tz":[300.0],"gp":[{"p":42,"e":"3D","v":30.0},{"p":42,"e":"3D","v":25.0},{"p":42,"e":"Copy","v":10.0},{"p":7,"e":"VideoDecode","v":12.0}]}"#;
+        let w = parse_win_sensor_line(line).unwrap();
+        assert_eq!(w.gpu_procs, vec![(7, 12.0), (42, 55.0)]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_program_is_seen() {
+        let mut c = Collector::new();
+        // `sh` is our child and left out (the app's own helpers are); `yes` under it is another program
+        let mut child = std::process::Command::new("sh").args(["-c", "exec 2>/dev/null; yes > /dev/null & sleep 3; kill $!"]).spawn().unwrap();
+        // a process's share shows from its second sample on: let it start first
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // like `collect`: the CPU totals are refreshed each sample (process shares are relative to them)
+        c.sys.refresh_cpu();
+        c.sample_programs(None, &[]);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        c.sys.refresh_cpu();
+        let v = c.sample_programs(None, &[]);
+        let _ = child.wait();
+        let yes = v.iter().find(|p| p.name == "yes").unwrap_or_else(|| panic!("yes not seen in {:?}", v));
+        assert!(yes.cpu_pct > 1.0, "{:?}", yes);
+        assert!(v.iter().all(|p| p.name != "sh"), "our own child is left out");
+        assert!(v.len() <= MAX_PROCS);
+    }
+
+    #[test]
+    fn hybrid_core_temps_clocks_and_lhm_status_are_read() {
+        use crate::topology::{CoreKind::*, CoreMap};
+        let mut kinds = vec![Efficiency; 24];
+        for p in [0, 1, 10, 11, 12, 13, 22, 23] {
+            kinds[p] = Performance;
+        }
+        let map = CoreMap::from_parts((0..24).map(|c| vec![c]).collect(), Some(&kinds));
+        let line = r#"{"src":"lib","t":[{"n":"CPU Package","v":61.0},{"n":"P-Core #3","v":70.0},{"n":"E-Core #1","v":55.0},{"n":"P-Core #3 Distance to TjMax","v":30.0}],
+            "cl":[{"n":"P-Core #1","v":5500.0},{"n":"E-Core #16","v":4600.0}],"x":[],"lhm":true,"lerr":"","pawn":"2.0.1.0"}"#;
+        let w = parse_win_sensor_line_with(&line.replace('\n', ""), &map).unwrap();
+        assert_eq!(w.cores, vec![(2, 55.0), (10, 70.0)], "P-Core #3 is CPU 10, E-Core #1 is CPU 2");
+        assert_eq!(w.package_c, Some(61.0));
+        assert_eq!((w.core_freq_mhz[0], w.core_freq_mhz[21]), (5500.0, 4600.0));
+        assert_eq!((w.lhm_present, w.lhm_error.as_deref(), w.pawnio.as_deref()), (true, None, Some("2.0.1.0")));
+        assert_eq!(w.lhm_pe, Some((1, 1)));
+        // a failed load is reported even without any temperature
+        let e = parse_win_sensor_line(r#"{"src":null,"t":[],"tz":[],"lhm":true,"lerr":"could not load","pawn":""}"#).unwrap();
+        assert_eq!((e.lhm_error.as_deref(), e.pawnio.as_deref()), (Some("could not load"), None));
+        assert!(lhm_notes(&e, true)[0].contains("could not load"));
+        let no_pawn = WinSensors { lhm_present: true, ..Default::default() };
+        assert!(lhm_notes(&no_pawn, true).iter().any(|n| n.contains("PawnIO")));
     }
 
     #[test]
@@ -1457,6 +1817,7 @@ mod tests {
             ram_total_mb: 64000.0,
             gpu: gpu_t.map(|t| GpuSensors { name: "g".into(), temp_c: Some(t), vram_used_mb: vram, vram_total_mb: Some(16000.0), ..Default::default() }),
             sensors: Vec::new(),
+            ..Default::default()
         }
     }
 

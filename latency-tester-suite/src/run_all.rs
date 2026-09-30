@@ -92,6 +92,11 @@ pub struct RunAllPlan {
     pub gpu: bool,
     /// Every GPU size keeps dispatching for at least this long so load, clocks and power register
     pub gpu_min_sample_ms: u64,
+
+    /// 3D graphics benchmark at 720p / 1080p / 1440p / 4K
+    pub gpu3d: bool,
+    /// Rendering time per resolution
+    pub gpu3d_duration_s: f64,
 }
 
 impl Default for RunAllPlan {
@@ -121,6 +126,8 @@ impl Default for RunAllPlan {
             cpu_core_warmup_s: 1,
             gpu: true,
             gpu_min_sample_ms: 2000,
+            gpu3d: true,
+            gpu3d_duration_s: 10.0,
         }
     }
 }
@@ -145,12 +152,13 @@ impl RunAllPlan {
             cpu_core_runs: 1,
             cpu_core_warmup_s: 0,
             gpu_min_sample_ms: 400,
+            gpu3d_duration_s: 2.0,
             ..Self::default()
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        !(self.interactive_input || self.auto_input || self.memory || self.cpu || self.gpu)
+        !(self.interactive_input || self.auto_input || self.memory || self.cpu || self.gpu || self.gpu3d)
     }
 }
 
@@ -181,6 +189,7 @@ pub enum StepSpec {
     Memory { label: String, config: MemoryBenchmarkConfig },
     Cpu { label: String, config: CpuBenchmarkConfig },
     Gpu { config: GpuBenchmarkConfig },
+    Gpu3d { config: crate::bench3d::Bench3dConfig },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -211,6 +220,7 @@ impl StepSpec {
                 format!("CPU: {} ({} tests)", label, n)
             }
             StepSpec::Gpu { config } => format!("GPU (Vulkan): {} sizes", config.workload_sizes.len()),
+            StepSpec::Gpu3d { config } => format!("3D graphics: {} resolutions", config.resolutions.len()),
         }
     }
 
@@ -236,6 +246,11 @@ impl StepSpec {
                 let n = config.workload_sizes.len() as f64;
                 let per = config.min_sample_ms as f64 / 1000.0 + 1.0;
                 Estimate { expected_s: n * per, worst_s: n * (per * 1.5 + 2.0) }
+            }
+            StepSpec::Gpu3d { config } => {
+                let n = config.resolutions.len() as f64;
+                let per = config.warmup_s + config.duration_s + config.latency_s + 1.0;
+                Estimate { expected_s: n * per + 2.0, worst_s: n * (per * 1.2 + 3.0) + 10.0 }
             }
         }
     }
@@ -336,6 +351,15 @@ impl RunAllPlan {
         }
     }
 
+    pub fn gpu3d_config(&self) -> crate::bench3d::Bench3dConfig {
+        crate::bench3d::Bench3dConfig {
+            duration_s: self.gpu3d_duration_s,
+            warmup_s: (self.gpu3d_duration_s / 5.0).clamp(0.5, 2.0),
+            latency_s: (self.gpu3d_duration_s / 3.0).clamp(0.5, 3.0),
+            ..Default::default()
+        }
+    }
+
     /// The ordered steps. The steps that need the user come first so the rest can run unattended.
     pub fn job(&self, host: &HostInfo) -> RunAllJob {
         let mut job = RunAllJob::default();
@@ -377,6 +401,9 @@ impl RunAllPlan {
         if self.gpu {
             job.steps.push(StepSpec::Gpu { config: self.gpu_config() });
         }
+        if self.gpu3d {
+            job.steps.push(StepSpec::Gpu3d { config: self.gpu3d_config() });
+        }
         job
     }
 }
@@ -408,6 +435,8 @@ pub struct RunAllHandles {
     pub cpu_partial: SharedResults<CpuBenchmarkResult>,
     pub gpu_progress: SharedProgress,
     pub gpu_partial: SharedResults<GpuBenchmarkResult>,
+    pub gpu3d_progress: SharedProgress,
+    pub gpu3d_partial: SharedResults<crate::bench3d::Bench3dResult>,
     pub input_progress: SharedProgress,
 }
 
@@ -446,6 +475,7 @@ pub struct RunAllOutput {
     pub memory_configs: Vec<MemoryBenchmarkConfig>,
     pub cpu_configs: Vec<CpuBenchmarkConfig>,
     pub gpu_config: Option<GpuBenchmarkConfig>,
+    pub gpu3d_summary: Option<crate::bench3d::Bench3dSummary>,
     /// Steps that failed (the rest still ran)
     pub errors: Vec<String>,
     pub cancelled: bool,
@@ -535,6 +565,12 @@ pub fn execute(
                         out.gpu_summary = Some(summary);
                     })
             }
+            StepSpec::Gpu3d { config } => crate::bench3d::Bench3d::new(config.clone())
+                .with_cancel(cancel_flag.clone())
+                .with_progress(handles.gpu3d_progress.clone(), handles.gpu3d_partial.clone())
+                .with_sensors(sampler.clone())
+                .run()
+                .map(|summary| out.gpu3d_summary = Some(summary)),
         };
 
         // Whatever happened, this step's progress panel must stop counting
@@ -546,6 +582,7 @@ pub fn execute(
             }
             StepSpec::Cpu { .. } => crate::progress::finish(&handles.cpu_progress),
             StepSpec::Gpu { .. } => crate::progress::finish(&handles.gpu_progress),
+            StepSpec::Gpu3d { .. } => crate::progress::finish(&handles.gpu3d_progress),
             StepSpec::InputSuite { .. } => crate::progress::finish(&handles.input_progress),
             StepSpec::Interactive(_) => {}
         }
@@ -620,7 +657,9 @@ mod tests {
         assert!(matches!(job.steps[0], StepSpec::Interactive(InputKind::MouseClick)));
         assert!(matches!(job.steps[1], StepSpec::Interactive(InputKind::KeyPress)));
         assert!(matches!(job.steps[2], StepSpec::InputSuite { .. }));
-        assert_eq!(job.steps.len(), 2 + 1 + 1 + 2 + 1, "{:?}", labels);
+        assert_eq!(job.steps.len(), 2 + 1 + 1 + 2 + 1 + 1, "{:?}", labels);
+        let StepSpec::Gpu3d { config } = &job.steps[7] else { panic!("3D last: {:?}", labels) };
+        assert_eq!(config.resolutions, vec![(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)], "every 16:9 resolution");
 
         let StepSpec::Memory { config, .. } = &job.steps[3] else { panic!("memory expected: {:?}", labels) };
         assert_eq!(config.sizes.len(), 18, "every buffer size");
@@ -720,7 +759,7 @@ mod tests {
 
     #[test]
     fn empty_plan_is_detected() {
-        let plan = RunAllPlan { interactive_input: false, auto_input: false, memory: false, cpu: false, gpu: false, ..RunAllPlan::default() };
+        let plan = RunAllPlan { interactive_input: false, auto_input: false, memory: false, cpu: false, gpu: false, gpu3d: false, ..RunAllPlan::default() };
         assert!(plan.is_empty() && plan.job(&host(4)).steps.is_empty());
         assert!(!RunAllPlan::default().is_empty());
     }
@@ -732,6 +771,8 @@ mod tests {
             cpu_partial: progress::new_results(),
             gpu_progress: progress::new(),
             gpu_partial: progress::new_results(),
+            gpu3d_progress: progress::new(),
+            gpu3d_partial: progress::new_results(),
             input_progress: progress::new(),
         }
     }

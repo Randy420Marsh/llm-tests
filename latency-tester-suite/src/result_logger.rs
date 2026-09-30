@@ -292,7 +292,7 @@ impl ResultLogger {
     pub fn result_path(&self, result: &VerifiedResult) -> std::path::PathBuf {
         // filename = timestamp + test type + start of the nonce
         let filename = format!("{}_{}_{}.json",
-            result.header.timestamp.replace(':', "-").replace('.', "-"),
+            result.header.timestamp.replace([':', '.'], "-"),
             result.payload.test_type,
             &result.header.nonce[..8]
         );
@@ -489,7 +489,7 @@ impl ResultLogger {
         let mut writer = csv::Writer::from_writer(&mut file);
         
         // Write header
-        writer.write_record(&[
+        writer.write_record([
             "timestamp", "test_type", "app_version", "app_hash", "valid",
             "cpu_name", "cpu_cores", "cpu_threads", "memory_total_gb",
             "gpu_name", "os_name", "virtualization_enabled",
@@ -499,7 +499,7 @@ impl ResultLogger {
             let verification = self.verify_result(result);
             let sys = SysBrief::of(&result.payload.system_info);
             
-            writer.write_record(&[
+            writer.write_record([
                 &result.header.timestamp,
                 &result.payload.test_type,
                 &result.header.app_version,
@@ -775,7 +775,7 @@ mod tests {
         let file = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().path())
-            .find(|p| p.extension().map_or(false, |e| e == "json"))
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
             .expect("result file written");
         let verdict = logger.verify_file(&file).unwrap();
         assert!(verdict.valid, "{}", verdict.message);
@@ -878,7 +878,7 @@ mod tests {
         logger.log_result("cpu", &info, &serde_json::json!({}), &serde_json::json!({}), HashMap::new()).unwrap();
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let path = entry.unwrap().path();
-            if path.extension().map_or(false, |e| e == "json") || path.file_name().unwrap() == "signing_key.bin" {
+            if path.extension().is_some_and(|e| e == "json") || path.file_name().unwrap() == "signing_key.bin" {
                 assert!(std::fs::metadata(&path).unwrap().permissions().readonly(), "{:?}", path);
                 assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err() || is_root());
             }

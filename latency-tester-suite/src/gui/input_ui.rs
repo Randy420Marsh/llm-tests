@@ -16,6 +16,10 @@ pub(super) enum SubTab {
     Mouse,
     Keyboard,
     Display,
+    /// Move the mouse: polling rate and jitter from its raw reports
+    Polling,
+    /// Click red circles as fast as possible
+    Aim,
 }
 
 /// A finished run plus the calibration that was active when it finished
@@ -43,6 +47,9 @@ pub(super) struct InputTestUi {
     pub display: DisplayTest,
     clock: HighResTimer,
     timer_info: Option<crate::input_latency::TimerResolutionInfo>,
+    /// Precise pattern window: flash or ghosting settings, display and lead-in
+    pub pattern: crate::pattern_window::PatternArgs,
+    displays: Vec<crate::displays::Display>,
 }
 
 impl InputTestUi {
@@ -61,6 +68,8 @@ impl InputTestUi {
             display: DisplayTest::new(DisplayTestConfig::default()),
             clock: HighResTimer::new(),
             timer_info: None,
+            pattern: crate::pattern_window::PatternArgs::default(),
+            displays: crate::displays::list(),
         }
     }
 
@@ -85,7 +94,7 @@ impl InputTestUi {
         match self.sub {
             SubTab::Mouse => Some(InputKind::MouseClick),
             SubTab::Keyboard => Some(InputKind::KeyPress),
-            SubTab::Display => None,
+            SubTab::Display | SubTab::Polling | SubTab::Aim => None,
         }
     }
 }
@@ -101,13 +110,12 @@ fn bg_color(bg: Bg) -> Color32 {
 }
 
 /// Pure colours for the sensor bar: black and white must be exactly 0 / 255
-fn bar_color(bar: Bar, bg: Color32) -> Color32 {
+fn bar_color(bar: Bar) -> Color32 {
     match bar {
         Bar::Dim => Color32::from_rgb(25, 25, 25),
         Bar::Black => Color32::BLACK,
         Bar::White => Color32::WHITE,
         Bar::Red => Color32::from_rgb(255, 0, 0),
-        Bar::Hidden => bg,
     }
 }
 
@@ -118,11 +126,13 @@ impl LatencyTesterApp {
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.heading("Input Latency");
-            ui.horizontal(|ui| {
-                let active = self.input_test.engine.is_active() || self.input_test.display.is_running();
+            ui.horizontal_wrapped(|ui| {
+                let active = self.input_test.engine.is_active() || self.input_test.display.is_running() || self.polling.is_active() || self.aim.is_active();
                 ui.add_enabled_ui(!active, |ui| {
                     ui.selectable_value(&mut self.input_test.sub, SubTab::Mouse, "🖱 Mouse click test");
                     ui.selectable_value(&mut self.input_test.sub, SubTab::Keyboard, "⌨ Keyboard press test");
+                    ui.selectable_value(&mut self.input_test.sub, SubTab::Polling, "🖱 Mouse polling (move the mouse)");
+                    ui.selectable_value(&mut self.input_test.sub, SubTab::Aim, "🎯 Reflex game");
                     ui.selectable_value(&mut self.input_test.sub, SubTab::Display, "🖥 Display / rig patterns");
                 });
                 ui.label(RichText::new(format!("drawn with {}", self.renderer)).weak().small());
@@ -135,6 +145,8 @@ impl LatencyTesterApp {
             match self.input_test.sub {
                 SubTab::Mouse | SubTab::Keyboard => self.trial_panel(ui, ctx),
                 SubTab::Display => self.display_panel(ui, ctx),
+                SubTab::Polling => self.polling_panel(ui, ctx),
+                SubTab::Aim => self.aim_panel(ui, ctx),
             }
 
             ui.separator();
@@ -232,7 +244,7 @@ impl LatencyTesterApp {
         let now = self.input_test.now_ms();
         let pressed = match kind {
             InputKind::MouseClick => ui.input(|i| {
-                i.pointer.primary_pressed() && i.pointer.interact_pos().map_or(false, |p| rect.contains(p))
+                i.pointer.primary_pressed() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p))
             }),
             InputKind::KeyPress => ui.input(|i| {
                 i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, repeat: false, .. }))
@@ -252,7 +264,7 @@ impl LatencyTesterApp {
         painter.rect_filled(rect, 0.0, bg);
         let bar_w = rect.width() * self.input_test.cfg.bar_fraction;
         let bar_rect = egui::Rect::from_min_max(egui::pos2(rect.right() - bar_w, rect.top()), rect.right_bottom());
-        painter.rect_filled(bar_rect, 0.0, bar_color(visual.bar, bg));
+        painter.rect_filled(bar_rect, 0.0, bar_color(visual.bar));
         let text_center = egui::pos2(rect.left() + (rect.width() - bar_w) / 2.0, rect.center().y);
         painter.text(text_center, egui::Align2::CENTER_CENTER, &visual.label, egui::FontId::proportional(30.0), Color32::WHITE);
     }
@@ -304,7 +316,7 @@ impl LatencyTesterApp {
                         let cal = &self.input_test.cal;
                         let c = cal.correct(kind, true, s.mean_ms);
                         ui.label(format!(
-                            "Robot run: raw {:.2} ms → minus robot delay ({:.2} ms) = {:.2} ms → minus display delay ({:.2} ms) = {:.2} ms",
+                            "Robot run: raw {:.2} ms, minus robot delay ({:.2} ms) = {:.2} ms, minus display delay ({:.2} ms) = {:.2} ms",
                             c.raw_ms, cal.robot_ms(kind), c.minus_robot_ms, cal.display_ms, c.minus_robot_and_display_ms
                         ));
                         ui.label(RichText::new("Only the subtractions enabled under Rig calibration are applied to the graphs and log.").weak().small());
@@ -382,24 +394,69 @@ impl LatencyTesterApp {
                 .weak()
                 .small(),
             );
+            use crate::pattern_window::Motion;
+            let pat = &mut self.input_test.pattern;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Show:");
+                ui.radio_value(&mut pat.motion, None, "white / black flashes");
+                if ui.radio(pat.motion.is_some(), "ghosting test (moving lines / square)").clicked() && pat.motion.is_none() {
+                    pat.motion = Some(Motion::Both);
+                }
+            });
+            if let Some(m) = pat.motion.as_mut() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(m, Motion::Vertical, "vertical line, left to right");
+                    ui.radio_value(m, Motion::Horizontal, "horizontal line, top to bottom");
+                    ui.radio_value(m, Motion::Both, "both (they cross exactly at the centre)");
+                    ui.radio_value(m, Motion::Square, "square");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(if *m == Motion::Square { "Square size:" } else { "Line width:" });
+                    ui.add(egui::DragValue::new(&mut pat.width).range(1.0..=600.0).suffix(" px"));
+                    ui.label("One sweep takes:");
+                    ui.add(egui::DragValue::new(&mut pat.sweep_ms).range(100.0..=60_000.0).speed(10.0).suffix(" ms"));
+                    ui.label(RichText::new("(whole frames; a fast sweep shows more ghosting)").weak().small());
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Display:");
+                let current = match pat.display {
+                    Some(i) => self.input_test.displays.get(i).map(|d| d.label(i)).unwrap_or_else(|| format!("display {}", i + 1)),
+                    None => "where Windows puts it".to_string(),
+                };
+                egui::ComboBox::from_id_salt("pattern_display").selected_text(current).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut pat.display, None, "where Windows puts it");
+                    for (i, d) in self.input_test.displays.iter().enumerate() {
+                        ui.selectable_value(&mut pat.display, Some(i), d.label(i));
+                    }
+                });
+                if ui.small_button("⟳").on_hover_text("Look for displays again").clicked() {
+                    self.input_test.displays = crate::displays::list();
+                }
+                ui.label("Start after:");
+                let mut secs = pat.delay_ms / 1000.0;
+                if ui.add(egui::DragValue::new(&mut secs).range(0.0..=600.0).speed(0.1).suffix(" s")).changed() {
+                    pat.delay_ms = secs * 1000.0;
+                }
+            });
             ui.horizontal(|ui| {
                 let d = self.input_test.display.cfg.clone();
                 if ui.button(RichText::new("▶ Open precise pattern window").strong()).clicked() {
-                    let args = [
-                        "--pattern".to_string(),
-                        "--on-ms".into(),
-                        d.on_ms.to_string(),
-                        "--off-ms".into(),
-                        d.off_ms.to_string(),
-                        "--cycles".into(),
-                        d.cycles.to_string(),
-                    ];
+                    let mut p = self.input_test.pattern.clone();
+                    (p.on_ms, p.off_ms, p.cycles) = (d.on_ms, d.off_ms, d.cycles);
+                    let args = crate::pattern_window::command_args(&p);
+                    let what = match p.motion {
+                        Some(m) => format!("ghosting test ({}, {} px, sweep {} ms)", m.arg(), p.width, p.sweep_ms),
+                        None => format!("white {} ms, black {} ms, {} cycles", d.on_ms, d.off_ms, d.cycles),
+                    };
                     match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(&args).spawn()) {
-                        Ok(_) => self.log(&format!("Opened the precise pattern window: white {} ms, black {} ms, {} cycles", d.on_ms, d.off_ms, d.cycles)),
+                        Ok(_) => self.log(&format!("Opened the precise pattern window: {} · starts after {:.1} s", what, p.delay_ms / 1000.0)),
                         Err(e) => self.log(&format!("Could not open the pattern window: {}", e)),
                     }
                 }
-                ui.label(RichText::new("uses the White / Black / Cycles values below").weak().small());
+                if self.input_test.pattern.motion.is_none() {
+                    ui.label(RichText::new("uses the White / Black / Cycles values below").weak().small());
+                }
             });
         });
         ui.horizontal(|ui| {
@@ -459,7 +516,7 @@ impl LatencyTesterApp {
                 ui.label(format!("black shown for: min {:.2} · avg {:.2} · max {:.2} ms  ({} phases)", mn, av, mx, t.off_shown_ms.len()));
             }
             if let Some((mn, av, mx)) = stats(&t.trigger_to_frame_ms) {
-                ui.label(format!("trigger key → white frame (software part only): min {:.2} · avg {:.2} · max {:.2} ms  ({} triggers)", mn, av, mx, t.triggers));
+                ui.label(format!("trigger key to white frame (software part only): min {:.2} · avg {:.2} · max {:.2} ms  ({} triggers)", mn, av, mx, t.triggers));
             }
             ui.label(RichText::new("The rig (Arduino serial monitor) reports what the photodiode saw: rise/fall time, on-time, period and, in F13 mode, trigger-to-light latency.").weak().small());
         });
@@ -484,7 +541,7 @@ impl LatencyTesterApp {
                     ui.add(egui::DragValue::new(&mut cal.mouse_robot_ms).range(0.0..=100.0).speed(0.01).suffix(" ms"));
                     ui.label("Keyboard robot (solenoid, to actuation):");
                     ui.add(egui::DragValue::new(&mut cal.keyboard_robot_ms).range(0.0..=100.0).speed(0.05).suffix(" ms"));
-                    ui.label("Display (frame → light):");
+                    ui.label("Display (frame to light):");
                     ui.add(egui::DragValue::new(&mut cal.display_ms).range(0.0..=200.0).speed(0.05).suffix(" ms"));
                 });
                 ui.horizontal_wrapped(|ui| {
