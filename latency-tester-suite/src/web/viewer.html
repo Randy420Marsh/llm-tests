@@ -48,6 +48,10 @@
   label.chip.on { border-color:var(--accent); background:#22344a; }
   label.chip input { display:none; }
   .serlist { max-height:150px; overflow:auto; padding:2px 0; flex:1 1 100%; display:flex; flex-wrap:wrap; gap:3px 14px; }
+  .sergrid { display:grid; gap:1px 12px; align-items:center; max-height:280px; overflow:auto; flex:1 1 100%; padding:2px 0; }
+  .sergrid .sgrow { display:contents; }
+  .sergrid .chk { justify-content:center; }
+  .sergrid button.small { text-align:left; }
   .ctools { display:flex; flex-wrap:wrap; gap:6px 8px; align-items:center; margin:8px 0 4px; }
   .ctools .hint { color:var(--dim); font-size:12px; }
   .ctools .zinfo { color:var(--accent); font-size:12px; }
@@ -140,7 +144,7 @@ const KINDS = {
   },
   cpu: {
     title: 'CPU',
-    metrics: [['mcalls','Throughput','M calls/s'],['mcalls_thread','Throughput per thread','M calls/s'],['ns_per_call','Time per call','time'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
+    metrics: [['mcalls','Throughput','M calls/s'],['mcalls_thread','Throughput per thread','M calls/s'],['ns_per_call','Time per call','time'],['run_spread','Run-to-run spread','%'],['clock','Clock','MHz'],['this_core_temp','Temp of this core','°C'],['threads','Threads','']].concat(TELEMETRY),
     // per-core runs next to all-core runs: the all-core total (24 threads) would dwarf every core, so
     // the chart starts on the per-thread value; the total stays in the table and the value chips
     defaultChart: rows => rows.some(r => r.core !== undefined) && rows.some(r => r.core === undefined) ? 'mcalls_thread' : 'mcalls',
@@ -158,6 +162,7 @@ const KINDS = {
         const v = Object.assign({ mcalls: r.operations_per_second/1e6, mcalls_thread: r.operations_per_second/1e6/threads, ns_per_call: r.latency_ns, threads: r.thread_count }, telemetryValues(r.telemetry));
         if (r.frequency_mhz > 0) v.clock = r.frequency_mhz;
         const runs = (r.iteration_results || []).filter(it => it.duration_ns > 0).map(it => it.operations / it.duration_ns * 1e3);
+        if (runs.length > 1) { const m = runs.reduce((a, b) => a + b, 0) / runs.length; v.run_spread = m > 0 ? Math.sqrt(runs.reduce((a, b) => a + (b - m) ** 2, 0) / runs.length) / m * 100 : 0; }
         if (single !== null) {
           if (r.telemetry && r.telemetry.core_temp_max_c) { const t = r.telemetry.core_temp_max_c.find(c => c[0] === single); if (t) v.this_core_temp = t[1]; }
           const c = cls(single);
@@ -571,6 +576,7 @@ class Chart {
         if (q[0] < L - 4 || q[0] > L + pw + 4 || q[1] < T - 4 || q[1] > T + ph + 4) continue;
         this.hit.push({ x: q[0], y: q[1], p: q[2], line: l, li });
         if (drawMarkers) markers += markerSvg(l.shape, +q[0].toFixed(1), +q[1].toFixed(1), 3.3, l.color);
+        if (s.marks && s.marks.has(l.series + '|' + q[2][0])) markers += `<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="8" fill="none" stroke="#ff5d5d" stroke-width="1.8"/>`;
       }
     });
     g += `<g clip-path="url(#${sid})">${body}${markers}</g><g id="ov" clip-path="url(#${sid})"></g>`;
@@ -679,12 +685,97 @@ function autoTimeUnits(metrics, rows) {
   });
 }
 
+// "12T" after "2T", "Core 10" after "Core 9"
+const natCmp = new Intl.Collator('en', { numeric: true, sensitivity: 'base' }).compare;
+// "StreamAdd · 12T" -> { base: 'StreamAdd', col: '12T' }; lines without a thread count keep col ''
+function splitSeries(s) {
+  const seg = s.split(' · '), k = seg.findIndex(x => /^\d+T\b/.test(x));
+  return k < 0 ? { base: s, col: '' } : { base: seg.filter((_, i) => i !== k).join(' · '), col: seg[k] };
+}
+// Line switches: a grid (one row per test, one column per thread count, row and column names toggle the
+// whole group) when the lines have both, otherwise a plain list
+function seriesPicker(kindKey, series, hid, q) {
+  const cell = (s, inner) => `<label class="chk" data-serlabel="${esc(s.toLowerCase())}" data-hl="${esc(s)}" data-for="chart_${kindKey}" title="${esc(s)}" ${q && !s.toLowerCase().includes(q) ? 'style="display:none"' : ''}><input type="checkbox" data-ser="${esc(s)}" ${hid(s) ? '' : 'checked'}>${styleSwatch(series.indexOf(s))}${inner}</label>`;
+  const parts = series.map(s => ({ s, ...splitSeries(s) }));
+  const bases = [...new Set(parts.map(p => p.base))].sort(natCmp), cols = [...new Set(parts.map(p => p.col))].sort(natCmp);
+  if (bases.length < 2 || cols.length < 2) return '<div class="serlist">' + series.map(s => cell(s, esc(s))).join('') + '</div>';
+  let h = `<div class="sergrid" style="grid-template-columns:auto repeat(${cols.length}, auto)"><div class="sgrow"><span style="color:var(--dim);font-size:12px">click a name to switch its group</span>` +
+    cols.map(c => `<button class="small" data-sercol="${esc(c)}" title="Show / hide every ${esc(c || 'single-thread')} line">${esc(c || '—')}</button>`).join('') + '</div>';
+  for (const b of bases) {
+    const mine = parts.filter(p => p.base === b);
+    const lbl = mine.map(p => p.s.toLowerCase()).join('|');
+    h += `<div class="sgrow" data-serlabel="${esc(lbl)}" ${q && !lbl.includes(q) ? 'style="display:none"' : ''}><button class="small" data-serrow="${esc(b)}" title="Show / hide every ${esc(b)} line">${esc(b)}</button>` +
+      cols.map(c => { const p = mine.find(x => x.col === c); return p ? cell(p.s, '') : '<span></span>'; }).join('') + '</div>';
+  }
+  return h + '</div>';
+}
+
+// ------------------------------------------------------------------ unusual values
+// Points that stand out from their neighbours on a line, cores that differ from cores of their own kind,
+// and results whose repeated runs disagree. Thresholds are deliberately loose: cache-level steps and
+// P-vs-E differences are expected, only what stands out from its own surroundings is listed.
+function findAnomalies(kindKey, rows) {
+  const out = [], med = a => { const s = [...a].sort((x, y) => x - y), h = Math.floor(s.length / 2); return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2; };
+  const add = (r, why, bad) => out.push({ series: r.series, x: r.x, xLabel: r.xLabel, why, bad });
+  const bySeries = new Map(); rows.forEach(r => { if (!bySeries.has(r.series)) bySeries.set(r.series, []); bySeries.get(r.series).push(r); });
+  // GPU: throughput, since the dispatch time grows with the size by design
+  const spikeKey = { memory: 'ns_per_access', gpu: 'gops', input_timing_suite: 'avg_ms' }[kindKey];
+  const spikeName = { memory: 'time per access', gpu: 'throughput', input_timing_suite: 'average' }[kindKey];
+  if (spikeKey) for (const rs of bySeries.values()) {
+    const pts = rs.filter(r => r.values[spikeKey] > 0).sort((a, b) => a.x - b.x);
+    if (pts.length < 4) continue;
+    const val = q => q.values[spikeKey];
+    const show = v => spikeKey === 'ns_per_access' ? fmt(v) + ' ns' : spikeKey === 'gops' ? fmt(v) + ' GOPS' : fmt(v / 1e6) + ' ms';
+    pts.forEach((r, i) => {
+      // the value the line would have here: between its neighbours on a log scale (geometric mean), or
+      // extrapolated from the next two at either end; so steady trends and cache steps are not flagged
+      const v = val(r), near = [pts[i - 1], pts[i + 1]].filter(Boolean).map(val);
+      const around = [pts[i - 2], pts[i - 1], pts[i + 1], pts[i + 2]].filter(Boolean).map(val);
+      const edge = near.length < 2;
+      const exp = !edge ? Math.sqrt(near[0] * near[1]) : i === 0 ? val(pts[1]) ** 2 / val(pts[2]) : val(pts[i - 1]) ** 2 / val(pts[i - 2]);
+      const f = edge ? 2.5 : 1.6;
+      // a spike must also beat its direct neighbours; a dip must be below every point within two places
+      if (v > exp * f && v > Math.max(...near) * 1.25) add(r, `${spikeName} ${(v / exp).toFixed(1)}× what the points around it suggest (${show(v)} vs ${show(exp)})`, v > exp * 3);
+      else if (v < exp / (f + 0.5) && v < Math.min(...around) / 1.5) add(r, `${spikeName} ${(exp / v).toFixed(1)}× lower than the points around it suggest (${show(v)} vs ${show(exp)})`, v < exp / 3);
+    });
+  }
+  if (kindKey === 'cpu') {
+    const peers = new Map();
+    rows.filter(r => r.core !== undefined).forEach(r => { const k = r.series + '|' + (r.coreClass || ''); if (!peers.has(k)) peers.set(k, []); peers.get(k).push(r); });
+    for (const rs of peers.values()) {
+      if (rs.length < 3) continue;
+      const m = med(rs.map(r => r.values.mcalls));
+      rs.forEach(r => {
+        const d = m > 0 ? r.values.mcalls / m - 1 : 0, kind = r.coreClass ? r.coreClass + '-core' : 'core';
+        if (Math.abs(d) > 0.08) add(r, `${Math.abs(d * 100).toFixed(0)}% ${d < 0 ? 'slower' : 'faster'} than the median ${kind}`, Math.abs(d) > 0.25);
+      });
+    }
+    rows.forEach(r => { if (r.values.run_spread > 5) add(r, `runs vary ±${r.values.run_spread.toFixed(1)}% (something else used the core, or the clock changed)`, r.values.run_spread > 15); });
+  }
+  rows.forEach(r => {
+    const v = r.values;
+    if (kindKey === 'memory' && v.p99_run > 0 && v.min_run > 0 && v.p99_run / v.min_run > 2) add(r, `unstable: slowest run ${(v.p99_run / v.min_run).toFixed(1)}× the best`, v.p99_run / v.min_run > 4);
+    if (kindKey === 'gpu' && v.p99_ms > 0 && v.avg_ms > 0 && v.p99_ms / v.avg_ms > 2) add(r, `p99 dispatch ${(v.p99_ms / v.avg_ms).toFixed(1)}× the average`, v.p99_ms / v.avg_ms > 4);
+    if (kindKey === 'input_timing_suite' && v.p99_ms > 0 && v.avg_ms > 0 && v.p99_ms / v.avg_ms > 1.5) add(r, `p99 ${(v.p99_ms / v.avg_ms).toFixed(1)}× the average`, v.p99_ms / v.avg_ms > 3);
+  });
+  return out;
+}
+
+function anomaliesHtml(kindKey, list) {
+  if (!list.length) return `<div style="color:var(--dim);font-size:12px;margin:4px 0">✓ No unusual values: every point fits its neighbours and its runs agree.</div>`;
+  const bad = list.filter(a => a.bad).length, MAX = 60;
+  return `<details class="anoms" ${list.length <= 12 ? 'open' : ''}><summary class="${bad ? 'bad' : 'warn'}">⚠ ${list.length} unusual value${list.length === 1 ? '' : 's'}${bad ? ` (${bad} strong)` : ''}: ringed on the chart · hover one to highlight its line</summary>` +
+    '<div class="scroll" style="max-height:260px"><table><thead><tr><th>Line</th><th>At</th><th>Why it stands out</th></tr></thead><tbody>' +
+    list.slice(0, MAX).map(a => `<tr data-hl="${esc(a.series)}" data-for="chart_${kindKey}"><td>${esc(a.series)}</td><td>${esc(a.xLabel)}</td><td class="${a.bad ? 'bad' : 'warn'}">${esc(a.why)}</td></tr>`).join('') +
+    (list.length > MAX ? `<tr><td colspan="3" style="color:var(--dim)">… and ${list.length - MAX} more</td></tr>` : '') + '</tbody></table></div></details>';
+}
+
 function kindSection(kindKey, entries) {
   // entries: [{label, sec}] one per selected result
   const kind = KINDS[kindKey];
   const multi = entries.length > 1;
   const rows = entries.flatMap(e => kind.rows(e.sec).map(r => multi ? { ...r, series: `[${e.label}] ${r.series}` } : r));
-  const series = [...new Set(rows.map(r => r.series))].sort();
+  const series = [...new Set(rows.map(r => r.series))].sort(natCmp);
   const metrics = autoTimeUnits(kind.metrics, rows).filter(m => rows.some(r => r.values[m[0]] !== undefined && r.values[m[0]] !== null));
   const hid = (k) => state.hiddenSeries.has(kindKey + ':' + k), hidc = (k) => state.hiddenCols.has(kindKey + ':' + k);
   const shownMetrics = metrics.filter(m => !hidc(m[0]));
@@ -699,13 +790,13 @@ function kindSection(kindKey, entries) {
   const q = (state.filters[kindKey] || '').toLowerCase();
   let html = `<h2>${esc(kind.title)} <span class="badge">${rows.length} result rows</span></h2>`;
   if (kindKey === 'memory' && entries.some(e => e.sec.complete === false)) html += `<div class="warn">⚠ The run was stopped early: ${entries.map(e => e.sec.tests_done + ' of ' + e.sec.tests_planned + ' tests').join(', ')} were completed.</div>`;
-  if (kindKey === 'cpu') html += slowCoreNotes(rows);
+  const anomalies = findAnomalies(kindKey, rows);
+  html += anomaliesHtml(kindKey, anomalies);
   html += flatTempWarning(rows);
   html += `<div class="card" id="${id}">`;
   html += `<div class="row"><b>Lines:</b> <button class="small" data-act="ser-all">all</button><button class="small" data-act="ser-none">none</button><button class="small" data-act="ser-only" title="Show only the lines matching the filter">only matching</button>` +
     `<input type="text" data-serfilter placeholder="filter lines (e.g. Stream, 12T)" value="${esc(state.filters[kindKey] || '')}" style="min-width:200px"><span style="color:var(--dim);font-size:12px">${series.length - series.filter(hid).length} of ${series.length} shown</span>` +
-    `<div class="serlist">` +
-    series.map((s, i) => `<label class="chk" data-serlabel="${esc(s.toLowerCase())}" data-hl="${esc(s)}" data-for="chart_${kindKey}" ${q && !s.toLowerCase().includes(q) ? 'style="display:none"' : ''}><input type="checkbox" data-ser="${esc(s)}" ${hid(s) ? '' : 'checked'}>${styleSwatch(i)}${esc(s)}</label>`).join('') + '</div></div>';
+    seriesPicker(kindKey, series, hid, q) + '</div>';
   html += `<details><summary>Show / hide values (columns)</summary><div class="row"><button class="small" data-act="col-all">all</button><button class="small" data-act="col-none">none</button><button class="small" data-act="col-perf">performance only</button><button class="small" data-act="col-sens">sensors only</button></div><div class="row">` +
     metrics.map(m => `<label class="chk"><input type="checkbox" data-col="${m[0]}" ${hidc(m[0]) ? '' : 'checked'}>${esc(m[1])} <span style="color:var(--dim)">(${esc(m[2])})</span></label>`).join('') + '</div></details>';
   const bySeries = new Map(); rows.forEach(r => { if (!bySeries.has(r.series)) bySeries.set(r.series, []); bySeries.get(r.series).push(r); });
@@ -747,6 +838,7 @@ function kindSection(kindKey, entries) {
         id: cid, lines, axes, legend: many ? chosenMetrics.map((m, mi) => ({ label: `${m[1]} (${m[2]})`, color: valueColor(mi), dash: DASHES[mi % DASHES.length], axis: units.indexOf(m[2]) })) : null, ysig: chosenMetrics.map(m => m[0]).join('|') + '|' + o.zeroY + o.logY,
         xLabel: kind.xLabel || (kindKey === 'cpu' ? 'core' : ''), logY: o.logY, zeroY: o.zeroY, markers: o.markers,
         xFmt: kind.xFmt ? kind.xFmt : (v => labelAt.get(Math.round(v * 1000)) ?? fmt(v)),
+        marks: new Set(anomalies.map(a => a.series + '|' + a.x)),
         xInt: !!kind.logX, xTicks: !kind.logX && xs.length <= 40 ? xs : undefined,
       });
       html += chartTools(cid) + `<div class="chartbox" data-chart="${cid}"></div>`;
@@ -757,21 +849,6 @@ function kindSection(kindKey, entries) {
     visRows.map(r => `<tr><td>${styleSwatch(series.indexOf(r.series))}${esc(r.series)}</td><td>${esc(r.xLabel)}</td>${shownMetrics.map(m => `<td>${fmt(r.values[m[0]])}</td>`).join('')}</tr>`).join('') + '</tbody></table></div>';
   html += '</div>';
   return { html, rows, shownMetrics, kindKey, series, metrics };
-}
-
-function slowCoreNotes(rows) {
-  // per workload, each core against the median of its own kind (P with P, E with E): on a hybrid CPU
-  // the E cores are slower by design, and some workloads even favour them
-  const by = {};
-  rows.forEach(r => { if (r.core !== undefined) (by[r.series + '|' + (r.coreClass || '')] ??= []).push([r.core, r.values.mcalls, r.coreClass]); });
-  let out = '';
-  for (const [key, arr] of Object.entries(by)) {
-    if (arr.length < 3) continue;
-    const w = key.slice(0, key.lastIndexOf('|'));
-    const s = arr.map(a => a[1]).sort((a, b) => a - b), med = s[Math.floor(s.length / 2)];
-    arr.sort((a, b) => a[0] - b[0]).forEach(([core, v, c]) => { if (med > 0 && v < med * 0.92) out += `<div class="warn">⚠ ${esc(w)}: core ${core} is ${((1 - v / med) * 100).toFixed(0)}% slower than the median ${c ? c + '-core' : 'core'}</div>`; });
-  }
-  return out;
 }
 
 const SENSOR_DEFS = [
@@ -961,6 +1038,15 @@ function wireKind(host, kindKey) {
   const card = host.querySelector('.card[id^=sec_]'); if (!card) return;
   const b = lastRender.built.find(x => x.kindKey === kindKey), redo = () => rebuildSection(kindKey);
   card.querySelectorAll('[data-ser]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.ser; el.checked ? state.hiddenSeries.delete(k) : state.hiddenSeries.add(k); redo(); });
+  // a whole row (test) or column (thread count): all shown -> hide them, otherwise show them all
+  const toggleGroup = pick => {
+    const group = b.series.filter(s => pick(splitSeries(s)));
+    const allOn = group.every(s => !state.hiddenSeries.has(kindKey + ':' + s));
+    group.forEach(s => allOn ? state.hiddenSeries.add(kindKey + ':' + s) : state.hiddenSeries.delete(kindKey + ':' + s));
+    redo();
+  };
+  card.querySelectorAll('[data-serrow]').forEach(el => el.onclick = () => toggleGroup(p => p.base === el.dataset.serrow));
+  card.querySelectorAll('[data-sercol]').forEach(el => el.onclick = () => toggleGroup(p => p.col === el.dataset.sercol));
   card.querySelectorAll('[data-col]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.col; el.checked ? state.hiddenCols.delete(k) : state.hiddenCols.add(k); redo(); });
   card.querySelectorAll('[data-opt]').forEach(el => el.onchange = () => { optsOf(kindKey)[el.dataset.opt] = el.checked; redo(); });
   card.querySelectorAll('[data-mchip]').forEach(el => el.onchange = () => {

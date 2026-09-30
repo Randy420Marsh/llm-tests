@@ -85,10 +85,11 @@ const MEMORY_METRICS: [Metric; 6] = [
     ("min_run", "Best run", "ms"),
     ("runs", "Runs", ""),
 ];
-const CPU_METRICS: [Metric; 6] = [
+const CPU_METRICS: [Metric; 7] = [
     ("mcalls", "Throughput", "M calls/s"),
     ("mcalls_thread", "Throughput per thread", "M calls/s"),
     ("ns_per_call", "Time per call", "ns"),
+    ("run_spread", "Run-to-run spread", "%"),
     ("clock", "Clock (during run)", "MHz"),
     ("this_core_temp", "Temp of this core", "°C"),
     ("threads", "Threads", ""),
@@ -212,6 +213,9 @@ pub(super) fn cpu_rows(results: &[CpuBenchmarkResult], kinds: Option<&[CoreKind]
             v.insert("mcalls_thread", r.operations_per_second / 1e6 / threads as f64);
             v.insert("ns_per_call", r.latency_ns);
             v.insert("threads", r.thread_count as f64);
+            if let Some(spread) = run_spread_pct(r) {
+                v.insert("run_spread", spread);
+            }
             if r.frequency_mhz > 0 {
                 v.insert("clock", r.frequency_mhz as f64);
             }
@@ -291,36 +295,170 @@ pub(super) fn input_rows(results: &[InputLatencyResult]) -> Vec<Row> {
         .collect()
 }
 
-/// Cores whose throughput is well below the median of the single-core CPU results of the same core
-/// kind (P against P, E against E: on a hybrid CPU the E cores differ by design). (workload, core, % slower, "P"/"E"/"")
-pub(super) fn slow_cores(results: &[CpuBenchmarkResult], threshold: f64, kinds: Option<&[CoreKind]>) -> Vec<(String, usize, f64, &'static str)> {
-    let mut by_workload: BTreeMap<(String, &'static str), Vec<(usize, f64)>> = BTreeMap::new();
-    for r in results {
-        if r.core_mask.count_ones() == 1 {
-            let core = r.core_mask.trailing_zeros() as usize;
-            by_workload
-                .entry((format!("{:?}", r.workload), crate::topology::class_label(kinds, core)))
-                .or_default()
-                .push((core, r.operations_per_second));
-        }
+/// Standard deviation of the per-run throughput in % of its mean (None with fewer than two runs)
+fn run_spread_pct(r: &CpuBenchmarkResult) -> Option<f64> {
+    let runs: Vec<f64> = r.iteration_results.iter().filter(|i| i.duration_ns > 0).map(|i| i.operations as f64 / i.duration_ns as f64).collect();
+    if runs.len() < 2 {
+        return None;
     }
+    let mean = runs.iter().sum::<f64>() / runs.len() as f64;
+    let var = runs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / runs.len() as f64;
+    (mean > 0.0).then(|| var.sqrt() / mean * 100.0)
+}
+
+/// A value that stands out, with the reason
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Anomaly {
+    pub series: String,
+    pub x: f64,
+    pub x_label: String,
+    pub why: String,
+    pub strong: bool,
+}
+
+fn median(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let h = s.len() / 2;
+    if s.is_empty() { 0.0 } else if s.len() % 2 == 1 { s[h] } else { (s[h - 1] + s[h]) / 2.0 }
+}
+
+/// Points that stand out from their neighbours on a line, cores that differ from cores of their own
+/// kind, and results whose repeated runs disagree (same rules as the web report)
+pub(super) fn find_anomalies(d: Dataset, rows: &[Row]) -> Vec<Anomaly> {
     let mut out = Vec::new();
-    for ((w, class), mut cores) in by_workload {
-        if cores.len() < 3 {
-            continue;
-        }
-        let mut sorted: Vec<f64> = cores.iter().map(|c| c.1).collect();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let median = sorted[sorted.len() / 2];
-        cores.sort_by_key(|c| c.0);
-        for (core, ops) in cores {
-            if median > 0.0 && ops < median * (1.0 - threshold) {
-                out.push((w.clone(), core, (1.0 - ops / median) * 100.0, class));
+    let mut add = |r: &Row, why: String, strong: bool| out.push(Anomaly { series: r.series.clone(), x: r.x, x_label: r.x_label.clone(), why, strong });
+    let mut by_series: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
+    for r in rows {
+        by_series.entry(&r.series).or_default().push(r);
+    }
+    // spikes and dips along a line (GPU: throughput, its dispatch time grows with the size by design)
+    let spike = match d {
+        Dataset::Memory => Some(("ns_per_access", "time per access", " ns")),
+        Dataset::Gpu => Some(("gops", "throughput", " GOPS")),
+        Dataset::Input => Some(("avg_ms", "average", " ms")),
+        _ => None,
+    };
+    if let Some((key, name, unit)) = spike {
+        for rs in by_series.values() {
+            let mut pts: Vec<(&Row, f64)> = rs.iter().filter_map(|r| r.values.get(key).filter(|v| **v > 0.0).map(|v| (*r, *v))).collect();
+            if pts.len() < 4 {
+                continue;
+            }
+            pts.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+            for i in 0..pts.len() {
+                // the value the line would have here: between its neighbours on a log scale (geometric
+                // mean), or extrapolated from the next two at either end; steady trends and cache steps
+                // are then not flagged
+                let v = pts[i].1;
+                let val = |j: usize| pts[j].1;
+                let near: Vec<f64> = [i.checked_sub(1), Some(i + 1)].into_iter().flatten().filter(|&j| j < pts.len()).map(val).collect();
+                let around: Vec<f64> = [i.checked_sub(2), i.checked_sub(1), Some(i + 1), Some(i + 2)].into_iter().flatten().filter(|&j| j < pts.len()).map(val).collect();
+                let edge = near.len() < 2;
+                let exp = if !edge {
+                    (near[0] * near[1]).sqrt()
+                } else if i == 0 {
+                    val(1).powi(2) / val(2)
+                } else {
+                    val(i - 1).powi(2) / val(i - 2)
+                };
+                let f = if edge { 2.5 } else { 1.6 };
+                // a spike must also beat its direct neighbours; a dip must be below every point within two places
+                let hi = near.iter().copied().fold(f64::MIN, f64::max);
+                let lo = around.iter().copied().fold(f64::MAX, f64::min);
+                let show = |x: f64| format!("{}{}", format_value(x, ""), unit);
+                if v > exp * f && v > hi * 1.25 {
+                    add(pts[i].0, format!("{} {:.1}× what the points around it suggest ({} vs {})", name, v / exp, show(v), show(exp)), v > exp * 3.0);
+                } else if v < exp / (f + 0.5) && v < lo / 1.5 {
+                    add(pts[i].0, format!("{} {:.1}× lower than the points around it suggest ({} vs {})", name, exp / v, show(v), show(exp)), v < exp / 3.0);
+                }
             }
         }
     }
-    out.sort_by_key(|o| o.1);
+    if d == Dataset::Cpu {
+        // single cores against the median of their own kind
+        let mut peers: BTreeMap<(String, String), Vec<&Row>> = BTreeMap::new();
+        for r in rows.iter().filter(|r| r.x >= 0.0 && r.x_label.starts_with("Core ")) {
+            let class = r.x_label.rsplit(" · ").next().filter(|c| *c == "P" || *c == "E").unwrap_or("").to_string();
+            peers.entry((r.series.clone(), class)).or_default().push(r);
+        }
+        for ((_, class), rs) in &peers {
+            if rs.len() < 3 {
+                continue;
+            }
+            let m = median(&rs.iter().filter_map(|r| r.values.get("mcalls").copied()).collect::<Vec<_>>());
+            for r in rs {
+                let Some(v) = r.values.get("mcalls") else { continue };
+                let dev = if m > 0.0 { v / m - 1.0 } else { 0.0 };
+                if dev.abs() > 0.08 {
+                    let kind = if class.is_empty() { "core".to_string() } else { format!("{}-core", class) };
+                    add(r, format!("{:.0}% {} than the median {}", dev.abs() * 100.0, if dev < 0.0 { "slower" } else { "faster" }, kind), dev.abs() > 0.25);
+                }
+            }
+        }
+    }
+    for r in rows {
+        let v = |k: &str| r.values.get(k).copied().unwrap_or(0.0);
+        match d {
+            Dataset::Cpu if v("run_spread") > 5.0 => {
+                add(r, format!("runs vary ±{:.1}% (something else used the core, or the clock changed)", v("run_spread")), v("run_spread") > 15.0)
+            }
+            Dataset::Memory if v("p99_run") > 0.0 && v("min_run") > 0.0 && v("p99_run") / v("min_run") > 2.0 => {
+                add(r, format!("unstable: slowest run {:.1}× the best", v("p99_run") / v("min_run")), v("p99_run") / v("min_run") > 4.0)
+            }
+            Dataset::Gpu if v("p99_ms") > 0.0 && v("avg_ms") > 0.0 && v("p99_ms") / v("avg_ms") > 2.0 => {
+                add(r, format!("p99 dispatch {:.1}× the average", v("p99_ms") / v("avg_ms")), v("p99_ms") / v("avg_ms") > 4.0)
+            }
+            Dataset::Input if v("p99_ms") > 0.0 && v("avg_ms") > 0.0 && v("p99_ms") / v("avg_ms") > 1.5 && !r.x_label.starts_with("trial") => {
+                add(r, format!("p99 {:.1}× the average", v("p99_ms") / v("avg_ms")), v("p99_ms") / v("avg_ms") > 3.0)
+            }
+            _ => {}
+        }
+    }
     out
+}
+
+/// Compare names with their numbers as numbers: "2T" before "12T", "Core 9" before "Core 10"
+pub(super) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn chunks(s: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for ch in s.chars() {
+            let digit = ch.is_ascii_digit();
+            match out.last_mut() {
+                Some((d, run)) if *d == digit => run.push(ch),
+                _ => out.push((digit, ch.to_string())),
+            }
+        }
+        out
+    }
+    let (ca, cb) = (chunks(a), chunks(b));
+    for (x, y) in ca.iter().zip(&cb) {
+        let o = match (x.0, y.0) {
+            (true, true) => {
+                let (tx, ty) = (x.1.trim_start_matches('0'), y.1.trim_start_matches('0'));
+                tx.len().cmp(&ty.len()).then_with(|| tx.cmp(ty))
+            }
+            _ => x.1.to_lowercase().cmp(&y.1.to_lowercase()),
+        };
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    ca.len().cmp(&cb.len()).then_with(|| a.cmp(b))
+}
+
+/// "StreamAdd · 12T" -> ("StreamAdd", "12T"); "GameSim · 24T all cores" -> ("GameSim", "24T all cores");
+/// lines without a thread count keep an empty column
+pub(super) fn split_series(s: &str) -> (String, String) {
+    let seg: Vec<&str> = s.split(" · ").collect();
+    let is_threads = |x: &&str| {
+        let digits = x.chars().take_while(|c| c.is_ascii_digit()).count();
+        digits > 0 && x[digits..].starts_with('T') && x[digits + 1..].chars().next().map_or(true, |c| c == ' ')
+    };
+    match seg.iter().position(|x| is_threads(x)) {
+        Some(k) => (seg.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, x)| *x).collect::<Vec<_>>().join(" · "), seg[k].to_string()),
+        None => (s.to_string(), String::new()),
+    }
 }
 
 /// Legend under a chart, right-aligned and wrapped; folded away when there are many lines (the
@@ -391,6 +529,8 @@ pub(super) struct ResultsUi {
     pub phase_opacity: f32,
     /// Charts to reset to their full view on the next frame ("Reset view" button)
     pub reset_view: HashSet<&'static str>,
+    /// Points ringed on the chart as unusual values (series, x)
+    pub marks: Vec<(String, f64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -465,6 +605,7 @@ impl ResultsUi {
             sensor_group: SensorGroup::Temperatures,
             phase_opacity: 0.18,
             reset_view: HashSet::new(),
+            marks: Vec::new(),
         }
     }
 
@@ -561,7 +702,7 @@ impl LatencyTesterApp {
         }
 
         let mut series: Vec<String> = rows.iter().map(|r| r.series.clone()).collect();
-        series.sort();
+        series.sort_by(|a, b| natural_cmp(a, b));
         series.dedup();
         let all_metrics = metrics_for(d);
         // only metrics that at least one row actually has a value for
@@ -584,14 +725,7 @@ impl LatencyTesterApp {
                         }
                     }
                 });
-                ui.horizontal_wrapped(|ui| {
-                    for (i, s) in series.iter().enumerate() {
-                        let mut vis = !self.results_ui.series_hidden(d, s);
-                        if ui.checkbox(&mut vis, RichText::new(s).color(color_for(i))).changed() {
-                            self.results_ui.toggle_series(d, s, vis);
-                        }
-                    }
-                });
+                self.series_picker(ui, d, &series);
             });
             egui::CollapsingHeader::new("Show / hide values (columns)").default_open(false).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -634,13 +768,30 @@ impl LatencyTesterApp {
                 }
             });
 
-            if d == Dataset::Cpu {
-                let results = self.cpu_partial.lock().unwrap().clone();
-                for (w, core, pct, class) in slow_cores(&results, 0.08, crate::topology::cached_core_kinds()) {
-                    let peer = if class.is_empty() { "core".to_string() } else { format!("{}-core", class) };
-                    ui.colored_label(Color32::from_rgb(255, 170, 60), format!("⚠ {}: core {} is {:.0}% slower than the median {}", w, core, pct, peer));
-                }
+            let anomalies = find_anomalies(d, &rows);
+            if anomalies.is_empty() {
+                ui.label(RichText::new("✓ No unusual values: every point fits its neighbours and its runs agree.").weak().small());
+            } else {
+                let strong = anomalies.iter().filter(|a| a.strong).count();
+                let title = format!("⚠ {} unusual value{}{}: ringed on the chart", anomalies.len(), if anomalies.len() == 1 { "" } else { "s" }, if strong > 0 { format!(" ({} strong)", strong) } else { String::new() });
+                egui::CollapsingHeader::new(RichText::new(title).color(Color32::from_rgb(255, 170, 60)))
+                    .id_salt(("anoms", d.tag()))
+                    .default_open(anomalies.len() <= 12)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().id_salt(("anoms_scroll", d.tag())).max_height(220.0).show(ui, |ui| {
+                            egui::Grid::new(("anoms_grid", d.tag())).striped(true).spacing([14.0, 2.0]).show(ui, |ui| {
+                                for a in anomalies.iter().take(200) {
+                                    let idx = series.iter().position(|s| *s == a.series).unwrap_or(0);
+                                    ui.label(RichText::new(&a.series).color(color_for(idx)));
+                                    ui.label(&a.x_label);
+                                    ui.label(RichText::new(&a.why).color(if a.strong { Color32::from_rgb(255, 110, 110) } else { Color32::from_rgb(255, 170, 60) }));
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    });
             }
+            self.results_ui.marks = anomalies.iter().map(|a| (a.series.clone(), a.x)).collect();
 
             // ---------------- chart ----------------
             let selectable: Vec<Metric> = metrics.iter().copied().filter(|m| !self.results_ui.col_hidden(d, m.0)).collect();
@@ -707,9 +858,71 @@ impl LatencyTesterApp {
         });
     }
 
+    /// Line switches: a grid with one row per test and one column per thread count (clicking a row or
+    /// column name switches that whole group) when the lines have both, otherwise a wrapped list
+    fn series_picker(&mut self, ui: &mut Ui, d: Dataset, series: &[String]) {
+        let parts: Vec<(String, String)> = series.iter().map(|s| split_series(s)).collect();
+        let mut bases: Vec<&String> = parts.iter().map(|p| &p.0).collect();
+        let mut cols: Vec<&String> = parts.iter().map(|p| &p.1).collect();
+        bases.sort_by(|a, b| natural_cmp(a, b));
+        bases.dedup();
+        cols.sort_by(|a, b| natural_cmp(a, b));
+        cols.dedup();
+        if bases.len() < 2 || cols.len() < 2 {
+            ui.horizontal_wrapped(|ui| {
+                for (i, s) in series.iter().enumerate() {
+                    let mut vis = !self.results_ui.series_hidden(d, s);
+                    if ui.checkbox(&mut vis, RichText::new(s).color(color_for(i))).changed() {
+                        self.results_ui.toggle_series(d, s, vis);
+                    }
+                }
+            });
+            return;
+        }
+        let mut toggle: Option<Vec<usize>> = None;
+        egui::ScrollArea::vertical().id_salt(("sergrid_scroll", d.tag())).max_height(280.0).show(ui, |ui| {
+            egui::Grid::new(("sergrid", d.tag())).spacing([10.0, 2.0]).show(ui, |ui| {
+                ui.label(RichText::new("click a name to switch its group").weak().small());
+                for c in &cols {
+                    let name = if c.is_empty() { "—" } else { c.as_str() };
+                    if ui.small_button(name).on_hover_text(format!("Show / hide every {} line", name)).clicked() {
+                        toggle = Some((0..series.len()).filter(|&i| parts[i].1 == **c).collect());
+                    }
+                }
+                ui.end_row();
+                for b in &bases {
+                    if ui.small_button(b.as_str()).on_hover_text(format!("Show / hide every {} line", b)).clicked() {
+                        toggle = Some((0..series.len()).filter(|&i| parts[i].0 == **b).collect());
+                    }
+                    for c in &cols {
+                        match (0..series.len()).find(|&i| parts[i].0 == **b && parts[i].1 == **c) {
+                            Some(i) => {
+                                let mut vis = !self.results_ui.series_hidden(d, &series[i]);
+                                if ui.checkbox(&mut vis, RichText::new("●").color(color_for(i))).on_hover_text(&series[i]).changed() {
+                                    self.results_ui.toggle_series(d, &series[i], vis);
+                                }
+                            }
+                            None => {
+                                ui.label("");
+                            }
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(group) = toggle {
+            let all_on = group.iter().all(|&i| !self.results_ui.series_hidden(d, &series[i]));
+            for i in group {
+                self.results_ui.toggle_series(d, &series[i], !all_on);
+            }
+        }
+    }
+
     fn draw_chart(&mut self, ui: &mut Ui, d: Dataset, rows: &[Row], series: &[String], metric: Metric) {
         let log_x = matches!(d, Dataset::Memory | Dataset::Gpu);
         let show_points = self.results_ui.show_points;
+        let marks = self.results_ui.marks.clone();
         let log_y = self.results_ui.log_y;
         let zero_y = self.results_ui.zero_y && !log_y;
         let ylabel = format!("{} ({}){}", metric.1, metric.2, if log_y { " — log scale" } else { "" });
@@ -757,6 +970,10 @@ impl LatencyTesterApp {
                 pts.sort_by(|a, b| a[0].total_cmp(&b[0]));
                 let color = color_for(i);
                 plot_ui.line(Line::new(PlotPoints::from(pts.clone())).name(s).color(color));
+                let ringed: Vec<[f64; 2]> = pts.iter().copied().filter(|p| marks.iter().any(|m| m.0 == *s && (m.1 - p[0]).abs() < 1e-9)).collect();
+                if !ringed.is_empty() {
+                    plot_ui.points(Points::new(PlotPoints::from(ringed)).color(Color32::from_rgb(255, 93, 93)).radius(8.0).filled(false).shape(egui_plot::MarkerShape::Circle));
+                }
                 if show_points {
                     plot_ui.points(Points::new(PlotPoints::from(pts)).name(s).color(color).radius(3.5_f32));
                 }
@@ -954,7 +1171,9 @@ pub(super) fn sensor_lines(tl: &[Snapshot], group: SensorGroup) -> Vec<(String, 
             add(&format!("{} {}", r.name, r.kind.unit()), x, Some(r.value));
         }
     }
-    lines.into_iter().collect()
+    let mut out: Vec<(String, Vec<[f64; 2]>)> = lines.into_iter().collect();
+    out.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+    out
 }
 
 fn avg_f32(v: &[f32]) -> Option<f32> {
@@ -1027,11 +1246,47 @@ mod tests {
     fn slow_core_is_flagged() {
         let mut v: Vec<_> = (0..6).map(|c| cpu_result(c, 1e6)).collect();
         v[4] = cpu_result(4, 0.7e6);
-        let slow = slow_cores(&v, 0.08, None);
+        let slow = find_anomalies(Dataset::Cpu, &cpu_rows(&v, None));
         assert_eq!(slow.len(), 1);
-        assert_eq!(slow[0].1, 4);
-        assert!((slow[0].2 - 30.0).abs() < 0.01);
-        assert!(slow_cores(&v[..2], 0.08, None).is_empty()); // too few cores to judge
+        assert_eq!(slow[0].x, 4.0);
+        assert_eq!(slow[0].why, "30% slower than the median core");
+        assert!(find_anomalies(Dataset::Cpu, &cpu_rows(&v[..2], None)).is_empty()); // too few cores to judge
+    }
+
+    #[test]
+    fn anomalies_find_spikes_peers_and_unstable_runs() {
+        let mem = |x: f64, ns: f64, p99: f64| {
+            let mut v = BTreeMap::new();
+            v.insert("ns_per_access", ns);
+            v.insert("min_run", 100.0);
+            v.insert("p99_run", p99);
+            Row { series: "StridedRead(4096 B) · 1T".into(), x, x_label: format!("{} KB", x), values: v }
+        };
+        // a cache step (1 -> 5 ns) is fine; the 128 KB spike and the unstable last point are not
+        let rows = vec![mem(12.0, 1.0, 110.0), mem(13.0, 1.1, 110.0), mem(14.0, 1.0, 110.0), mem(15.0, 9.0, 110.0), mem(16.0, 1.0, 110.0), mem(17.0, 5.0, 110.0), mem(18.0, 5.2, 110.0), mem(19.0, 5.1, 500.0)];
+        let a = find_anomalies(Dataset::Memory, &rows);
+        assert_eq!(a.iter().filter(|a| a.why.starts_with("time per access")).map(|a| a.x).collect::<Vec<_>>(), vec![15.0]);
+        assert!(a.iter().any(|a| a.x == 19.0 && a.why.starts_with("unstable") && a.strong));
+        // CPU: one P core 20% slow, E cores differ from P cores by design and are not flagged
+        use CoreKind::{Efficiency as E, Performance as P};
+        let kinds = [P, P, P, E, E, E];
+        let mut v: Vec<_> = (0..6).map(|c| cpu_result(c, if kinds[c] == P { 5e6 } else { 4e6 })).collect();
+        v[1] = cpu_result(1, 4e6);
+        let a = find_anomalies(Dataset::Cpu, &cpu_rows(&v, Some(&kinds)));
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].x, a[0].why.as_str()), (1.0, "20% slower than the median P-core"));
+    }
+
+    #[test]
+    fn names_sort_naturally_and_split_into_test_and_threads() {
+        let mut v = vec!["StreamAdd · 12T", "StreamAdd · 2T", "StreamAdd · 1T", "Core 10 °C", "Core 9 °C", "PointerChase · 24T"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, vec!["Core 9 °C", "Core 10 °C", "PointerChase · 24T", "StreamAdd · 1T", "StreamAdd · 2T", "StreamAdd · 12T"]);
+        assert_eq!(split_series("StreamAdd · 12T"), ("StreamAdd".into(), "12T".into()));
+        assert_eq!(split_series("StridedRead(64 B) · 4T · P-cores 0-7"), ("StridedRead(64 B) · P-cores 0-7".into(), "4T".into()));
+        assert_eq!(split_series("GameSim · 24T all cores"), ("GameSim".into(), "24T all cores".into()));
+        assert_eq!(split_series("GameSim"), ("GameSim".into(), String::new()));
+        assert_eq!(split_series("Tiles · 12Tx"), ("Tiles · 12Tx".into(), String::new()));
     }
 
     #[test]
@@ -1040,8 +1295,8 @@ mod tests {
         // IntegerAdd on Arrow Lake: E cores 5x the P cores; no core is slow within its kind
         let kinds = [P, P, E, E, E, E, P, P];
         let v: Vec<_> = (0..8).map(|c| cpu_result(c, if kinds[c] == P { 0.8e6 } else { 4.0e6 })).collect();
-        assert!(slow_cores(&v, 0.08, Some(&kinds)).is_empty());
-        assert_eq!(slow_cores(&v, 0.08, None).len(), 4, "without kinds every P core looks slow");
+        assert!(find_anomalies(Dataset::Cpu, &cpu_rows(&v, Some(&kinds))).is_empty());
+        assert_eq!(find_anomalies(Dataset::Cpu, &cpu_rows(&v, None)).len(), 8, "without kinds P and E cores look like outliers");
         let rows = cpu_rows(&v, Some(&kinds));
         assert_eq!(rows[2].x_label, "Core 2 · E");
     }
