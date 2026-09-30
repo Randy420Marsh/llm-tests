@@ -43,6 +43,27 @@
   .warn { color:var(--warn); } .bad { color:var(--bad); } .ok { color:var(--ok); }
   #empty { color:var(--dim); padding:40px 0; text-align:center; }
   a { color:var(--accent); }
+  .swl { vertical-align:middle; margin-right:3px; }
+  label.chip { display:inline-flex; align-items:center; gap:4px; padding:1px 9px; border:1px solid var(--line); border-radius:13px; background:var(--panel2); cursor:pointer; user-select:none; }
+  label.chip.on { border-color:var(--accent); background:#22344a; }
+  label.chip input { display:none; }
+  .serlist { max-height:150px; overflow:auto; padding:2px 0; flex:1 1 100%; display:flex; flex-wrap:wrap; gap:3px 14px; }
+  .ctools { display:flex; flex-wrap:wrap; gap:6px 8px; align-items:center; margin:8px 0 4px; }
+  .ctools .hint { color:var(--dim); font-size:12px; }
+  .ctools .zinfo { color:var(--accent); font-size:12px; }
+  .chartbox { position:relative; width:100%; height:clamp(330px, 54vh, 600px); background:#12141a; border:1px solid var(--line); border-radius:8px; overflow:hidden; cursor:grab; touch-action:none; user-select:none; }
+  .chartbox.big { height:84vh; }
+  .chartbox.drag { cursor:grabbing; }
+  .chartbox svg { display:block; }
+  .tip { position:absolute; pointer-events:none; background:#0b0d11ee; border:1px solid var(--line); border-radius:6px; padding:4px 9px; font-size:12px; line-height:1.35; white-space:nowrap; z-index:5; }
+  .bars { padding:6px 10px; }
+  .bh { color:var(--dim); font-size:12px; margin:8px 0 2px; text-transform:uppercase; letter-spacing:.04em; }
+  .bar { display:grid; grid-template-columns:minmax(110px,260px) 1fr 120px; gap:10px; align-items:center; padding:2px 0; }
+  .bar .bn { text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bar .bt { background:#1b1f27; border-radius:3px; height:16px; }
+  .bar .bt i { display:block; height:100%; border-radius:3px; min-width:2px; }
+  .bar .bv { color:var(--dim); font-size:12px; }
+  .flatwarn { background:#3a2f12; border:1px solid #6b5416; border-radius:6px; padding:6px 10px; margin:6px 0; color:var(--warn); font-size:13px; }
   @media (max-width:800px){ #layout{flex-direction:column;} #side{width:auto;position:static;max-height:220px;} }
 </style>
 </head>
@@ -103,7 +124,7 @@ function telemetryValues(t) {
 }
 const KINDS = {
   memory: {
-    title: 'Memory', logX: true,
+    title: 'Memory', logX: true, xLabel: 'buffer size', xFmt: v => humanSize(2 ** v),
     metrics: [['ns_per_access','Latency / access','ns'],['bandwidth','Bandwidth','GB/s'],['avg_run','Avg run','ms'],['p99_run','p99 run','ms'],['min_run','Best run','ms'],['runs','Runs','']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map(r => ({
       series: `${patternLabel(r.pattern)} · ${r.thread_count}T` + (r.cores && !String(r.cores).startsWith('All cores') ? ` · ${r.cores}` : ''),
@@ -124,7 +145,7 @@ const KINDS = {
     }); },
   },
   gpu: {
-    title: 'GPU (Vulkan compute)', logX: true,
+    title: 'GPU (Vulkan compute)', logX: true, xLabel: 'elements per dispatch', xFmt: v => humanCount(2 ** v),
     metrics: [['avg_ms','Avg dispatch','ms'],['p95_ms','p95 dispatch','ms'],['p99_ms','p99 dispatch','ms'],['min_ms','Best dispatch','ms'],['gops','Throughput','GOPS']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map(r => ({
       series: 'GPU compute', x: Math.log2(r.workload_size), xLabel: `${r.workload_size} elements`,
@@ -164,11 +185,13 @@ const state = {
   list: [],             // [{name, timestamp, test_type, app_version, valid, message}]
   docs: new Map(),      // name -> parsed VerifiedResult
   selected: [],         // names
-  hiddenSeries: new Set(), hiddenCols: new Set(), chartMetric: {},
-  opts: { zeroY: true, logY: false, markers: true },
-  sensorGroup: 'temps',
+  hiddenSeries: new Set(), hiddenCols: new Set(), chartMetrics: {}, filters: {}, wheelZoom: false,
+  optsBy: {},
+  sensorSel: null,
   serverMode: false,
 };
+
+const optsOf = k => (state.optsBy[k] ??= { zeroY: true, logY: false, markers: true });
 
 async function loadList() {
   const emb = JSON.parse($('#embedded').textContent || 'null');
@@ -243,62 +266,331 @@ function sectionsOf(doc) {
 const docLabel = (doc, name) => (doc.header.timestamp || name || '').replace('T', ' ').slice(5, 19);
 
 // ------------------------------------------------------------------------------------------------
-// charts (plain SVG)
+// line styles: colour per series, dash per value, marker + shade when the palette wraps
+// ------------------------------------------------------------------------------------------------
+const DASHES = ['', '9 4', '2 4', '11 4 2 4', '1 5', '15 5 3 5'];
+const SHAPES = ['circle', 'square', 'triangle', 'diamond', 'cross', 'star'];
+function shade(hex, variant) {
+  if (!variant) return hex;
+  const n = parseInt(hex.slice(1), 16), k = variant % 2 ? 0.4 : -0.35;
+  const f = c => Math.max(0, Math.min(255, Math.round(k > 0 ? c + (255 - c) * k : c * (1 + k))));
+  return '#' + [n >> 16, (n >> 8) & 255, n & 255].map(c => f(c).toString(16).padStart(2, '0')).join('');
+}
+// The 12 palette colours repeat for line 13 onwards: those lines get a lighter / darker shade, another
+// marker shape and (when only one value is charted) another dash pattern, so no two lines look alike.
+function seriesStyle(i) {
+  const variant = Math.floor(i / PALETTE.length);
+  return { color: shade(PALETTE[i % PALETTE.length], variant), variant, shape: SHAPES[variant % SHAPES.length], dash: DASHES[variant % DASHES.length] };
+}
+function markerSvg(shape, cx, cy, r, color) {
+  const f = `fill="${color}"`;
+  switch (shape) {
+    case 'square': return `<rect x="${cx - r}" y="${cy - r}" width="${2 * r}" height="${2 * r}" ${f}/>`;
+    case 'triangle': return `<polygon points="${cx},${cy - r - 1} ${cx + r + 1},${cy + r} ${cx - r - 1},${cy + r}" ${f}/>`;
+    case 'diamond': return `<polygon points="${cx},${cy - r - 1.5} ${cx + r + 1.5},${cy} ${cx},${cy + r + 1.5} ${cx - r - 1.5},${cy}" ${f}/>`;
+    case 'cross': return `<path d="M${cx - r} ${cy - r}L${cx + r} ${cy + r}M${cx + r} ${cy - r}L${cx - r} ${cy + r}" stroke="${color}" stroke-width="2" fill="none"/>`;
+    case 'star': return `<path d="M${cx} ${cy - r - 1}V${cy + r + 1}M${cx - r - 1} ${cy}H${cx + r + 1}M${cx - r} ${cy - r}L${cx + r} ${cy + r}M${cx + r} ${cy - r}L${cx - r} ${cy + r}" stroke="${color}" stroke-width="1.4" fill="none"/>`;
+    default: return `<circle cx="${cx}" cy="${cy}" r="${r}" ${f}/>`;
+  }
+}
+function swatch(color, shape, dash) {
+  return `<svg class="swl" width="28" height="12" viewBox="0 0 28 12"><line x1="1" x2="27" y1="6" y2="6" stroke="${color}" stroke-width="2" ${dash ? `stroke-dasharray="${dash}"` : ''}/>${markerSvg(shape, 14, 6, 3, color)}</svg>`;
+}
+const styleSwatch = i => { const st = seriesStyle(i); return swatch(st.color, st.shape, st.dash); };
+function humanCount(n) { return n >= 2 ** 20 ? (n / 2 ** 20).toFixed(n % 2 ** 20 ? 1 : 0) + ' M' : n >= 1024 ? (n / 1024).toFixed(0) + ' K' : String(Math.round(n)); }
+
+// ------------------------------------------------------------------------------------------------
+// charts (plain SVG): fills its container, zoom + pan, several values with their own axes
 // ------------------------------------------------------------------------------------------------
 function niceTicks(lo, hi, n = 6) {
   if (!(hi > lo)) return [lo];
   const span = hi - lo, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
   const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= step0) || step0;
-  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(12)); return out;
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9 && out.length < 200; v += step) out.push(+v.toFixed(12)); return out;
 }
-function drawChart(lines, o) {
-  // lines: [{name, color, pts:[[x,y]], labels?:Map}], o: {xLabel, yLabel, xFmt, logY, zeroY, markers, xTicks?}
-  const W = 940, H = 330, L = 64, R = 16, T = 12, B = 44;
-  let all = lines.flatMap(l => l.pts);
-  if (o.logY) all = all.filter(p => p[1] > 0).map(p => [p[0], Math.log10(p[1])]);
-  if (!all.length) return '<div style="padding:30px;color:var(--dim)">Nothing to plot for this selection.</div>';
-  let xmin = Math.min(...all.map(p => p[0])), xmax = Math.max(...all.map(p => p[0]));
-  let ymin = Math.min(...all.map(p => p[1])), ymax = Math.max(...all.map(p => p[1]));
-  if (o.zeroY && !o.logY) ymin = Math.min(0, ymin);
-  if (xmax === xmin) { xmin -= 0.5; xmax += 0.5; }
-  if (ymax === ymin) { ymax += Math.abs(ymax) * 0.1 || 1; ymin -= o.zeroY && !o.logY ? 0 : Math.abs(ymin) * 0.1; }
-  const pad = (ymax - ymin) * 0.06; ymax += pad; if (!(o.zeroY && !o.logY)) ymin -= pad;
-  const sx = x => L + (x - xmin) / (xmax - xmin) * (W - L - R);
-  const sy = y => H - B - (y - ymin) / (ymax - ymin) * (H - T - B);
-  let g = '';
-  for (const t of niceTicks(ymin, ymax)) {
-    const label = o.logY ? fmt(10 ** t) : fmt(t);
-    g += `<line x1="${L}" x2="${W - R}" y1="${sy(t)}" y2="${sy(t)}" stroke="#2a2f39"/><text x="${L - 6}" y="${sy(t) + 4}" text-anchor="end">${label}</text>`;
+// ticks (as log10 values) for a log axis: 1, 2, 5 x 10^n, or every integer digit when zoomed in far
+function logTicks(lo, hi) {
+  const out = [], sets = [[1, 2, 5], [1, 2, 3, 4, 5, 6, 7, 8, 9]];
+  for (const set of sets) {
+    out.length = 0;
+    for (let e = Math.floor(lo) - 1; e <= Math.ceil(hi) + 1 && out.length < 400; e++) for (const m of set) { const t = Math.log10(m * 10 ** e); if (t >= lo - 1e-9 && t <= hi + 1e-9) out.push(t); }
+    if (out.length >= 4 || set === sets[1]) break;
   }
-  const xt = o.xTicks ? o.xTicks.filter(t => t >= xmin - 1e-9 && t <= xmax + 1e-9) : niceTicks(xmin, xmax, 8);
-  for (const t of xt) g += `<line x1="${sx(t)}" x2="${sx(t)}" y1="${T}" y2="${H - B}" stroke="#20242c"/><text x="${sx(t)}" y="${H - B + 15}" text-anchor="middle">${esc(o.xFmt ? o.xFmt(t) : fmt(t))}</text>`;
-  g += `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="none" stroke="#3a404c"/>`;
-  g += `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">${esc(o.xLabel || '')}</text>`;
-  g += `<text transform="translate(14 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">${esc(o.yLabel || '')}${o.logY ? ' (log)' : ''}</text>`;
-  for (const l of lines) {
-    let pts = l.pts.slice().sort((a, b) => a[0] - b[0]);
-    if (o.logY) pts = pts.filter(p => p[1] > 0).map(p => [p[0], Math.log10(p[1])]);
-    if (!pts.length) continue;
-    g += `<polyline fill="none" stroke="${l.color}" stroke-width="1.8" points="${pts.map(p => sx(p[0]).toFixed(1) + ',' + sy(p[1]).toFixed(1)).join(' ')}"/>`;
-    if (o.markers) for (const p of pts) {
-      const raw = o.logY ? 10 ** p[1] : p[1];
-      g += `<circle cx="${sx(p[0]).toFixed(1)}" cy="${sy(p[1]).toFixed(1)}" r="3.2" fill="${l.color}"><title>${esc(l.name)}\n${esc(o.xFmt ? o.xFmt(p[0]) : fmt(p[0]))}: ${fmt(raw)}</title></circle>`;
+  return out;
+}
+const views = {};              // chart id -> { x:[lo,hi]|null, y:[f0,f1]|null, ysig }
+const liveCharts = new Map();  // chart id -> Chart
+const pendingSpecs = new Map();
+
+class Chart {
+  constructor(el, spec) {
+    this.el = el; this.spec = spec; this.hlSeries = null; this.pointers = new Map(); this.drag = null;
+    const v = views[spec.id] || {};
+    this.view = { x: v.x || null, y: v.ysig === spec.ysig ? (v.y || null) : null, ysig: spec.ysig };
+    views[spec.id] = this.view;
+    el.innerHTML = '<div class="svghost"></div><div class="tip" hidden></div>';
+    this.host = el.firstChild; this.tip = el.lastChild;
+    this.domains();
+    this.ro = new ResizeObserver(() => { cancelAnimationFrame(this.raf); this.raf = requestAnimationFrame(() => this.draw()); });
+    this.ro.observe(el);
+    el.addEventListener('wheel', this.onWheel = e => this.wheel(e), { passive: false });
+    el.addEventListener('pointerdown', this.onDown = e => this.down(e));
+    el.addEventListener('pointermove', this.onMove = e => this.move(e));
+    el.addEventListener('pointerup', this.onUp = e => this.up(e));
+    el.addEventListener('pointercancel', this.onUp);
+    el.addEventListener('pointerleave', this.onLeave = () => { if (!this.drag) { this.tip.hidden = true; this.setHighlight(null); } });
+    this.draw();
+  }
+  destroy() {
+    this.ro.disconnect(); cancelAnimationFrame(this.raf);
+    const el = this.el;
+    el.removeEventListener('wheel', this.onWheel); el.removeEventListener('pointerdown', this.onDown); el.removeEventListener('pointermove', this.onMove);
+    el.removeEventListener('pointerup', this.onUp); el.removeEventListener('pointercancel', this.onUp); el.removeEventListener('pointerleave', this.onLeave);
+  }
+  tr(y) { return this.spec.logY ? (y > 0 ? Math.log10(y) : null) : y; }
+  domains() {
+    const s = this.spec; let xlo = Infinity, xhi = -Infinity;
+    const ylo = s.axes.map(() => Infinity), yhi = s.axes.map(() => -Infinity);
+    for (const l of s.lines) for (const p of l.pts) {
+      if (p[0] < xlo) xlo = p[0]; if (p[0] > xhi) xhi = p[0];
+      const y = this.tr(p[1]); if (y === null) continue;
+      if (y < ylo[l.axis]) ylo[l.axis] = y; if (y > yhi[l.axis]) yhi[l.axis] = y;
     }
+    this.empty = xlo === Infinity;
+    if (xhi === xlo) { xlo -= 0.5; xhi += 0.5; }
+    const px = (xhi - xlo) * 0.025; this.fx = [xlo - px, xhi + px];
+    const zero = s.zeroY && !s.logY;
+    this.fy = s.axes.map((_, k) => {
+      let lo = ylo[k], hi = yhi[k];
+      if (lo === Infinity) { lo = 0; hi = 1; }
+      if (zero) lo = Math.min(0, lo);
+      if (hi === lo) { hi += Math.abs(hi) * 0.1 || 1; if (!zero) lo -= Math.abs(lo) * 0.1; }
+      const pad = (hi - lo) * 0.06; hi += pad; if (!zero) lo -= pad;
+      return [lo, hi];
+    });
   }
-  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px">${g}</svg>`;
+  reset() { this.view.x = null; this.view.y = null; this.draw(); }
+  setX(lo, hi) {
+    const [flo, fhi] = this.fx, full = fhi - flo;
+    let span = hi - lo;
+    if (span >= full * 0.999) { this.view.x = null; return; }
+    span = Math.max(span, full * 1e-6);
+    lo = Math.min(Math.max(lo, flo), fhi - span); this.view.x = [lo, lo + span];
+  }
+  setY(lo, hi) {
+    let span = hi - lo;
+    if (span >= 0.999) { this.view.y = null; return; }
+    span = Math.max(span, 1e-4);
+    lo = Math.min(Math.max(lo, 0), 1 - span); this.view.y = [lo, lo + span];
+  }
+  zoomAt(p, f, ax = { x: true, y: true }) {
+    const g = this.geo;
+    if (ax.x) { const [lo, hi] = this.xr, c = lo + (p.x - g.L) / g.pw * (hi - lo); this.setX(c - (c - lo) * f, c + (hi - c) * f); }
+    if (ax.y) { const [y0, y1] = this.view.y || [0, 1], u = Math.max(0, Math.min(1, 1 - (p.y - g.T) / g.ph)), c = y0 + u * (y1 - y0); this.setY(c - (c - y0) * f, c + (y1 - c) * f); }
+    this.draw();
+  }
+  zoomCenter(f) { const g = this.geo; this.zoomAt({ x: g.L + g.pw / 2, y: g.T + g.ph / 2 }, f); }
+  panBy(dx, dy) {
+    const g = this.geo;
+    if (this.view.x) { const s = this.view.x[1] - this.view.x[0], d = -dx / g.pw * s; this.setX(this.view.x[0] + d, this.view.x[1] + d); }
+    if (this.view.y) { const s = this.view.y[1] - this.view.y[0], d = dy / g.ph * s; this.setY(this.view.y[0] + d, this.view.y[1] + d); }
+    this.draw();
+  }
+  local(e) { const r = this.el.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
+  inPlot(p) { const g = this.geo; return p.x >= g.L && p.x <= g.L + g.pw && p.y >= g.T && p.y <= g.T + g.ph; }
+  wheel(e) {
+    if (this.empty) return;
+    const p = this.local(e);
+    if (!this.inPlot(p) || !(e.ctrlKey || e.metaKey || state.wheelZoom)) return;   // otherwise the page scrolls
+    e.preventDefault();
+    const f = Math.exp(Math.max(-200, Math.min(200, e.deltaY)) * 0.002);
+    this.zoomAt(p, f, { x: !e.altKey, y: !e.shiftKey });
+  }
+  down(e) {
+    if (e.button !== 0 && e.button !== 1) return;
+    const p = this.local(e); if (!this.inPlot(p)) return;
+    // double press = reset (a real dblclick event is lost because every redraw replaces the svg)
+    const now = performance.now(), ld = this.lastDown;
+    if (ld && now - ld.t < 400 && Math.hypot(p.x - ld.x, p.y - ld.y) < 8) { this.lastDown = null; this.pointers.clear(); this.drag = null; this.el.classList.remove('drag'); this.reset(); return; }
+    this.lastDown = { t: now, x: p.x, y: p.y };
+    this.el.setPointerCapture(e.pointerId);
+    this.pointers.set(e.pointerId, p);
+    if (this.pointers.size === 1) { this.drag = { mode: e.shiftKey ? 'box' : 'pan', start: p, last: p }; this.el.classList.add('drag'); this.tip.hidden = true; }
+    else { this.drag = { mode: 'pinch' }; }
+  }
+  move(e) {
+    const p = this.local(e);
+    if (this.pointers.has(e.pointerId)) {
+      const prev = this.pointers.get(e.pointerId); this.pointers.set(e.pointerId, p);
+      if (this.pointers.size >= 2) {
+        const [a, b] = [...this.pointers.values()], other = [...this.pointers.entries()].find(([id]) => id !== e.pointerId)[1];
+        const d1 = Math.hypot(prev.x - other.x, prev.y - other.y) || 1, d2 = Math.hypot(p.x - other.x, p.y - other.y) || 1;
+        this.zoomAt({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, d1 / d2);
+      } else if (this.drag && this.drag.mode === 'pan') {
+        this.panBy(p.x - this.drag.last.x, p.y - this.drag.last.y); this.drag.last = p;
+      } else if (this.drag && this.drag.mode === 'box') { this.drag.last = p; this.drawOverlay(); }
+      return;
+    }
+    if (!this.drag) this.hover(p);
+  }
+  up(e) {
+    if (this.drag && this.drag.mode === 'box' && this.pointers.size === 1) {
+      const a = this.drag.start, b = this.drag.last, g = this.geo;
+      if (Math.abs(a.x - b.x) > 6 && Math.abs(a.y - b.y) > 6) {
+        const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x), y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y), [lo, hi] = this.xr, [v0, v1] = this.view.y || [0, 1];
+        const fx = x => lo + (Math.min(Math.max(x, g.L), g.L + g.pw) - g.L) / g.pw * (hi - lo);
+        const fy = y => v0 + (1 - (Math.min(Math.max(y, g.T), g.T + g.ph) - g.T) / g.ph) * (v1 - v0);
+        this.setX(fx(x0), fx(x1)); this.setY(fy(y1), fy(y0));
+      }
+    }
+    const wasBox = this.drag && this.drag.mode === 'box';
+    this.pointers.delete(e.pointerId);
+    if (!this.pointers.size) { this.drag = null; this.el.classList.remove('drag'); }
+    if (wasBox) this.draw();
+  }
+  setHighlight(name, pt) { this.hlSeries = name; this.hlPoint = pt || null; this.drawOverlay(); }
+  hover(p) {
+    if (!this.hit || !this.inPlot(p)) { this.tip.hidden = true; this.setHighlight(null); return; }
+    let best = null, bd = 22 * 22;
+    for (const h of this.hit) { const d = (h.x - p.x) ** 2 + (h.y - p.y) ** 2; if (d < bd) { bd = d; best = h; } }
+    if (!best) { this.tip.hidden = true; this.setHighlight(null); return; }
+    const s = this.spec, l = best.line;
+    this.tip.innerHTML = `<b style="color:${l.color}">${esc(l.series)}</b><br>${esc(l.metric)}<br>${esc(s.xFmt ? s.xFmt(best.p[0]) : fmt(best.p[0]))}: <b>${fmt(best.p[1], l.unit)}</b>`;
+    this.tip.hidden = false;
+    const tw = this.tip.offsetWidth, th = this.tip.offsetHeight;
+    this.tip.style.left = Math.min(Math.max(4, best.x + 14), this.W - tw - 4) + 'px';
+    this.tip.style.top = Math.min(Math.max(4, best.y - th - 10), this.H - th - 4) + 'px';
+    this.setHighlight(l.series, best);
+  }
+  ticksX(xr, pw) {
+    const s = this.spec; let xt;
+    if (s.xInt) { xt = []; for (let v = Math.ceil(xr[0] - 1e-9); v <= Math.floor(xr[1] + 1e-9) && xt.length < 300; v++) xt.push(v); }
+    else if (s.xTicks) xt = s.xTicks.filter(t => t >= xr[0] - 1e-9 && t <= xr[1] + 1e-9);
+    if (!xt || xt.length < 2) xt = niceTicks(xr[0], xr[1], Math.max(3, Math.round(pw / 90)));
+    const out = []; let last = -1e9;
+    for (const t of xt) { const px = (t - xr[0]) / (xr[1] - xr[0]) * pw; if (px - last >= 62) { out.push(t); last = px; } }
+    return out;
+  }
+  draw() {
+    const s = this.spec, el = this.el;
+    const W = Math.max(320, el.clientWidth), H = Math.max(220, el.clientHeight);
+    this.W = W; this.H = H;
+    const nAx = s.axes.length, AX = 64, L = 68, R = 14 + Math.max(0, nAx - 1) * AX, T = 10, B = 42;
+    const pw = W - L - R, ph = H - T - B;
+    this.geo = { L, R, T, B, pw, ph };
+    if (this.empty || !s.lines.length) { this.host.innerHTML = '<div style="padding:30px;color:var(--dim)">Nothing to plot for this selection.</div>'; this.hit = null; this.updateInfo(); return; }
+    const xr = this.view.x || this.fx, yf = this.view.y || [0, 1];
+    this.xr = xr;
+    const dom = this.fy.map(d => [d[0] + (d[1] - d[0]) * yf[0], d[0] + (d[1] - d[0]) * yf[1]]);
+    const sx = x => L + (x - xr[0]) / (xr[1] - xr[0]) * pw;
+    const sy = (k, y) => T + ph - (y - dom[k][0]) / (dom[k][1] - dom[k][0]) * ph;
+    const sid = 'cp' + s.id.replace(/\W/g, '_');
+    let g = `<defs><clipPath id="${sid}"><rect x="${L}" y="${T}" width="${pw}" height="${ph}"/></clipPath></defs>`;
+    const yTicks = k => s.logY ? logTicks(dom[k][0], dom[k][1]) : niceTicks(dom[k][0], dom[k][1], Math.max(3, Math.round(ph / 46)));
+    const yLabel = t => s.logY ? fmt(10 ** t) : fmt(t);
+    // grid follows the first axis
+    for (const t of yTicks(0)) g += `<line x1="${L}" x2="${L + pw}" y1="${sy(0, t).toFixed(1)}" y2="${sy(0, t).toFixed(1)}" stroke="#2a2f39"/>`;
+    for (const t of this.ticksX(xr, pw)) g += `<line x1="${sx(t).toFixed(1)}" x2="${sx(t).toFixed(1)}" y1="${T}" y2="${T + ph}" stroke="#20242c"/><text x="${sx(t).toFixed(1)}" y="${T + ph + 15}" text-anchor="middle">${esc(s.xFmt ? s.xFmt(t) : fmt(t))}</text>`;
+    g += `<rect x="${L}" y="${T}" width="${pw}" height="${ph}" fill="none" stroke="#3a404c"/>`;
+    g += `<text x="${L + pw / 2}" y="${H - 6}" text-anchor="middle">${esc(s.xLabel || '')}</text>`;
+    s.axes.forEach((ax, k) => {
+      const ticks = yTicks(k), right = k > 0, base = right ? L + pw + (k - 1) * AX : L;
+      if (right) g += `<line x1="${base}" x2="${base}" y1="${T}" y2="${T + ph}" stroke="#3a404c"/>`;
+      for (const t of ticks) {
+        const y = sy(k, t).toFixed(1);
+        g += right ? `<line x1="${base}" x2="${base + 4}" y1="${y}" y2="${y}" stroke="#3a404c"/><text x="${base + 7}" y="${+y + 4}">${yLabel(t)}</text>` : `<text x="${L - 6}" y="${+y + 4}" text-anchor="end">${yLabel(t)}</text>`;
+      }
+      const title = (ax.label + (s.logY ? ' (log)' : '')).slice(0, Math.max(12, Math.floor(ph / 6.2)));
+      const tx = right ? base + AX - 10 : 14;
+      g += `<text transform="translate(${tx} ${T + ph / 2}) rotate(${right ? 90 : -90})" text-anchor="middle">${esc(title)}</text>`;
+    });
+    // lines
+    let body = '', markers = '', total = 0; this.hit = []; this.screen = new Map();
+    for (const l of s.lines) total += l.pts.length;
+    const drawMarkers = s.markers && total <= 6000;
+    s.lines.forEach((l, li) => {
+      const pts = [];
+      for (const p of l.pts) { const y = this.tr(p[1]); if (y === null) continue; pts.push([sx(p[0]), sy(l.axis, y), p]); }
+      this.screen.set(li, pts);
+      if (!pts.length) return;
+      body += `<polyline fill="none" stroke="${l.color}" stroke-width="1.7" stroke-linejoin="round" ${l.dash ? `stroke-dasharray="${l.dash}"` : ''} points="${pts.map(q => q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(' ')}"/>`;
+      for (const q of pts) {
+        if (q[0] < L - 4 || q[0] > L + pw + 4 || q[1] < T - 4 || q[1] > T + ph + 4) continue;
+        this.hit.push({ x: q[0], y: q[1], p: q[2], line: l, li });
+        if (drawMarkers) markers += markerSvg(l.shape, +q[0].toFixed(1), +q[1].toFixed(1), 3.3, l.color);
+      }
+    });
+    g += `<g clip-path="url(#${sid})">${body}${markers}</g><g id="ov" clip-path="url(#${sid})"></g>`;
+    if (s.legend && s.legend.length) {
+      const rowH = 15, lw = Math.min(pw - 20, Math.max(...s.legend.map(e => e.label.length)) * 6.3 + 48);
+      g += `<g><rect x="${L + 8}" y="${T + 6}" width="${lw}" height="${s.legend.length * rowH + 6}" rx="5" fill="#12141ad9" stroke="#343a46"/>` + s.legend.map((e, i) => {
+        const y = T + 6 + 3 + i * rowH + rowH / 2;
+        return `<line x1="${L + 14}" x2="${L + 38}" y1="${y}" y2="${y}" stroke="${e.color}" stroke-width="2" ${e.dash ? `stroke-dasharray="${e.dash}"` : ''}/><text x="${L + 44}" y="${y + 4}" style="fill:var(--text)">${esc(e.label)}${s.axes.length > 1 ? (e.axis === 0 ? '  ◀' : '  ▶') : ''}</text>`;
+      }).join('') + '</g>';
+    }
+    this.host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`;
+    this.drawOverlay(); this.updateInfo();
+  }
+  drawOverlay() {
+    const ov = this.host.querySelector('#ov'); if (!ov) return;
+    const { L, T, pw, ph } = this.geo; let h = '';
+    if (this.hlSeries !== null) {
+      this.spec.lines.forEach((l, li) => {
+        if (l.series !== this.hlSeries) return;
+        const pts = this.screen.get(li) || []; if (pts.length < 1) return;
+        h += `<polyline fill="none" stroke="${l.color}" stroke-width="3.4" stroke-linejoin="round" ${l.dash ? `stroke-dasharray="${l.dash}"` : ''} points="${pts.map(q => q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(' ')}"/>`;
+      });
+      if (this.hlPoint) h += `<circle cx="${this.hlPoint.x}" cy="${this.hlPoint.y}" r="6.5" fill="none" stroke="#fff" stroke-width="1.6"/>`;
+    }
+    if (this.drag && this.drag.mode === 'box' && this.drag.last) {
+      const a = this.drag.start, b = this.drag.last;
+      h += `<rect x="${Math.min(a.x, b.x)}" y="${Math.min(a.y, b.y)}" width="${Math.abs(a.x - b.x)}" height="${Math.abs(a.y - b.y)}" fill="#5ab0ff33" stroke="#5ab0ff"/>`;
+    }
+    ov.innerHTML = h;
+  }
+  updateInfo() {
+    const z = document.querySelector(`[data-zinfo="${CSS.escape(this.spec.id)}"]`); if (!z) return;
+    const fx = this.view.x ? (this.fx[1] - this.fx[0]) / (this.view.x[1] - this.view.x[0]) : 1, fy = this.view.y ? 1 / (this.view.y[1] - this.view.y[0]) : 1;
+    z.textContent = fx > 1.01 || fy > 1.01 ? `zoom ×${fx.toFixed(1)} horizontal · ×${fy.toFixed(1)} vertical` : '';
+  }
+  svgText() {
+    const svg = this.host.querySelector('svg'); if (!svg) return '';
+    const c = svg.cloneNode(true); c.querySelector('#ov')?.remove();
+    c.insertAdjacentHTML('afterbegin', `<style>text{fill:#8b93a3;font:11px system-ui,sans-serif}</style><rect width="100%" height="100%" fill="#12141a"/>`);
+    return new XMLSerializer().serializeToString(c);
+  }
 }
 
-function drawBars(items, o) {
-  // items: [{name, color, value}] -> horizontal bars, one per line (used when every line has a single point)
-  const rowH = 30, L = 210, R = 90, T = 8, W = 940, H = T * 2 + items.length * rowH;
+function mountCharts(root) {
+  root.querySelectorAll('.chartbox[data-chart]').forEach(el => {
+    const id = el.dataset.chart, spec = pendingSpecs.get(id); if (!spec) return;
+    liveCharts.get(id)?.destroy();
+    liveCharts.set(id, new Chart(el, spec));
+  });
+  root.querySelectorAll('[data-z]').forEach(b => b.onclick = () => {
+    const c = liveCharts.get(b.dataset.for); if (!c) return;
+    const a = b.dataset.z;
+    if (a === 'in') c.zoomCenter(0.6); if (a === 'out') c.zoomCenter(1 / 0.6); if (a === 'reset') c.reset();
+    if (a === 'big') { c.el.classList.toggle('big'); b.textContent = c.el.classList.contains('big') ? '⤡ shrink' : '⤢ expand'; c.draw(); }
+    if (a === 'svg') download(c.spec.id.replace(/\W/g, '_') + '.svg', c.svgText(), 'image/svg+xml');
+  });
+  root.querySelectorAll('[data-wheel]').forEach(cb => cb.onchange = () => { state.wheelZoom = cb.checked; document.querySelectorAll('[data-wheel]').forEach(o => o.checked = cb.checked); });
+  root.querySelectorAll('[data-hl]').forEach(el => {
+    el.onmouseenter = () => liveCharts.get(el.dataset.for)?.setHighlight(el.dataset.hl);
+    el.onmouseleave = () => liveCharts.get(el.dataset.for)?.setHighlight(null);
+  });
+}
+
+function chartTools(id) {
+  return `<div class="ctools"><button class="small" data-z="in" data-for="${esc(id)}" title="Zoom in">＋</button><button class="small" data-z="out" data-for="${esc(id)}" title="Zoom out">－</button>` +
+    `<button class="small" data-z="reset" data-for="${esc(id)}">⟲ reset zoom</button><button class="small" data-z="big" data-for="${esc(id)}">⤢ expand</button><button class="small" data-z="svg" data-for="${esc(id)}" title="Save the chart as it is shown">SVG</button>` +
+    `<label class="chk" title="Otherwise hold Ctrl while scrolling"><input type="checkbox" data-wheel ${state.wheelZoom ? 'checked' : ''}>zoom with the mouse wheel</label>` +
+    `<span class="hint">Ctrl + wheel or ＋/－ = zoom · drag = pan · Shift + drag = box zoom · double-click = reset · hover a point for its value</span><span class="zinfo" data-zinfo="${esc(id)}"></span></div>`;
+}
+
+function barsHtml(items, unit) {
   const max = Math.max(...items.map(i => i.value), 0) || 1;
-  const bars = items.map((it, k) => {
-    const w = Math.max(1, it.value / max * (W - L - R)), y = T + k * rowH;
-    return `<text x="${L - 8}" y="${y + 19}" text-anchor="end" style="fill:var(--text)">${esc(it.name)}</text>` +
-      `<rect x="${L}" y="${y + 4}" width="${w.toFixed(1)}" height="${rowH - 10}" rx="3" fill="${it.color}"><title>${esc(it.name)}: ${fmt(it.value)}</title></rect>` +
-      `<text x="${L + w + 6}" y="${y + 19}">${fmt(it.value, o.unit)}</text>`;
-  }).join('');
-  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px">${bars}</svg>`;
+  return '<div class="bars">' + items.map(it => `<div class="bar"><span class="bn" title="${esc(it.name)}">${esc(it.name)}</span><span class="bt"><i style="width:${Math.max(0.3, it.value / max * 100).toFixed(2)}%;background:${it.color}"></i></span><span class="bv">${fmt(it.value, unit)}</span></div>`).join('') + '</div>';
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -313,6 +605,15 @@ function download(name, text, type = 'text/plain') {
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); URL.revokeObjectURL(a.href);
 }
 
+// A temperature that is identical in every test is not a live reading (Windows: fixed ACPI thermal zone)
+function flatTempWarning(rows) {
+  const v = rows.map(r => r.values.cpu_temp_max).filter(x => x != null);
+  if (v.length >= 6 && Math.max(...v) - Math.min(...v) < 0.05) {
+    return `<div class="flatwarn">⚠ CPU temperature reads ${fmt(v[0])} °C in all ${v.length} tests. If the CPU was busy that is almost certainly a fixed ACPI thermal-zone value, not the real CPU temperature. On Windows, real per-core temperatures need LibreHardwareMonitor or OpenHardwareMonitor running while the tests run.</div>`;
+  }
+  return '';
+}
+
 function kindSection(kindKey, entries) {
   // entries: [{label, sec}] one per selected result
   const kind = KINDS[kindKey];
@@ -322,37 +623,70 @@ function kindSection(kindKey, entries) {
   const metrics = kind.metrics.filter(m => rows.some(r => r.values[m[0]] !== undefined && r.values[m[0]] !== null));
   const hid = (k) => state.hiddenSeries.has(kindKey + ':' + k), hidc = (k) => state.hiddenCols.has(kindKey + ':' + k);
   const shownMetrics = metrics.filter(m => !hidc(m[0]));
-  let cur = shownMetrics.find(m => m[0] === state.chartMetric[kindKey]) || shownMetrics[0];
-  const id = 'sec_' + kindKey;
+  let chosen = (state.chartMetrics[kindKey] || []).filter(k => shownMetrics.some(m => m[0] === k));
+  if (!chosen.length && shownMetrics.length) chosen = [shownMetrics[0][0]];
+  const chosenMetrics = shownMetrics.filter(m => chosen.includes(m[0]));   // catalogue order keeps dashes stable
+  const id = 'sec_' + kindKey, o = optsOf(kindKey);
   const visRows = rows.filter(r => !hid(r.series));
+  const q = (state.filters[kindKey] || '').toLowerCase();
   let html = `<h2>${esc(kind.title)} <span class="badge">${rows.length} result rows</span></h2>`;
   if (kindKey === 'memory' && entries.some(e => e.sec.complete === false)) html += `<div class="warn">⚠ The run was stopped early: ${entries.map(e => e.sec.tests_done + ' of ' + e.sec.tests_planned + ' tests').join(', ')} were completed.</div>`;
   if (kindKey === 'cpu') html += slowCoreNotes(rows);
+  html += flatTempWarning(rows);
   html += `<div class="card" id="${id}">`;
-  html += `<div class="row"><b>Lines:</b> <button class="small" data-act="ser-all">all</button><button class="small" data-act="ser-none">none</button> ` +
-    series.map((s, i) => `<label class="chk"><input type="checkbox" data-ser="${esc(s)}" ${hid(s) ? '' : 'checked'}><span class="sw" style="background:${colorOf(i)}"></span>${esc(s)}</label>`).join('') + '</div>';
+  html += `<div class="row"><b>Lines:</b> <button class="small" data-act="ser-all">all</button><button class="small" data-act="ser-none">none</button><button class="small" data-act="ser-only" title="Show only the lines matching the filter">only matching</button>` +
+    `<input type="text" data-serfilter placeholder="filter lines (e.g. Stream, 12T)" value="${esc(state.filters[kindKey] || '')}" style="min-width:200px"><span style="color:var(--dim);font-size:12px">${series.length - series.filter(hid).length} of ${series.length} shown</span>` +
+    `<div class="serlist">` +
+    series.map((s, i) => `<label class="chk" data-serlabel="${esc(s.toLowerCase())}" data-hl="${esc(s)}" data-for="chart_${kindKey}" ${q && !s.toLowerCase().includes(q) ? 'style="display:none"' : ''}><input type="checkbox" data-ser="${esc(s)}" ${hid(s) ? '' : 'checked'}>${styleSwatch(i)}${esc(s)}</label>`).join('') + '</div></div>';
   html += `<details><summary>Show / hide values (columns)</summary><div class="row"><button class="small" data-act="col-all">all</button><button class="small" data-act="col-none">none</button><button class="small" data-act="col-perf">performance only</button><button class="small" data-act="col-sens">sensors only</button></div><div class="row">` +
     metrics.map(m => `<label class="chk"><input type="checkbox" data-col="${m[0]}" ${hidc(m[0]) ? '' : 'checked'}>${esc(m[1])} <span style="color:var(--dim)">(${esc(m[2])})</span></label>`).join('') + '</div></details>';
-  if (cur) {
-    html += `<div class="row"><b>Chart:</b> <select data-metric>${shownMetrics.map(m => `<option value="${m[0]}" ${m[0] === cur[0] ? 'selected' : ''}>${esc(m[1])} (${esc(m[2])})</option>`).join('')}</select>` +
-      `<label class="chk"><input type="checkbox" data-opt="zeroY" ${state.opts.zeroY ? 'checked' : ''}>start Y at 0</label><label class="chk"><input type="checkbox" data-opt="logY" ${state.opts.logY ? 'checked' : ''}>log Y</label><label class="chk"><input type="checkbox" data-opt="markers" ${state.opts.markers ? 'checked' : ''}>markers</label></div>`;
-    const lines = series.map((s, i) => ({ name: s, color: colorOf(i), pts: rows.filter(r => r.series === s && r.values[cur[0]] != null).map(r => [r.x, r.values[cur[0]]]) })).filter(l => !hid(l.name));
-    const xs = [...new Set(rows.map(r => r.x))].sort((a, b) => a - b);
-    const labelAt = new Map(rows.map(r => [Math.round(r.x * 1000), r.xLabel]));
-    const allSingle = lines.length > 0 && lines.every(l => l.pts.length === 1);
-    if (allSingle) {
-      // one value per line: bars read better than isolated dots
-      const items = lines.map(l => ({ name: l.name, color: l.color, value: l.pts[0][1] }));
-      html += `<div class="chartwrap" style="padding:6px 0">${drawBars(items, { unit: cur[2] })}</div>`;
-    } else html += `<div class="chartwrap">${drawChart(lines, {
-      xLabel: kind.logX ? 'size' : (kindKey === 'cpu' ? 'core' : ''), yLabel: `${cur[1]} (${cur[2]})`, logY: state.opts.logY, zeroY: state.opts.zeroY, markers: state.opts.markers,
-      xFmt: kind.logX ? (v => humanSize(2 ** v)) : (v => labelAt.get(Math.round(v * 1000)) ?? fmt(v)),
-      xTicks: xs.length <= 24 ? xs : undefined,
-    })}</div>`;
+  const bySeries = new Map(); rows.forEach(r => { if (!bySeries.has(r.series)) bySeries.set(r.series, []); bySeries.get(r.series).push(r); });
+  if (chosenMetrics.length) {
+    const many = chosenMetrics.length > 1;
+    const visCount = series.filter(s => !hid(s)).length;
+    // one line only (e.g. the GPU test): colour by value, otherwise colour = line and dash = value
+    const byValueColor = many && visCount === 1;
+    const valueColor = mi => byValueColor ? PALETTE[mi % PALETTE.length] : '#c8ccd6';
+    html += `<div class="row"><b>Chart values:</b> ` + shownMetrics.map(m => {
+      const mi = chosenMetrics.indexOf(m), on = mi >= 0;
+      return `<label class="chip ${on ? 'on' : ''}" title="Tick several to overlay them; values with different units get their own axis"><input type="checkbox" data-mchip="${m[0]}" ${on ? 'checked' : ''}>${on && many ? swatch(valueColor(mi), 'circle', DASHES[mi % DASHES.length]) : ''}${esc(m[1])} <span style="color:var(--dim)">(${esc(m[2])})</span></label>`;
+    }).join('') + '</div>';
+    html += `<div class="row"><b>Chart:</b><label class="chk"><input type="checkbox" data-opt="zeroY" ${o.zeroY ? 'checked' : ''}>start Y at 0</label><label class="chk"><input type="checkbox" data-opt="logY" ${o.logY ? 'checked' : ''}>log Y</label><label class="chk"><input type="checkbox" data-opt="markers" ${o.markers ? 'checked' : ''}>markers</label>` +
+      (many ? '<span style="color:var(--dim);font-size:12px">one dash pattern per value · colours are the lines above · values with different units share the chart but each unit has its own axis (first on the left, others on the right)</span>' : '') + '</div>';
+    const visSeries = series.filter(s => !hid(s));
+    const singles = visSeries.length > 0 && visSeries.every(s => bySeries.get(s).length <= 1);
+    if (singles) {
+      // one value per line: bars read better than isolated dots; one block per chosen value
+      html += '<div class="chartwrap">' + chosenMetrics.map(m => {
+        const items = visSeries.map(s => ({ name: s, color: seriesStyle(series.indexOf(s)).color, value: (bySeries.get(s)[0].values[m[0]]) })).filter(i => i.value != null);
+        return (chosenMetrics.length > 1 ? `<div class="bh" style="padding:0 10px">${esc(m[1])} (${esc(m[2])})</div>` : '') + barsHtml(items, m[2]);
+      }).join('') + '</div>';
+    } else {
+      const units = [...new Set(chosenMetrics.map(m => m[2]))];
+      const axes = units.map(u => { const ms = chosenMetrics.filter(m => m[2] === u); return { unit: u, label: ms.length <= 2 ? ms.map(m => m[1]).join(' · ') + (u ? ` (${u})` : '') : (u || 'value') }; });
+      const lines = [];
+      visSeries.forEach(s => {
+        const st = seriesStyle(series.indexOf(s));
+        chosenMetrics.forEach((m, mi) => {
+          const pts = bySeries.get(s).filter(r => r.values[m[0]] != null).map(r => [r.x, r.values[m[0]], r.xLabel]).sort((a, b) => a[0] - b[0]);
+          if (pts.length) lines.push({ series: s, metric: `${m[1]} (${m[2]})`, unit: m[2], name: s, color: byValueColor ? valueColor(mi) : st.color, shape: st.shape, dash: many ? DASHES[mi % DASHES.length] : st.dash, axis: units.indexOf(m[2]), pts });
+        });
+      });
+      const xs = [...new Set(rows.map(r => r.x))].sort((a, b) => a - b);
+      const labelAt = new Map(rows.map(r => [Math.round(r.x * 1000), r.xLabel]));
+      const cid = 'chart_' + kindKey;
+      pendingSpecs.set(cid, {
+        id: cid, lines, axes, legend: many ? chosenMetrics.map((m, mi) => ({ label: `${m[1]} (${m[2]})`, color: valueColor(mi), dash: DASHES[mi % DASHES.length], axis: units.indexOf(m[2]) })) : null, ysig: chosenMetrics.map(m => m[0]).join('|') + '|' + o.zeroY + o.logY,
+        xLabel: kind.xLabel || (kindKey === 'cpu' ? 'core' : ''), logY: o.logY, zeroY: o.zeroY, markers: o.markers,
+        xFmt: kind.xFmt ? kind.xFmt : (v => labelAt.get(Math.round(v * 1000)) ?? fmt(v)),
+        xInt: !!kind.logX, xTicks: !kind.logX && xs.length <= 40 ? xs : undefined,
+      });
+      html += chartTools(cid) + `<div class="chartbox" data-chart="${cid}"></div>`;
+    }
   } else html += '<div style="color:var(--dim)">All values are hidden.</div>';
   html += `<div class="row"><span style="color:var(--dim)">${visRows.length} rows</span><button class="small" data-act="csv">Copy CSV</button><button class="small" data-act="dl-csv">Download CSV</button></div>`;
   html += `<div class="scroll"><table><thead><tr><th>Line</th><th>At</th>${shownMetrics.map(m => `<th>${esc(m[1])} (${esc(m[2])})</th>`).join('')}</tr></thead><tbody>` +
-    visRows.map(r => `<tr><td><span class="sw" style="background:${colorOf(series.indexOf(r.series))}"></span> ${esc(r.series)}</td><td>${esc(r.xLabel)}</td>${shownMetrics.map(m => `<td>${fmt(r.values[m[0]])}</td>`).join('')}</tr>`).join('') + '</tbody></table></div>';
+    visRows.map(r => `<tr><td>${styleSwatch(series.indexOf(r.series))}${esc(r.series)}</td><td>${esc(r.xLabel)}</td>${shownMetrics.map(m => `<td>${fmt(r.values[m[0]])}</td>`).join('')}</tr>`).join('') + '</tbody></table></div>';
   html += '</div>';
   return { html, rows, shownMetrics, kindKey, series, metrics };
 }
@@ -369,22 +703,48 @@ function slowCoreNotes(rows) {
   return out;
 }
 
+const SENSOR_DEFS = [
+  ['cpu_package_c', 'CPU package', '°C'], ['hottest_core_c', 'Hottest core', '°C'], ['gpu_temp_c', 'GPU temperature', '°C'],
+  ['cpu_freq_avg_mhz', 'CPU clock (avg)', 'MHz'], ['cpu_load_pct', 'CPU load', '%'], ['gpu_util_pct', 'GPU load', '%'],
+  ['gpu_power_w', 'GPU power', 'W'], ['ram_used_mb', 'RAM used', 'MB'], ['vram_used_mb', 'VRAM used', 'MB'],
+];
+const SENSOR_PRESETS = {
+  temps: ['Temperatures', ['cpu_package_c', 'hottest_core_c', 'gpu_temp_c']], clocks: ['Clocks', ['cpu_freq_avg_mhz']],
+  load: ['Load / power', ['cpu_load_pct', 'gpu_util_pct', 'gpu_power_w']], mem: ['RAM / VRAM', ['ram_used_mb', 'vram_used_mb']],
+};
+
 function sensorsSection(entries) {
   const sec = entries[0].sec;
   const tl = sec.timeline || [];
+  const has = d => tl.some(p => p[d[0]] != null);
+  const defs = SENSOR_DEFS.filter(has);
+  if (!state.sensorSel) state.sensorSel = new Set(SENSOR_PRESETS.temps[1]);
+  let sel = defs.filter(d => state.sensorSel.has(d[0]));
+  if (!sel.length && defs.length) { sel = defs.filter(d => SENSOR_PRESETS.temps[1].includes(d[0])); if (!sel.length) sel = [defs[0]]; }
   let html = `<h2>Sensors over time <span class="badge">${sec.samples_recorded ?? tl.length} samples</span></h2><div class="card">`;
   html += (sec.sources || []).map(n => `<div style="color:var(--dim);font-size:12px">• ${esc(n)}</div>`).join('');
-  const groups = {
-    temps: ['Temperatures', [['cpu_package_c','CPU package °C'],['hottest_core_c','Hottest core °C'],['gpu_temp_c','GPU °C']]],
-    clocks: ['Clocks', [['cpu_freq_avg_mhz','CPU avg MHz']]],
-    load: ['Load / power', [['cpu_load_pct','CPU load %'],['gpu_util_pct','GPU load %'],['gpu_power_w','GPU power W']]],
-    mem: ['RAM / VRAM', [['ram_used_mb','RAM used MB'],['vram_used_mb','VRAM used MB']]],
-  };
-  html += '<div class="row">' + Object.entries(groups).map(([k, g]) => `<button data-sgroup="${k}" style="${state.sensorGroup === k ? 'border-color:var(--accent)' : ''}">${g[0]}</button>`).join('') + '</div>';
-  const defs = groups[state.sensorGroup][1];
-  const lines = defs.map((d, i) => ({ name: d[1], color: colorOf(i), pts: tl.filter(p => p[d[0]] != null).map(p => [p.t_s, p[d[0]]]) })).filter(l => l.pts.length);
-  html += '<div class="row">' + lines.map(l => `<label class="chk"><input type="checkbox" data-sser="${esc(l.name)}" ${state.hiddenSeries.has('sen:' + l.name) ? '' : 'checked'}><span class="sw" style="background:${l.color}"></span>${esc(l.name)}</label>`).join('') + '</div>';
-  html += `<div class="chartwrap">${drawChart(lines.filter(l => !state.hiddenSeries.has('sen:' + l.name)), { xLabel: 'seconds since the test started', yLabel: groups[state.sensorGroup][0], zeroY: false, markers: false })}</div>`;
+  // a busy CPU whose package temperature never moves is not a live sensor
+  const cp = tl.filter(p => p.cpu_package_c != null), busy = tl.filter(p => p.cpu_load_pct != null);
+  if (cp.length >= 20 && Math.max(...cp.map(p => p.cpu_package_c)) - Math.min(...cp.map(p => p.cpu_package_c)) < 0.05 && busy.length && busy.reduce((a, p) => a + p.cpu_load_pct, 0) / busy.length > 25)
+    html += `<div class="flatwarn">⚠ The CPU package temperature never changed (${fmt(cp[0].cpu_package_c)} °C) although the CPU was busy. That is a fixed ACPI thermal-zone value, not a live reading; run LibreHardwareMonitor or OpenHardwareMonitor for real temperatures.</div>`;
+  html += '<div class="row"><b>Show:</b>' + Object.entries(SENSOR_PRESETS).map(([k, g]) => {
+    const same = g[1].filter(x => defs.some(d => d[0] === x)); const on = same.length && same.length === sel.length && same.every(x => sel.some(d => d[0] === x));
+    return `<button class="small" data-spreset="${k}" style="${on ? 'border-color:var(--accent)' : ''}">${g[0]}</button>`;
+  }).join('') + '<button class="small" data-spreset="all">everything</button><button class="small" data-spreset="none">none</button></div>';
+  const units = [...new Set(sel.map(d => d[2]))];
+  html += '<div class="row">' + defs.map(d => {
+    const i = SENSOR_DEFS.indexOf(d), on = sel.includes(d), st = seriesStyle(i);
+    return `<label class="chip ${on ? 'on' : ''}"><input type="checkbox" data-ssel="${d[0]}" ${on ? 'checked' : ''}>${swatch(st.color, 'circle', on ? DASHES[units.indexOf(d[2]) % DASHES.length] : '')}${esc(d[1])} <span style="color:var(--dim)">(${esc(d[2])})</span></label>`;
+  }).join('') + '</div>';
+  if (units.length > 1) html += '<div style="color:var(--dim);font-size:12px">Each unit has its own axis (first on the left, others on the right); lines on different axes use different dash patterns.</div>';
+  const axes = units.map(u => ({ unit: u, label: sel.filter(d => d[2] === u).map(d => d[1]).slice(0, 2).join(' · ') + ` (${u})` }));
+  const lines = sel.map(d => {
+    const st = seriesStyle(SENSOR_DEFS.indexOf(d));
+    return { series: d[1], metric: d[1], unit: d[2], name: d[1], color: st.color, shape: 'circle', dash: DASHES[units.indexOf(d[2]) % DASHES.length], axis: units.indexOf(d[2]), pts: tl.filter(p => p[d[0]] != null).map(p => [p.t_s, p[d[0]]]) };
+  });
+  const cid = 'chart_sensors';
+  pendingSpecs.set(cid, { id: cid, lines, axes, legend: sel.length > 1 ? lines.map(l => ({ label: l.name + ' (' + l.unit + ')', color: l.color, dash: l.dash, axis: l.axis })) : null, ysig: sel.map(d => d[0]).join('|'), xLabel: 'seconds since the test started', logY: false, zeroY: false, markers: false, xFmt: v => fmt(v) + ' s' });
+  html += chartTools(cid) + `<div class="chartbox" data-chart="${cid}"></div>`;
   const peaks = sec.core_peak_temps_c || [];
   if (peaks.length) {
     html += '<h3>Peak temperature per core</h3><div class="row">' + peaks.map(p => { const t = p[1], c = t > 85 ? 'bad' : t > 70 ? 'warn' : 'ok'; return `<span class="badge ${c === 'ok' ? 'ok' : c === 'warn' ? 'warn' : 'bad'}">core ${p[0]}: ${t.toFixed(0)} °C</span>`; }).join('') + '</div>';
@@ -425,54 +785,93 @@ function overview(doc, name, meta) {
 // page
 // ------------------------------------------------------------------------------------------------
 let lastRender = null;
+const KIND_ORDER = ['memory', 'cpu', 'gpu', 'input_timing_suite', 'input_trials'];
+const entriesFor = k => lastRender.perDoc.filter(p => p.sections[k]).map(p => ({ label: p.label, sec: p.sections[k] }));
+
 function render() {
   const main = $('#main');
+  liveCharts.forEach(c => c.destroy()); liveCharts.clear(); pendingSpecs.clear();
   if (!state.selected.length) { main.innerHTML = '<div id="empty">Select a result on the left.</div>'; return; }
   const docs = state.selected.map(n => [n, state.docs.get(n)]).filter(d => d[1]);
   let html = '';
   if (docs.length > 1) html += `<div class="card">Comparing ${docs.length} results: overlaid lines are prefixed with their date. Column and line switches apply to all.</div>`;
   else html += overview(docs[0][1], docs[0][0], state.list.find(m => m.name === docs[0][0]));
   const perDoc = docs.map(([n, d]) => ({ label: docLabel(d, n), sections: sectionsOf(d), doc: d }));
-  const order = ['memory','cpu','gpu','input_timing_suite','input_trials'];
-  const built = [];
-  for (const k of order) {
-    const entries = perDoc.filter(p => p.sections[k]).map(p => ({ label: p.label, sec: p.sections[k] }));
-    if (entries.length) { const b = kindSection(k, entries); html += b.html; built.push(b); }
+  lastRender = { built: [], docs, perDoc };
+  for (const k of KIND_ORDER) {
+    const entries = entriesFor(k);
+    if (entries.length) { const b = kindSection(k, entries); html += `<section id="ks_${k}">${b.html}</section>`; lastRender.built.push(b); }
   }
-  const sens = perDoc.filter(p => p.sections.sensors).map(p => ({ label: p.label, sec: p.sections.sensors }));
-  if (sens.length) html += sensorsSection(sens);
+  const sens = entriesFor('sensors');
+  if (sens.length) html += `<section id="ks_sensors">${sensorsSection(sens)}</section>`;
   const virt = perDoc.find(p => p.sections.virtualization);
   if (virt && docs.length === 1) html += virtSection(virt.sections.virtualization);
-  if (!built.length && !sens.length && !virt) html += '<div class="card">This file has no chartable results.</div>';
+  if (!lastRender.built.length && !sens.length && !virt) html += '<div class="card">This file has no chartable results.</div>';
   main.innerHTML = html;
-  lastRender = { built, docs };
-  wire();
+  KIND_ORDER.forEach(k => { const h = $('#ks_' + k); if (h) wireKind(h, k); });
+  const sh = $('#ks_sensors'); if (sh) wireSensors(sh);
+  wirePage();
 }
 
-function wire() {
-  document.querySelectorAll('.card[id^=sec_]').forEach(card => {
-    const kindKey = card.id.slice(4);
-    const b = lastRender.built.find(x => x.kindKey === kindKey);
-    card.querySelectorAll('[data-ser]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.ser; el.checked ? state.hiddenSeries.delete(k) : state.hiddenSeries.add(k); render(); });
-    card.querySelectorAll('[data-col]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.col; el.checked ? state.hiddenCols.delete(k) : state.hiddenCols.add(k); render(); });
-    card.querySelectorAll('[data-opt]').forEach(el => el.onchange = () => { state.opts[el.dataset.opt] = el.checked; render(); });
-    const sel = card.querySelector('[data-metric]'); if (sel) sel.onchange = () => { state.chartMetric[kindKey] = sel.value; render(); };
-    card.querySelectorAll('[data-act]').forEach(el => el.onclick = () => {
-      const a = el.dataset.act, isTel = k => TELEMETRY.some(t => t[0] === k);
-      if (a === 'ser-all') b.series.forEach(s => state.hiddenSeries.delete(kindKey + ':' + s));
-      if (a === 'ser-none') b.series.forEach(s => state.hiddenSeries.add(kindKey + ':' + s));
-      if (a === 'col-all') b.metrics.forEach(m => state.hiddenCols.delete(kindKey + ':' + m[0]));
-      if (a === 'col-none') b.metrics.forEach(m => state.hiddenCols.add(kindKey + ':' + m[0]));
-      if (a === 'col-perf') b.metrics.forEach(m => isTel(m[0]) ? state.hiddenCols.add(kindKey + ':' + m[0]) : state.hiddenCols.delete(kindKey + ':' + m[0]));
-      if (a === 'col-sens') b.metrics.forEach(m => isTel(m[0]) ? state.hiddenCols.delete(kindKey + ':' + m[0]) : state.hiddenCols.add(kindKey + ':' + m[0]));
-      const rows = b.rows.filter(r => !state.hiddenSeries.has(kindKey + ':' + r.series)), cols = b.metrics.filter(m => !state.hiddenCols.has(kindKey + ':' + m[0]));
-      if (a === 'csv') { navigator.clipboard && navigator.clipboard.writeText(toCsv(rows, cols)); el.textContent = 'Copied'; return; }
-      if (a === 'dl-csv') { download(kindKey + '.csv', toCsv(rows, cols), 'text/csv'); return; }
-      render();
-    });
+// Re-render one section only: keeps the scroll position and does not rebuild the other big tables
+function rebuildSection(k) {
+  const host = $('#ks_' + k); if (!host) return render();
+  liveCharts.get('chart_' + k)?.destroy(); liveCharts.delete('chart_' + k);
+  if (k === 'sensors') { host.innerHTML = sensorsSection(entriesFor('sensors')); wireSensors(host); return; }
+  const b = kindSection(k, entriesFor(k)), i = lastRender.built.findIndex(x => x.kindKey === k);
+  if (i >= 0) lastRender.built[i] = b;
+  host.innerHTML = b.html; wireKind(host, k);
+}
+
+function wireKind(host, kindKey) {
+  const card = host.querySelector('.card[id^=sec_]'); if (!card) return;
+  const b = lastRender.built.find(x => x.kindKey === kindKey), redo = () => rebuildSection(kindKey);
+  card.querySelectorAll('[data-ser]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.ser; el.checked ? state.hiddenSeries.delete(k) : state.hiddenSeries.add(k); redo(); });
+  card.querySelectorAll('[data-col]').forEach(el => el.onchange = () => { const k = kindKey + ':' + el.dataset.col; el.checked ? state.hiddenCols.delete(k) : state.hiddenCols.add(k); redo(); });
+  card.querySelectorAll('[data-opt]').forEach(el => el.onchange = () => { optsOf(kindKey)[el.dataset.opt] = el.checked; redo(); });
+  card.querySelectorAll('[data-mchip]').forEach(el => el.onchange = () => {
+    const cur = new Set([...card.querySelectorAll('[data-mchip]:checked')].map(x => x.dataset.mchip));
+    if (!cur.size) cur.add(el.dataset.mchip);              // at least one value stays on the chart
+    state.chartMetrics[kindKey] = [...cur]; redo();
   });
-  document.querySelectorAll('[data-sgroup]').forEach(el => el.onclick = () => { state.sensorGroup = el.dataset.sgroup; render(); });
-  document.querySelectorAll('[data-sser]').forEach(el => el.onchange = () => { const k = 'sen:' + el.dataset.sser; el.checked ? state.hiddenSeries.delete(k) : state.hiddenSeries.add(k); render(); });
+  const flt = card.querySelector('[data-serfilter]');
+  if (flt) flt.oninput = () => {
+    const q = flt.value.trim().toLowerCase(); state.filters[kindKey] = flt.value;
+    card.querySelectorAll('[data-serlabel]').forEach(l => l.style.display = !q || l.dataset.serlabel.includes(q) ? '' : 'none');
+  };
+  card.querySelectorAll('[data-act]').forEach(el => el.onclick = () => {
+    const a = el.dataset.act, isTel = k => TELEMETRY.some(t => t[0] === k), q = (state.filters[kindKey] || '').trim().toLowerCase();
+    const match = s => !q || s.toLowerCase().includes(q);
+    if (a === 'ser-all') b.series.filter(match).forEach(s => state.hiddenSeries.delete(kindKey + ':' + s));
+    if (a === 'ser-none') b.series.filter(match).forEach(s => state.hiddenSeries.add(kindKey + ':' + s));
+    if (a === 'ser-only') b.series.forEach(s => match(s) ? state.hiddenSeries.delete(kindKey + ':' + s) : state.hiddenSeries.add(kindKey + ':' + s));
+    if (a === 'col-all') b.metrics.forEach(m => state.hiddenCols.delete(kindKey + ':' + m[0]));
+    if (a === 'col-none') b.metrics.forEach(m => state.hiddenCols.add(kindKey + ':' + m[0]));
+    if (a === 'col-perf') b.metrics.forEach(m => isTel(m[0]) ? state.hiddenCols.add(kindKey + ':' + m[0]) : state.hiddenCols.delete(kindKey + ':' + m[0]));
+    if (a === 'col-sens') b.metrics.forEach(m => isTel(m[0]) ? state.hiddenCols.delete(kindKey + ':' + m[0]) : state.hiddenCols.add(kindKey + ':' + m[0]));
+    const rows = b.rows.filter(r => !state.hiddenSeries.has(kindKey + ':' + r.series)), cols = b.metrics.filter(m => !state.hiddenCols.has(kindKey + ':' + m[0]));
+    if (a === 'csv') { navigator.clipboard && navigator.clipboard.writeText(toCsv(rows, cols)); el.textContent = 'Copied'; return; }
+    if (a === 'dl-csv') { download(kindKey + '.csv', toCsv(rows, cols), 'text/csv'); return; }
+    redo();
+  });
+  mountCharts(card);
+}
+
+function wireSensors(host) {
+  host.querySelectorAll('[data-spreset]').forEach(el => el.onclick = () => {
+    const k = el.dataset.spreset;
+    state.sensorSel = new Set(k === 'all' ? SENSOR_DEFS.map(d => d[0]) : k === 'none' ? [] : SENSOR_PRESETS[k][1]);
+    rebuildSection('sensors');
+  });
+  host.querySelectorAll('[data-ssel]').forEach(el => el.onchange = () => {
+    const cur = new Set([...host.querySelectorAll('[data-ssel]:checked')].map(x => x.dataset.ssel));
+    if (!cur.size) cur.add(el.dataset.ssel);
+    state.sensorSel = cur; rebuildSection('sensors');
+  });
+  mountCharts(host);
+}
+
+function wirePage() {
   const raw = $('[data-act=raw]'); if (raw) raw.onclick = () => { const d = lastRender.docs[0][1]; const pre = document.createElement('pre'); pre.textContent = JSON.stringify(d, null, 2); raw.closest('.card').appendChild(pre); raw.disabled = true; };
   const dj = $('[data-act=dl-json]'); if (dj) dj.onclick = () => download(lastRender.docs[0][0].replace(/[^\w.-]/g, '_'), JSON.stringify(lastRender.docs[0][1], null, 2), 'application/json');
 }
