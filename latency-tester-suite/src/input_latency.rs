@@ -6,6 +6,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use crate::cancel::{self, CancelFlag};
 use crate::timer::{HighResTimer, busy_wait_ns};
 use rand::{Rng, SeedableRng};
 
@@ -84,6 +85,7 @@ pub struct InputLatencyTester {
     pub last_response_time: Arc<Mutex<Option<u64>>>,
     /// Latencies (ms) recorded from real stimulus/response pairs
     pub live_samples: Arc<Mutex<Vec<f64>>>,
+    cancel: CancelFlag,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +105,14 @@ impl InputLatencyTester {
             last_input_time: Arc::new(Mutex::new(None)),
             last_response_time: Arc::new(Mutex::new(None)),
             live_samples: Arc::new(Mutex::new(Vec::new())),
+            cancel: cancel::new_flag(),
         }
+    }
+
+    /// Share a flag that stops the run early when set
+    pub fn with_cancel(mut self, flag: CancelFlag) -> Self {
+        self.cancel = flag;
+        self
     }
 
     pub fn run(&mut self) -> Result<InputLatencySummary> {
@@ -111,6 +120,7 @@ impl InputLatencyTester {
         let mut results = Vec::new();
 
         for mode in self.config.test_modes.clone() {
+            cancel::check(&self.cancel)?;
             let result = self.run_mode(mode)?;
             results.push(result);
         }
@@ -140,11 +150,13 @@ impl InputLatencyTester {
         
         // Warmup
         for _ in 0..self.config.warmup_samples {
+            cancel::check(&self.cancel)?;
             self.single_click_test()?;
         }
 
         // Actual test
         for _ in 0..self.config.sample_count {
+            cancel::check(&self.cancel)?;
             if let Some(latency) = self.single_click_test()? {
                 samples.push(latency);
             }
@@ -180,10 +192,12 @@ impl InputLatencyTester {
         let mut samples = Vec::new();
         
         for _ in 0..self.config.warmup_samples {
+            cancel::check(&self.cancel)?;
             self.single_key_test()?;
         }
 
         for _ in 0..self.config.sample_count {
+            cancel::check(&self.cancel)?;
             if let Some(latency) = self.single_key_test()? {
                 samples.push(latency);
             }
@@ -214,6 +228,7 @@ impl InputLatencyTester {
         let mut samples = Vec::new();
         
         for _ in 0..self.config.sample_count {
+            cancel::check(&self.cancel)?;
             let start = self.timer.now_ticks();
             // Simulate mouse move processing
             std::thread::sleep(Duration::from_micros(100));
@@ -235,6 +250,7 @@ impl InputLatencyTester {
         // On Linux: evdev / libinput
         
         for _ in 0..self.config.sample_count {
+            cancel::check(&self.cancel)?;
             let start = self.timer.now_ticks();
             
             // Simulate raw input processing
@@ -268,6 +284,7 @@ impl InputLatencyTester {
         let mut last_time = self.timer.now_ticks();
         
         while self.timer.now_ticks() < target_end {
+            cancel::check(&self.cancel)?;
             let now = self.timer.now_ticks();
             let interval_ticks = now - last_time;
             let interval_ms = self.timer.ticks_to_ms_f64(interval_ticks);
@@ -298,6 +315,7 @@ impl InputLatencyTester {
         let mut last = self.timer.now_ticks();
         
         for _ in 0..sample_count {
+            cancel::check(&self.cancel)?;
             busy_wait_ns(&self.timer, target_interval_ns);
             let now = self.timer.now_ticks();
             let interval_ns = self.timer.ticks_to_ns(now - last);

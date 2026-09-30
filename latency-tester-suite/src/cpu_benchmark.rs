@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::thread;
+use crate::cancel::{self, CancelFlag};
 use crate::timer::HighResTimer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +143,7 @@ pub struct CpuBenchmark {
     config: CpuBenchmarkConfig,
     timer: HighResTimer,
     topology: CoreTopology,
+    cancel: CancelFlag,
 }
 
 impl CpuBenchmark {
@@ -151,7 +153,14 @@ impl CpuBenchmark {
             config,
             timer: HighResTimer::new(),
             topology,
+            cancel: cancel::new_flag(),
         })
+    }
+
+    /// Share a flag that stops the run early when set
+    pub fn with_cancel(mut self, flag: CancelFlag) -> Self {
+        self.cancel = flag;
+        self
     }
 
     fn detect_topology() -> Result<CoreTopology> {
@@ -189,11 +198,16 @@ impl CpuBenchmark {
         let (p_threads, e_threads) = hybrid_thread_counts();
 
         let p_end = p_threads.min(logical);
-        let p_cores: Vec<usize> = (0..p_end).collect();
-        let e_cores: Vec<usize> = if e_threads > 0 {
-            (p_end..logical).collect()
-        } else {
-            Vec::new()
+        // Exact per-CPU classification when CPUID can tell us, else the "P threads first" convention
+        let (p_cores, e_cores): (Vec<usize>, Vec<usize>) = match crate::topology::detect_core_kinds() {
+            Some(kinds) => {
+                let ids = |want| kinds.iter().enumerate().filter(|(_, &k)| k == want).map(|(i, _)| i).collect();
+                (ids(crate::topology::CoreKind::Performance), ids(crate::topology::CoreKind::Efficiency))
+            }
+            None => (
+                (0..p_end).collect(),
+                if e_threads > 0 { (p_end..logical).collect() } else { Vec::new() },
+            ),
         };
 
         // HT pairs exist only when SMT is enabled (more logical threads than physical cores),
@@ -235,6 +249,7 @@ impl CpuBenchmark {
         for workload in self.config.workload_types.clone() {
             for thread_count in self.config.thread_counts.clone() {
                 for affinity_mode in self.config.affinity_modes.clone() {
+                    cancel::check(&self.cancel)?;
                     // Skip invalid combinations
                     if !self.is_valid_combination(thread_count, affinity_mode) {
                         continue;
@@ -283,6 +298,7 @@ impl CpuBenchmark {
         let mut total_time_ns = 0u64;
 
         for iter in 0..self.config.iterations {
+            cancel::check(&self.cancel)?;
             // Warmup
             if iter == 0 {
                 self.run_workload_internal(workload, thread_count, core_mask, affinity_mode, self.config.warmup_seconds)?;
@@ -393,6 +409,7 @@ impl CpuBenchmark {
             let target_end = target_end;
             let core_id = self.get_core_for_thread(i, thread_count, core_mask, affinity_mode);
             
+            let cancel_flag = self.cancel.clone();
             let handle = thread::spawn(move || {
                 // Set thread affinity
                 #[cfg(target_os = "windows")]
@@ -413,7 +430,7 @@ impl CpuBenchmark {
                 }
 
                 let mut ops = 0u64;
-                while timer.now_ticks() < target_end {
+                while timer.now_ticks() < target_end && !cancel::is_cancelled(&cancel_flag) {
                     std::hint::black_box(Self::execute_workload(workload, ops));
                     ops += 1;
                 }
@@ -427,6 +444,7 @@ impl CpuBenchmark {
             total_ops += handle.join().unwrap();
         }
 
+        cancel::check(&self.cancel)?;
         let end_time = self.timer.now_ticks();
         let elapsed_ticks = end_time - start_time;
         let elapsed_ns = (elapsed_ticks as u128 * 1_000_000_000 / self.timer.frequency() as u128) as u64;
@@ -666,6 +684,14 @@ fn parse_cpulist_len(list: &str) -> usize {
 /// `(logical, 0)`. Intel convention is assumed: P threads have the lowest IDs.
 pub fn hybrid_thread_counts() -> (usize, usize) {
     let logical = num_cpus::get();
+    // CPUID per pinned core works on Windows and Linux
+    if let Some(kinds) = crate::topology::detect_core_kinds() {
+        let p = kinds.iter().filter(|&&k| k == crate::topology::CoreKind::Performance).count();
+        let e = kinds.iter().filter(|&&k| k == crate::topology::CoreKind::Efficiency).count();
+        if p > 0 && e > 0 {
+            return (p, e);
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         let read = |p: &str| std::fs::read_to_string(p).ok();

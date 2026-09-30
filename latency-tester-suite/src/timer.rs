@@ -51,7 +51,7 @@ impl HighResTimer {
             use windows::Win32::System::Performance::QueryPerformanceCounter;
             let mut counter = 0i64;
             unsafe {
-                QueryPerformanceCounter(&mut counter);
+                let _ = QueryPerformanceCounter(&mut counter);
             }
             counter as u64
         }

@@ -5,6 +5,7 @@ use anyhow::Result;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
+use crate::cancel::{self, CancelFlag};
 use crate::timer::HighResTimer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +110,16 @@ pub struct MemoryBenchmark {
     config: MemoryBenchmarkConfig,
     timer: HighResTimer,
     rng: StdRng,
+    cancel: CancelFlag,
+}
+
+/// Per-(size, pattern, threads) setup data built once, outside the timed region and
+/// reused by every iteration
+enum Prepared {
+    None,
+    Indices(Vec<usize>),
+    PerThread(Vec<Vec<usize>>),
+    Chain { chain: Vec<usize>, starts: Vec<usize> },
 }
 
 /// Split `buf` into `tc` contiguous, disjoint, mutable chunks (remainder spread over the first chunks)
@@ -140,7 +151,14 @@ impl MemoryBenchmark {
             config,
             timer: HighResTimer::new(),
             rng: StdRng::seed_from_u64(0xDEADBEEF_CAFEBABE),
+            cancel: cancel::new_flag(),
         }
+    }
+
+    /// Share a flag that stops the run early when set
+    pub fn with_cancel(mut self, flag: CancelFlag) -> Self {
+        self.cancel = flag;
+        self
     }
 
     pub fn run(&mut self) -> Result<MemoryBenchmarkSummary> {
@@ -148,12 +166,14 @@ impl MemoryBenchmark {
         let mut results = Vec::new();
 
         for size in self.config.sizes.clone() {
+            cancel::check(&self.cancel)?;
             // Allocate once per size and reuse across all patterns and thread counts
             let mut data = self.allocate_buffer(size)?;
             let mut aux = self.allocate_buffer(size)?;
 
             for pattern in self.config.patterns.clone() {
                 for &thread_count in &self.config.thread_counts.clone() {
+                    cancel::check(&self.cancel)?;
                     if thread_count > num_cpus::get() {
                         continue; // Skip thread counts higher than available CPUs
                     }
@@ -181,10 +201,13 @@ impl MemoryBenchmark {
         pattern: AccessPattern,
         thread_count: usize,
     ) -> Result<MemoryBenchmarkResult> {
-        // Warmup
+        // Warmup (single thread)
+        let warm_prep = self.prepare(pattern, size, 1);
         for _ in 0..self.config.warmup_iterations {
-            self.run_pattern(data, aux, size, pattern, 1)?;
+            cancel::check(&self.cancel)?;
+            self.run_pattern(data, aux, size, pattern, 1, &warm_prep)?;
         }
+        let prep = if thread_count == 1 { warm_prep } else { self.prepare(pattern, size, thread_count) };
 
         // Actual benchmark
         let iterations = self.config.iterations.max(1);
@@ -192,7 +215,8 @@ impl MemoryBenchmark {
         let mut total_bytes = 0u64;
 
         for _ in 0..iterations {
-            let (latency_ns, bytes) = self.run_pattern(data, aux, size, pattern, thread_count)?;
+            cancel::check(&self.cancel)?;
+            let (latency_ns, bytes) = self.run_pattern(data, aux, size, pattern, thread_count, &prep)?;
             latencies.push(latency_ns);
             total_bytes += bytes;
         }
@@ -287,21 +311,22 @@ impl MemoryBenchmark {
         &mut self,
         data: &mut [u8],
         aux: &mut [u8],
-        size: usize,
+        _size: usize,
         pattern: AccessPattern,
         thread_count: usize,
+        prep: &Prepared,
     ) -> Result<(f64, u64)> {
         let tc = thread_count.max(1);
         let (bytes, ns) = match pattern {
             AccessPattern::SequentialRead => self.sequential_read(data, tc),
             AccessPattern::SequentialWrite => self.sequential_write(data, tc),
             AccessPattern::SequentialReadWrite => self.sequential_read_write(data, tc),
-            AccessPattern::RandomRead => self.random_read(data, tc),
-            AccessPattern::RandomWrite => self.random_write(data, tc),
+            AccessPattern::RandomRead => self.random_read(data, tc, prep),
+            AccessPattern::RandomWrite => self.random_write(data, tc, prep),
             AccessPattern::StridedRead { stride } => self.strided_read(data, stride, tc),
-            AccessPattern::PointerChase => self.pointer_chase(size, tc),
-            AccessPattern::DependentRead => self.dependent_read(size, tc),
-            AccessPattern::IndependentRead => self.independent_read(data, tc),
+            AccessPattern::PointerChase => self.pointer_chase(tc, prep),
+            AccessPattern::DependentRead => self.dependent_read(tc, prep),
+            AccessPattern::IndependentRead => self.independent_read(data, tc, prep),
             AccessPattern::StreamCopy => self.stream_copy(data, aux, tc),
             AccessPattern::StreamScale => self.stream_scale(data, tc),
             AccessPattern::StreamAdd => self.stream_add(data, aux, tc),
@@ -346,13 +371,53 @@ impl MemoryBenchmark {
         })
     }
 
-    // Random read - measures random access latency
-    fn random_read(&self, buffer: &[u8], tc: usize) -> (u64, f64) {
+    /// Build the untimed setup data for a pattern
+    fn prepare(&self, pattern: AccessPattern, size: usize, tc: usize) -> Prepared {
         use rand::seq::SliceRandom;
-        let mut shuffled: Vec<usize> = (0..buffer.len()).step_by(64).collect(); // Cache line aligned
-        shuffled.shuffle(&mut StdRng::seed_from_u64(0xFEEDFACE));
-        let shuffled = &shuffled;
+        match pattern {
+            AccessPattern::RandomRead => {
+                let mut idx: Vec<usize> = (0..size).step_by(64).collect(); // cache-line aligned
+                idx.shuffle(&mut StdRng::seed_from_u64(0xFEEDFACE));
+                Prepared::Indices(idx)
+            }
+            AccessPattern::IndependentRead => Prepared::Indices((0..size).step_by(64).collect()),
+            AccessPattern::RandomWrite => Prepared::PerThread(
+                (0..tc)
+                    .map(|i| {
+                        let len = share(size, tc, i).len();
+                        let mut idxs: Vec<usize> = (0..len).step_by(64).collect();
+                        idxs.shuffle(&mut StdRng::seed_from_u64(0xFEEDFACEu64.wrapping_add(i as u64)));
+                        idxs
+                    })
+                    .collect(),
+            ),
+            AccessPattern::PointerChase => {
+                // Random permutation cycle over 8-byte nodes (a single long chain)
+                let num_nodes = (size / 8).max(tc);
+                let mut perm: Vec<usize> = (0..num_nodes).collect();
+                perm.shuffle(&mut StdRng::seed_from_u64(0xBADF00D));
+                let mut chain = vec![0usize; num_nodes];
+                for i in 0..num_nodes {
+                    chain[perm[i]] = perm[(i + 1) % num_nodes];
+                }
+                // Disjoint start nodes so threads do not share hot cache lines
+                let starts = (0..tc).map(|i| perm[i % num_nodes]).collect();
+                Prepared::Chain { chain, starts }
+            }
+            AccessPattern::DependentRead => {
+                // Sequential chain: node i -> node i+1, last wraps to 0
+                let num_nodes = (size / 8).max(tc);
+                let chain = (0..num_nodes).map(|i| (i + 1) % num_nodes).collect();
+                let starts = (0..tc).map(|i| (i * num_nodes) / tc).collect();
+                Prepared::Chain { chain, starts }
+            }
+            _ => Prepared::None,
+        }
+    }
 
+    // Random read - measures random access latency
+    fn random_read(&self, buffer: &[u8], tc: usize, prep: &Prepared) -> (u64, f64) {
+        let Prepared::Indices(shuffled) = prep else { return (0, 1.0) };
         self.run_parallel(tc, |i| {
             let idxs = &shuffled[share(shuffled.len(), tc, i)];
             let mut sum = 0u64;
@@ -365,19 +430,8 @@ impl MemoryBenchmark {
     }
 
     // Random write
-    fn random_write(&self, buffer: &mut [u8], tc: usize) -> (u64, f64) {
-        use rand::seq::SliceRandom;
-        // Random cache-line-aligned offsets within each thread's private region
-        let per_thread: Vec<Vec<usize>> = (0..tc)
-            .map(|i| {
-                let len = share(buffer.len(), tc, i).len();
-                let mut idxs: Vec<usize> = (0..len).step_by(64).collect();
-                idxs.shuffle(&mut StdRng::seed_from_u64(0xFEEDFACEu64.wrapping_add(i as u64)));
-                idxs
-            })
-            .collect();
-        let per_thread = &per_thread;
-
+    fn random_write(&self, buffer: &mut [u8], tc: usize, prep: &Prepared) -> (u64, f64) {
+        let Prepared::PerThread(per_thread) = prep else { return (0, 1.0) };
         self.run_parallel_mut(buffer, tc, |i, chunk| {
             for &idx in &per_thread[i] {
                 chunk[idx] = (idx & 0xFF) as u8;
@@ -405,40 +459,20 @@ impl MemoryBenchmark {
     }
 
     // Pointer chasing - measures pointer dereference latency
-    fn pointer_chase(&self, size: usize, tc: usize) -> (u64, f64) {
-        use rand::seq::SliceRandom;
-        // Random permutation cycle over 8-byte nodes (a single long chain)
-        let num_nodes = (size / 8).max(tc);
-        let mut perm: Vec<usize> = (0..num_nodes).collect();
-        perm.shuffle(&mut StdRng::seed_from_u64(0xBADF00D));
-        let mut chain = vec![0usize; num_nodes];
-        for i in 0..num_nodes {
-            chain[perm[i]] = perm[(i + 1) % num_nodes];
-        }
-        let (chain, perm) = (&chain, &perm);
-        let steps: usize = 1 << 16; // Chase depth per thread (latency-bound)
-
-        self.run_parallel(tc, |i| {
-            // Disjoint start nodes so threads do not share hot cache lines
-            let mut current = perm[i % num_nodes];
-            for _ in 0..steps {
-                current = chain[current];
-            }
-            std::hint::black_box(current);
-            steps * 8
-        })
+    fn pointer_chase(&self, tc: usize, prep: &Prepared) -> (u64, f64) {
+        self.chase(tc, prep)
     }
 
     // Dependent read - each read address depends on previous read value
-    fn dependent_read(&self, size: usize, tc: usize) -> (u64, f64) {
-        // Sequential chain: node i -> node i+1, last wraps to 0
-        let num_nodes = (size / 8).max(tc);
-        let chain: Vec<usize> = (0..num_nodes).map(|i| (i + 1) % num_nodes).collect();
-        let chain = &chain;
-        let steps: usize = 1 << 16;
+    fn dependent_read(&self, tc: usize, prep: &Prepared) -> (u64, f64) {
+        self.chase(tc, prep)
+    }
 
+    fn chase(&self, tc: usize, prep: &Prepared) -> (u64, f64) {
+        let Prepared::Chain { chain, starts } = prep else { return (0, 1.0) };
+        let steps: usize = 1 << 16; // Chase depth per thread (latency-bound)
         self.run_parallel(tc, |i| {
-            let mut current = (i * num_nodes) / tc;
+            let mut current = starts[i];
             for _ in 0..steps {
                 current = chain[current];
             }
@@ -448,10 +482,8 @@ impl MemoryBenchmark {
     }
 
     // Independent reads - multiple independent memory accesses (bandwidth bound)
-    fn independent_read(&self, buffer: &[u8], tc: usize) -> (u64, f64) {
-        let indices: Vec<usize> = (0..buffer.len()).step_by(64).collect();
-        let indices = &indices;
-
+    fn independent_read(&self, buffer: &[u8], tc: usize, prep: &Prepared) -> (u64, f64) {
+        let Prepared::Indices(indices) = prep else { return (0, 1.0) };
         self.run_parallel(tc, |i| {
             let idxs = &indices[share(indices.len(), tc, i)];
             let mut sums = [0u64; 4]; // 4 independent accumulators
@@ -517,23 +549,63 @@ impl MemoryBenchmark {
     }
 }
 
-/// Quick memory latency test (simplified for GUI)
-pub fn quick_memory_latency_test(size: usize, iterations: u32) -> Result<f64> {
+/// One row of a quick test
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickMemoryRow {
+    pub pattern: String,
+    /// Average time per memory access (random read: per cache line; pointer chase: per dependent load)
+    pub ns_per_access: f64,
+    pub bandwidth_gb_s: f64,
+    pub p99_run_ms: f64,
+}
+
+/// Result of the quick test shown in the GUI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickMemoryResult {
+    pub size: usize,
+    pub iterations: u32,
+    pub rows: Vec<QuickMemoryRow>,
+    pub elapsed_ms: f64,
+}
+
+/// Quick memory latency test (simplified for GUI): single thread, random read + pointer chase.
+/// Runs to completion or until `cancel` is set.
+pub fn quick_memory_latency_test(size: usize, iterations: u32, cancel: CancelFlag) -> Result<QuickMemoryResult> {
+    let started = std::time::Instant::now();
     let mut bench = MemoryBenchmark::new(MemoryBenchmarkConfig {
         sizes: vec![size],
         iterations,
-        warmup_iterations: 5,
+        warmup_iterations: 2,
         patterns: vec![AccessPattern::RandomRead, AccessPattern::PointerChase],
         thread_counts: vec![1],
         use_huge_pages: false,
-    });
+    })
+    .with_cancel(cancel);
 
     let summary = bench.run()?;
-    let avg_latency = summary.results.iter()
-        .map(|r| r.latency_ns)
-        .sum::<f64>() / summary.results.len().max(1) as f64;
+    let rows = summary
+        .results
+        .iter()
+        .map(|r| {
+            // bytes moved per run = bandwidth (bytes/ns) * run time (ns); one access per 64 B
+            // (random read) or per 8 B node (pointer chase)
+            let bytes = r.bandwidth_gb_s * r.latency_ns;
+            let unit = if matches!(r.pattern, AccessPattern::PointerChase) { 8.0 } else { 64.0 };
+            QuickMemoryRow {
+                pattern: format!("{:?}", r.pattern),
+                ns_per_access: if bytes > 0.0 { r.latency_ns / (bytes / unit) } else { 0.0 },
+                bandwidth_gb_s: r.bandwidth_gb_s,
+                p99_run_ms: r.percentile_99_ns / 1e6,
+            }
+        })
+        .collect();
 
-    Ok(avg_latency)
+    Ok(QuickMemoryResult {
+        size,
+        iterations,
+        rows,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+    })
 }
 
 #[cfg(test)]
@@ -563,7 +635,8 @@ mod tests {
     #[test]
     fn test_pointer_chase() {
         let b = bench();
-        let (bytes, _) = b.pointer_chase(1024 * 1024, 2);
+        let prep = b.prepare(AccessPattern::PointerChase, 1024 * 1024, 2);
+        let (bytes, _) = b.pointer_chase(2, &prep);
         assert_eq!(bytes, 2 * (1 << 16) * 8);
     }
 
@@ -590,7 +663,8 @@ mod tests {
         ];
         for p in patterns {
             for tc in [1, 3] {
-                let (ns, bytes) = b.run_pattern(&mut data, &mut aux, size, p, tc).unwrap();
+                let prep = b.prepare(p, size, tc);
+                let (ns, bytes) = b.run_pattern(&mut data, &mut aux, size, p, tc, &prep).unwrap();
                 assert!(ns > 0.0 && bytes > 0, "{:?} tc={}", p, tc);
             }
         }
@@ -603,6 +677,24 @@ mod tests {
         let mut dst = vec![0u8; 1001];
         b.stream_copy(&src, &mut dst, 4);
         assert_eq!(src, dst);
+    }
+
+    #[test]
+    fn test_quick_test_reports_per_access_latency() {
+        let r = quick_memory_latency_test(256 * 1024, 3, cancel::new_flag()).unwrap();
+        assert_eq!(r.rows.len(), 2);
+        for row in &r.rows {
+            // a memory access takes between a fraction of a ns and a few microseconds
+            assert!(row.ns_per_access > 0.01 && row.ns_per_access < 10_000.0, "{:?}", row);
+        }
+    }
+
+    #[test]
+    fn test_cancel_stops_run() {
+        let flag = cancel::new_flag();
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = quick_memory_latency_test(64 * 1024 * 1024, 1000, flag).unwrap_err();
+        assert!(cancel::is_cancel_error(&err));
     }
 
     #[test]

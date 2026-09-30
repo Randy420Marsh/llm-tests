@@ -1,3 +1,6 @@
+// GUI-subsystem exe on Windows release builds: double-click opens the window without a console.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! Latency Tester Suite - Cross-platform latency measurement application
 //! 
 //! Measures CPU, memory, GPU, and input latency with cryptographic result verification
@@ -12,6 +15,8 @@ mod result_logger;
 mod gui;
 mod virtualization;
 mod verification;
+mod topology;
+mod cancel;
 
 use anyhow::Result;
 use eframe::egui;
@@ -27,6 +32,9 @@ fn main() -> Result<()> {
 
     // Headless mode: `latency-tester --cli [--out results.json]`
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--cli" || a == "--help" || a == "-h") {
+        attach_parent_console();
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", cli::USAGE);
         return Ok(());
@@ -53,3 +61,15 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+/// The Windows release exe has no console of its own; attach to the launching terminal
+/// so `--cli` / `--help` output is visible there.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_parent_console() {}

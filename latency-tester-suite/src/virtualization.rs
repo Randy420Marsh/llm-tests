@@ -57,15 +57,161 @@ pub struct LinuxVirtualization {
     pub details: String,
 }
 
+/// Everything Windows can tell an unprivileged process about virtualization.
+/// Kept platform independent so the PowerShell-output parser can be unit tested anywhere.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub struct WinFacts {
+    /// Firmware virtualization (VT-x/SVM) enabled, as Task Manager reports it
+    pub firmware_virt_enabled: bool,
+    /// A hypervisor is running underneath the OS (Hyper-V, VBS, WSL2, ...)
+    pub hypervisor_present: bool,
+    /// Win32_DeviceGuard.VirtualizationBasedSecurityStatus: 0 off, 1 configured, 2 running
+    pub vbs_status: i64,
+    /// SecurityServicesRunning: 1 = Credential Guard, 2 = HVCI (memory integrity)
+    pub services_running: Vec<i64>,
+    /// AvailableSecurityProperties: 1 hypervisor, 2 secure boot, 3 DMA protection, ...
+    pub available_props: Vec<i64>,
+    pub feature_hyper_v: bool,
+    pub feature_vm_platform: bool,
+    pub feature_hypervisor_platform: bool,
+    pub feature_wsl: bool,
+    pub secure_boot: bool,
+    pub tpm_present: bool,
+    pub raw: String,
+}
+
+/// PowerShell run without elevation: CIM classes and registry values readable by any user
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WIN_FACTS_SCRIPT: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard
+$cs = Get-CimInstance -ClassName Win32_ComputerSystem
+$names = 'Microsoft-Hyper-V-All','VirtualMachinePlatform','HypervisorPlatform','Microsoft-Windows-Subsystem-Linux'
+$feat = @(Get-CimInstance -ClassName Win32_OptionalFeature | Where-Object { $names -contains $_.Name } | ForEach-Object { @{ n = $_.Name; s = [int]$_.InstallState } })
+$sb = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State').UEFISecureBootEnabled
+$tpm = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftTpm -ClassName Win32_Tpm
+[pscustomobject]@{
+  vbs = [int]$dg.VirtualizationBasedSecurityStatus
+  running = @($dg.SecurityServicesRunning)
+  avail = @($dg.AvailableSecurityProperties)
+  hv = [bool]$cs.HypervisorPresent
+  feat = $feat
+  secureboot = [int]$sb
+  tpm = [bool]$tpm
+} | ConvertTo-Json -Compress -Depth 4
+"#;
+
+/// Parse the JSON printed by `WIN_FACTS_SCRIPT` (tolerates PowerShell's scalar/array quirks)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn parse_win_facts(json: &str) -> Option<WinFacts> {
+    use serde_json::Value;
+    // PowerShell may print warnings before the JSON object
+    let start = json.find('{')?;
+    let v: Value = serde_json::from_str(json[start..].trim()).ok()?;
+    let ints = |v: &Value| -> Vec<i64> {
+        match v {
+            Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(),
+            Value::Number(n) => n.as_i64().into_iter().collect(),
+            _ => Vec::new(),
+        }
+    };
+    let feature = |name: &str| -> bool {
+        let list: Vec<&Value> = match &v["feat"] {
+            Value::Array(a) => a.iter().collect(),
+            o @ Value::Object(_) => vec![o],
+            _ => Vec::new(),
+        };
+        // InstallState 1 = installed/enabled
+        list.iter().any(|f| f["n"].as_str() == Some(name) && f["s"].as_i64() == Some(1))
+    };
+    Some(WinFacts {
+        firmware_virt_enabled: false, // filled in from native APIs
+        hypervisor_present: v["hv"].as_bool().unwrap_or(false),
+        vbs_status: v["vbs"].as_i64().unwrap_or(0),
+        services_running: ints(&v["running"]),
+        available_props: ints(&v["avail"]),
+        feature_hyper_v: feature("Microsoft-Hyper-V-All"),
+        feature_vm_platform: feature("VirtualMachinePlatform"),
+        feature_hypervisor_platform: feature("HypervisorPlatform"),
+        feature_wsl: feature("Microsoft-Windows-Subsystem-Linux"),
+        secure_boot: v["secureboot"].as_i64() == Some(1),
+        tpm_present: v["tpm"].as_bool().unwrap_or(false),
+        raw: json.trim().to_string(),
+    })
+}
+
+/// CPUID: is a hypervisor running underneath us? (leaf 1 ECX bit 31)
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+fn cpuid_hypervisor_present() -> bool {
+    core::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
+fn cpuid_hypervisor_present() -> bool {
+    false
+}
+
+/// CPU vendor string from CPUID leaf 0
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+fn cpuid_vendor() -> String {
+    let r = core::arch::x86_64::__cpuid(0);
+    let mut b = Vec::with_capacity(12);
+    for reg in [r.ebx, r.edx, r.ecx] {
+        b.extend_from_slice(&reg.to_le_bytes());
+    }
+    String::from_utf8_lossy(&b).to_string()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
+fn cpuid_vendor() -> String {
+    String::new()
+}
+
+#[cfg(target_os = "windows")]
+fn gather_win_facts() -> WinFacts {
+    use std::os::windows::process::CommandExt;
+    use windows::Win32::System::Threading::{IsProcessorFeaturePresent, PROCESSOR_FEATURE_ID};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no console flash from the GUI exe
+    let mut facts = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WIN_FACTS_SCRIPT])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .and_then(|o| parse_win_facts(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default();
+
+    // PF_VIRT_FIRMWARE_ENABLED (21): the flag behind Task Manager's "Virtualisation: Enabled"
+    facts.firmware_virt_enabled =
+        unsafe { IsProcessorFeaturePresent(PROCESSOR_FEATURE_ID(21)) }.as_bool();
+    facts.hypervisor_present |= cpuid_hypervisor_present();
+    facts
+}
+
 pub struct VirtualizationDetector;
 
 impl VirtualizationDetector {
     pub fn detect() -> Result<VirtualizationStatus> {
         let platform = Self::detect_platform();
-        
+
+        #[cfg(target_os = "windows")]
+        let facts = gather_win_facts();
+
+        #[cfg(target_os = "windows")]
+        let bios = Self::detect_bios_virtualization_windows(&facts)?;
+        #[cfg(not(target_os = "windows"))]
         let bios = Self::detect_bios_virtualization()?;
+
         let windows = if platform == Platform::Windows {
-            Some(Self::detect_windows_virtualization()?)
+            #[cfg(target_os = "windows")]
+            { Some(Self::windows_from_facts(&facts)) }
+            #[cfg(not(target_os = "windows"))]
+            { None }
         } else {
             None
         };
@@ -96,18 +242,14 @@ impl VirtualizationDetector {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn detect_bios_virtualization() -> Result<BiosVirtualization> {
-        #[cfg(target_os = "windows")]
-        {
-            Self::detect_bios_virtualization_windows()
-        }
-        
         #[cfg(target_os = "linux")]
         {
             Self::detect_bios_virtualization_linux()
         }
-        
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+
+        #[cfg(not(target_os = "linux"))]
         {
             Ok(BiosVirtualization {
                 vt_x_enabled: false,
@@ -122,80 +264,63 @@ impl VirtualizationDetector {
     }
 
     #[cfg(target_os = "windows")]
-    fn detect_bios_virtualization_windows() -> Result<BiosVirtualization> {
-        let mut details = String::new();
-        let mut vt_x_enabled = false;
-        let mut svm_enabled = false;
-        let mut vt_d_enabled = false;
-        let mut iommu_enabled = false;
-        let mut tpm_enabled = false;
-        let mut secure_boot_enabled = false;
-
-        // Check CPU virtualization support via WMI
-        if let Ok(output) = Command::new("wmic")
-            .args(["cpu", "get", "VirtualizationFirmwareEnabled,SecondLevelAddressTranslationExtensions,VMMonitorModeExtensions"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("WMI CPU: {}; ", output_str.trim()));
-            
-            if output_str.contains("TRUE") {
-                vt_x_enabled = true;
-                svm_enabled = true; // WMI doesn't distinguish
-            }
-        }
-
-        // Check for VT-d / IOMMU
-        if let Ok(output) = Command::new("wmic")
-            .args(["path", "Win32_DeviceGuard", "get", "VirtualizationBasedSecurityStatus"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("DeviceGuard: {}; ", output_str.trim()));
-        }
-
-        // Check TPM
-        if let Ok(output) = Command::new("wmic")
-            .args(["path", "Win32_Tpm", "get", "SpecVersion,IsEnabled_InitialValue"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("TPM: {}; ", output_str.trim()));
-            if output_str.contains("TRUE") {
-                tpm_enabled = true;
-            }
-        }
-
-        // Check Secure Boot
-        if let Ok(output) = Command::new("powershell")
-            .args(["-Command", "Confirm-SecureBootUEFI"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("SecureBoot: {}; ", output_str.trim()));
-            if output_str.contains("True") {
-                secure_boot_enabled = true;
-            }
-        }
-
-        // Check IOMMU via kernel DMA protection
-        if let Ok(output) = Command::new("powershell")
-            .args(["-Command", "Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\SystemGuard' -Name 'Enabled' -ErrorAction SilentlyContinue"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("SystemGuard: {}; ", output_str.trim()));
-        }
-
+    fn detect_bios_virtualization_windows(f: &WinFacts) -> Result<BiosVirtualization> {
+        // A running hypervisor proves the firmware switch is on even if the flag is hidden from us
+        let virt_on = f.firmware_virt_enabled || f.hypervisor_present;
+        let vendor = cpuid_vendor();
+        let dma_protection = f.available_props.contains(&3);
+        let details = format!(
+            "firmware virtualization flag={}; hypervisor present={}; DMA protection={}; VBS status={}; PowerShell: {}",
+            f.firmware_virt_enabled, f.hypervisor_present, dma_protection, f.vbs_status, f.raw
+        );
         Ok(BiosVirtualization {
-            vt_x_enabled,
-            svm_enabled,
-            vt_d_enabled,
-            iommu_enabled,
-            tpm_enabled,
-            secure_boot_enabled,
+            vt_x_enabled: virt_on && vendor != "AuthenticAMD",
+            svm_enabled: virt_on && vendor == "AuthenticAMD",
+            // Kernel DMA Protection is only active when the IOMMU (VT-d / AMD-Vi) is on
+            vt_d_enabled: dma_protection && vendor != "AuthenticAMD",
+            iommu_enabled: dma_protection,
+            tpm_enabled: f.tpm_present,
+            secure_boot_enabled: f.secure_boot,
             details,
         })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_from_facts(f: &WinFacts) -> WindowsVirtualization {
+        let vbs_enabled = f.vbs_status == 2;
+        let hvci_enabled = f.services_running.contains(&2) || Self::hvci_registry_enabled();
+        let wsl2 = f.feature_vm_platform && f.feature_wsl;
+        let core_isolation_enabled = vbs_enabled || hvci_enabled;
+        WindowsVirtualization {
+            // "Hyper-V" here means the hypervisor is actually active: the optional feature,
+            // or VBS/WSL2/etc. having launched it
+            hyper_v_enabled: f.feature_hyper_v || f.hypervisor_present,
+            vbs_enabled,
+            hvci_enabled,
+            wsl_enabled: f.feature_wsl || f.feature_vm_platform,
+            wsl_version: if wsl2 { Some("2".to_string()) } else { None },
+            core_isolation_enabled,
+            memory_integrity_enabled: hvci_enabled,
+            virtual_machine_platform_enabled: f.feature_vm_platform,
+            windows_hypervisor_platform_enabled: f.feature_hypervisor_platform,
+            details: format!(
+                "hypervisor present={}; VBS status={}; services running={:?}; features: HyperV={} VMP={} WHP={} WSL={}",
+                f.hypervisor_present, f.vbs_status, f.services_running,
+                f.feature_hyper_v, f.feature_vm_platform, f.feature_hypervisor_platform, f.feature_wsl
+            ),
+        }
+    }
+
+    /// Memory Integrity toggle: HKLM\...\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled
+    #[cfg(target_os = "windows")]
+    fn hvci_registry_enabled() -> bool {
+        use std::os::windows::process::CommandExt;
+        Command::new("reg")
+            .args(["query", r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity", "/v", "Enabled"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
+            .unwrap_or(false)
     }
 
     #[cfg(target_os = "linux")]
@@ -272,122 +397,6 @@ impl VirtualizationDetector {
             iommu_enabled,
             tpm_enabled,
             secure_boot_enabled,
-            details,
-        })
-    }
-
-    fn detect_windows_virtualization() -> Result<WindowsVirtualization> {
-        let mut details = String::new();
-        let mut hyper_v_enabled = false;
-        let mut vbs_enabled = false;
-        let mut hvci_enabled = false;
-        let mut wsl_enabled = false;
-        let mut wsl_version = None;
-        let mut memory_integrity_enabled = false;
-        let mut virtual_machine_platform_enabled = false;
-        let mut windows_hypervisor_platform_enabled = false;
-
-        // Check Hyper-V
-        if let Ok(output) = Command::new("powershell")
-            .args(["-Command", "Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Select-Object State"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("Hyper-V: {}; ", output_str.trim()));
-            if output_str.contains("Enabled") {
-                hyper_v_enabled = true;
-            }
-        }
-
-        // Check VBS and HVCI
-        if let Ok(output) = Command::new("powershell")
-            .args(["-Command", "Get-CimInstance -Namespace root\\Microsoft\\Windows\\DeviceGuard -ClassName DeviceGuardSecurityProperties | Select-Object VirtualizationBasedSecurityStatus, RequiredSecurityProperties"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("DeviceGuard: {}; ", output_str.trim()));
-            
-            // VBS status: 0=not supported, 1=supported but not running, 2=running
-            if output_str.contains("VirtualizationBasedSecurityStatus") {
-                if output_str.contains("2") {
-                    vbs_enabled = true;
-                }
-            }
-            // HVCI: RequiredSecurityProperties = 1 means HVCI enabled
-            if output_str.contains("RequiredSecurityProperties") {
-                if output_str.contains("1") {
-                    hvci_enabled = true;
-                    memory_integrity_enabled = true;
-                }
-            }
-        }
-
-        // Check Core Isolation / Memory Integrity via registry
-        if let Ok(output) = Command::new("reg")
-            .args(["query", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "/v", "Enabled"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("HVCI Registry: {}; ", output_str.trim()));
-            if output_str.contains("0x1") {
-                hvci_enabled = true;
-                memory_integrity_enabled = true;
-            }
-        }
-
-        // Check WSL
-        if let Ok(output) = Command::new("wsl")
-            .args(["--status"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("WSL: {}; ", output_str.trim()));
-            if output_str.contains("WSL 2") {
-                wsl_enabled = true;
-                wsl_version = Some("2".to_string());
-            } else if output_str.contains("WSL 1") {
-                wsl_enabled = true;
-                wsl_version = Some("1".to_string());
-            }
-        }
-
-        // Check Virtual Machine Platform
-        if let Ok(output) = Command::new("powershell")
-            .args(["-Command", "Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform | Select-Object State"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("VirtualMachinePlatform: {}; ", output_str.trim()));
-            if output_str.contains("Enabled") {
-                virtual_machine_platform_enabled = true;
-            }
-        }
-
-        // Check Windows Hypervisor Platform
-        if let Ok(output) = Command::new("powershell")
-            .args(["-Command", "Get-WindowsOptionalFeature -Online -FeatureName Windows-Hypervisor-Platform | Select-Object State"])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            details.push_str(&format!("WindowsHypervisorPlatform: {}; ", output_str.trim()));
-            if output_str.contains("Enabled") {
-                windows_hypervisor_platform_enabled = true;
-            }
-        }
-
-        // Core Isolation
-        let core_isolation_enabled = vbs_enabled || hvci_enabled;
-
-        Ok(WindowsVirtualization {
-            hyper_v_enabled,
-            vbs_enabled,
-            hvci_enabled,
-            wsl_enabled,
-            wsl_version,
-            core_isolation_enabled,
-            memory_integrity_enabled,
-            virtual_machine_platform_enabled,
-            windows_hypervisor_platform_enabled,
             details,
         })
     }
@@ -610,5 +619,32 @@ mod tests {
     fn test_detect_platform() {
         let platform = VirtualizationDetector::detect_platform();
         assert_ne!(platform, Platform::Unknown);
+    }
+
+    #[test]
+    fn parses_vbs_running_sample() {
+        // Shape of a real machine: VBS running, hypervisor active, no optional features listed
+        let out = r#"{"vbs":2,"running":[],"avail":[1,2,3,5,6,7],"hv":true,"feat":[],"secureboot":1,"tpm":false}"#;
+        let f = parse_win_facts(out).unwrap();
+        assert_eq!(f.vbs_status, 2);
+        assert!(f.hypervisor_present && f.secure_boot);
+        assert!(f.available_props.contains(&3));
+        assert!(f.services_running.is_empty());
+    }
+
+    #[test]
+    fn parses_scalar_and_single_object_quirks() {
+        // PowerShell collapses 1-element arrays in some versions
+        let out = "WARNING: something\n{\"vbs\":1,\"running\":2,\"avail\":3,\"hv\":false,\"feat\":{\"n\":\"VirtualMachinePlatform\",\"s\":1},\"secureboot\":0,\"tpm\":true}";
+        let f = parse_win_facts(out).unwrap();
+        assert_eq!(f.services_running, vec![2]);
+        assert_eq!(f.available_props, vec![3]);
+        assert!(f.feature_vm_platform && !f.feature_wsl && f.tpm_present && !f.secure_boot);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_win_facts("").is_none());
+        assert!(parse_win_facts("not json").is_none());
     }
 }

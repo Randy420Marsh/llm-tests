@@ -22,11 +22,22 @@ separately; stronger guarantees would need an external timestamping/signing serv
 
 ## Build & run
 
+One step (needs [Rust](https://rustup.rs)):
+
+| | Build | Run the GUI |
+|---|---|---|
+| Windows | `build.bat` → `dist\LatencyTester.exe` | double-click the exe, or `run.bat` |
+| Linux   | `./build.sh` → `dist/latency-tester` | `./run.sh` |
+
+The exe is self-contained: the MSVC runtime is linked statically, the Vulkan loader is
+optional (loaded at run time; the GPU suite reports "no device" without it), and results are
+written to a `latency_results` folder next to the exe. Copy the single file anywhere to use it.
+
+Command line (also works on the built exe):
+
 ```sh
-cargo build --release
-./target/release/latency-tester                 # GUI
-./target/release/latency-tester --cli           # quick headless pass of all suites
-./target/release/latency-tester --cli --skip gpu --out ./my_results
+latency-tester --cli                       # quick headless pass of all suites
+latency-tester --cli --skip gpu --out ./my_results
 ```
 
 Linux GUI needs `libxkbcommon`, X11/Wayland and OpenGL. The GPU suite needs a Vulkan driver

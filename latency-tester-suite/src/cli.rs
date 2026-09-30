@@ -18,7 +18,7 @@ USAGE:
     latency-tester --cli [OPTIONS] Run a quick headless pass of all suites
 
 OPTIONS (with --cli):
-    --out <DIR>     Directory for signed result files (default: ./latency_results)
+    --out <DIR>     Directory for signed result files (default: ./latency_results in the current directory)
     --skip <SUITE>  Skip a suite: memory, cpu, gpu, input (repeatable)
     -h, --help      Show this help";
 

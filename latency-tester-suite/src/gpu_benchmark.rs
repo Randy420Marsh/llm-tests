@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use ash::{vk, Device, Entry, Instance};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
+use crate::cancel::{self, CancelFlag};
 use crate::timer::HighResTimer;
 
 /// ALU steps (one multiply + one add each) executed by every shader invocation
@@ -72,6 +73,7 @@ pub struct GpuBenchmark {
     queue: vk::Queue,
     queue_family_index: u32,
     timer: HighResTimer,
+    cancel: CancelFlag,
 }
 
 impl Drop for GpuBenchmark {
@@ -224,7 +226,14 @@ impl GpuBenchmark {
             queue,
             queue_family_index,
             timer: HighResTimer::new(),
+            cancel: cancel::new_flag(),
         })
+    }
+
+    /// Share a flag that stops the run early when set
+    pub fn with_cancel(mut self, flag: CancelFlag) -> Self {
+        self.cancel = flag;
+        self
     }
 
     fn create_instance(entry: &Entry) -> Result<Instance> {
@@ -292,12 +301,18 @@ impl GpuBenchmark {
         Ok((device, queue))
     }
 
+    /// Convenience for `GpuBenchmark::new(..).and_then(|b| b.run_owned())`
+    pub fn run_owned(mut self) -> Result<GpuBenchmarkSummary> {
+        self.run()
+    }
+
     pub fn run(&mut self) -> Result<GpuBenchmarkSummary> {
         let system_info = crate::system_info::collect_system_info()?;
         let vulkan_info = self.get_vulkan_info()?;
         let mut results = Vec::new();
 
         for &size in &self.config.workload_sizes {
+            cancel::check(&self.cancel)?;
             results.push(self.run_compute_workload(size)?);
         }
 
@@ -515,12 +530,14 @@ impl GpuBenchmark {
         let res = self.create_resources(size, false)?;
 
         for _ in 0..self.config.warmup_iterations {
+            cancel::check(&self.cancel)?;
             self.submit_and_wait(&res)?;
         }
 
         let iterations = self.config.iterations.max(1);
         let mut times = Vec::with_capacity(iterations as usize);
         for _ in 0..iterations {
+            cancel::check(&self.cancel)?;
             let start = self.timer.now_ticks();
             self.submit_and_wait(&res)?;
             let end = self.timer.now_ticks();

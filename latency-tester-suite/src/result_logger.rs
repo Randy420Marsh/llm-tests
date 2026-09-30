@@ -125,6 +125,8 @@ impl ResultLogger {
                 use std::os::unix::fs::PermissionsExt;
                 perms.set_mode(if readable_by_others { 0o444 } else { 0o400 });
             }
+            #[cfg(not(unix))]
+            let _ = readable_by_others; // Windows only has a read-only attribute
             let _ = std::fs::set_permissions(path, perms);
         }
     }

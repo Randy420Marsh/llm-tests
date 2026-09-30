@@ -171,7 +171,12 @@ impl SystemInfoCollector {
         let (p_cores, e_cores) = self.detect_hybrid_cores();
 
         Ok(CpuInfo {
-            name: cpu.name().to_string(),
+            // sysinfo reports "CPU 1" on Windows; the CPUID brand string is the real model name
+            name: if brand.trim().is_empty() || brand == "Unknown" {
+                cpu.name().to_string()
+            } else {
+                brand.trim().to_string()
+            },
             vendor: vendor.clone(),
             brand: brand.clone(),
             frequency: cpu.frequency(),
@@ -215,7 +220,6 @@ impl SystemInfoCollector {
                 if feature_info.has_sse41() { features.push("SSE4.1".to_string()); }
                 if feature_info.has_sse42() { features.push("SSE4.2".to_string()); }
                 if feature_info.has_avx() { features.push("AVX".to_string()); }
-                if feature_info.has_avx() { features.push("AVX2".to_string()); }
                 if feature_info.has_fma() { features.push("FMA".to_string()); }
                 if feature_info.has_aesni() { features.push("AES-NI".to_string()); }
                 // SHA detection is more complex in raw-cpuid, skipping for now or using a generic check
@@ -225,6 +229,7 @@ impl SystemInfoCollector {
             
             // Check for AVX-512
             if let Some(ext_features) = cpuid.get_extended_feature_info() {
+                if ext_features.has_avx2() { features.push("AVX2".to_string()); }
                 if ext_features.has_avx512f() { features.push("AVX-512F".to_string()); }
                 if ext_features.has_avx512dq() { features.push("AVX-512DQ".to_string()); }
                 if ext_features.has_avx512cd() { features.push("AVX-512CD".to_string()); }
@@ -291,8 +296,8 @@ impl SystemInfoCollector {
     fn detect_hybrid_cores(&self) -> (usize, usize) {
         // Intel hybrid architecture: logical P/E thread counts
         // (e.g. Core Ultra 270K = 8 P-threads + 12 E-threads, no SMT)
-        // For now, return (0, 0) - would need CPUID leaf 0x1A/0x1B parsing
-        (0, 0)
+        let (p, e) = crate::topology::hybrid_counts();
+        if e == 0 { (p, 0) } else { (p, e) }
     }
 
     fn collect_memory_info(&mut self) -> Result<MemoryInfo> {
@@ -381,10 +386,6 @@ impl SystemInfoCollector {
 
     #[cfg(target_os = "windows")]
     fn collect_windows_virtualization_info(&self) -> Result<VirtualizationInfo> {
-        use windows::Win32::System::SystemInformation::*;
-        use windows::Win32::Foundation::*;
-        use std::ptr;
-        
         let mut details = String::new();
         
         // Check if running in a VM
