@@ -88,17 +88,17 @@ impl Measure {
     pub fn draw(&self, plot_ui: &mut PlotUi, top: f64) {
         for (i, (name, x)) in self.markers.iter().enumerate() {
             let c = COLORS[i % COLORS.len()];
-            plot_ui.vline(VLine::new(*x).color(c).width(1.5).style(egui_plot::LineStyle::dashed_dense()));
+            plot_ui.vline(VLine::new(*x).color(c).width(1.5_f32).style(egui_plot::LineStyle::dashed_dense()));
             plot_ui.text(Text::new(PlotPoint::new(*x, top), RichText::new(name).color(c).strong()));
         }
         for (i, (name, a, b)) in self.ranges.iter().enumerate() {
             let c = COLORS[(i + 3) % COLORS.len()];
-            plot_ui.vline(VLine::new(*a).color(c).width(1.0));
-            plot_ui.vline(VLine::new(*b).color(c).width(1.0));
+            plot_ui.vline(VLine::new(*a).color(c).width(1.0_f32));
+            plot_ui.vline(VLine::new(*b).color(c).width(1.0_f32));
             plot_ui.text(Text::new(PlotPoint::new((a + b) / 2.0, top), RichText::new(name).color(c)).anchor(egui::Align2::CENTER_TOP));
         }
         if let Some(p) = self.pending {
-            plot_ui.vline(VLine::new(p).color(Color32::from_rgb(255, 209, 102)).width(1.0).style(egui_plot::LineStyle::dotted_dense()));
+            plot_ui.vline(VLine::new(p).color(Color32::from_rgb(255, 209, 102)).width(1.0_f32).style(egui_plot::LineStyle::dotted_dense()));
         }
     }
 
