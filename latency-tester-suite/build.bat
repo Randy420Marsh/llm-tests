@@ -5,7 +5,14 @@ cd /d "%~dp0"
 where cargo >nul 2>nul || (echo Rust is not installed. Get it from https://rustup.rs & exit /b 1)
 cargo build --release || exit /b 1
 if not exist dist mkdir dist
-copy /y target\release\latency-tester.exe dist\LatencyTester.exe >nul || exit /b 1
+copy /y target\release\latency-tester.exe dist\LatencyTester.exe >nul
+if errorlevel 1 (
+  echo.
+  echo Could not overwrite dist\LatencyTester.exe - it is probably still running.
+  echo Close Latency Tester ^(check Task Manager^) and run build.bat again.
+  echo The fresh build is at target\release\latency-tester.exe
+  exit /b 1
+)
 echo.
 echo Done: %~dp0dist\LatencyTester.exe
 echo Run it with a double-click, or "dist\LatencyTester.exe --cli" from a terminal.
