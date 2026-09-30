@@ -1,12 +1,12 @@
+#![allow(dead_code)] // live-input hooks and helpers are public API for embedding
 //! Input latency measurement using high-resolution timers
 //! Measures mouse/keyboard to display latency (click-to-photon)
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
-use crate::timer::{HighResTimer, IntervalTimer, busy_wait_ns};
+use crate::timer::{HighResTimer, busy_wait_ns};
 use rand::{Rng, SeedableRng};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,9 +31,10 @@ pub enum InputTestMode {
 impl Default for InputLatencyConfig {
     fn default() -> Self {
         Self {
+            // MouseClick/KeyPress are simulated headlessly (fixed sleeps, no real human), so
+            // they are opt-in; the interactive click test lives in the GUI.
             test_modes: vec![
-                InputTestMode::MouseClick,
-                InputTestMode::KeyPress,
+                InputTestMode::MouseMove,
                 InputTestMode::RawInput,
                 InputTestMode::PollingRate,
                 InputTestMode::Jitter,
@@ -81,26 +82,27 @@ pub struct InputLatencyTester {
     pub pending_stimulus: Arc<Mutex<Option<StimulusInfo>>>,
     pub last_input_time: Arc<Mutex<Option<u64>>>,
     pub last_response_time: Arc<Mutex<Option<u64>>>,
+    /// Latencies (ms) recorded from real stimulus/response pairs
+    pub live_samples: Arc<Mutex<Vec<f64>>>,
 }
 
 #[derive(Debug, Clone)]
-struct StimulusInfo {
-    trigger_time: u64,
-    stimulus_type: InputTestMode,
+pub struct StimulusInfo {
+    pub trigger_time: u64,
+    pub stimulus_type: InputTestMode,
 }
 
 impl InputLatencyTester {
     pub fn new(config: InputLatencyConfig) -> Self {
         let timer = HighResTimer::new();
-        let timer_overhead = timer.measure_overhead(10000);
-        
         Self {
             config,
             timer,
-            rng: rand::rngs::StdRng::seed_from_u64(0x123456789ABCDEF0 as u64),
+            rng: rand::rngs::StdRng::seed_from_u64(0x123456789ABCDEF0),
             pending_stimulus: Arc::new(Mutex::new(None)),
             last_input_time: Arc::new(Mutex::new(None)),
             last_response_time: Arc::new(Mutex::new(None)),
+            live_samples: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -108,7 +110,7 @@ impl InputLatencyTester {
         let system_info = crate::system_info::collect_system_info()?;
         let mut results = Vec::new();
 
-        for &mode in &self.config.test_modes {
+        for mode in self.config.test_modes.clone() {
             let result = self.run_mode(mode)?;
             results.push(result);
         }
@@ -154,7 +156,6 @@ impl InputLatencyTester {
     fn single_click_test(&mut self) -> Result<Option<f64>> {
         // Random delay before showing stimulus
         let delay_ms = self.rng.gen_range(self.config.delay_range_ms.0..=self.config.delay_range_ms.1);
-        let delay_ns = delay_ms as u64 * 1_000_000;
         
         // Wait for random delay
         std::thread::sleep(Duration::from_millis(delay_ms as u64));
@@ -277,6 +278,9 @@ impl InputLatencyTester {
             std::thread::sleep(Duration::from_micros(100));
         }
         
+        if intervals.is_empty() {
+            return Err(anyhow::anyhow!("polling-rate test collected no samples"));
+        }
         let avg_interval = intervals.iter().sum::<f64>() / intervals.len() as f64;
         let polling_rate = 1000.0 / avg_interval; // Hz
         
@@ -312,7 +316,7 @@ impl InputLatencyTester {
         }
         
         let mut sorted = samples.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.total_cmp(b));
         
         let sum: f64 = sorted.iter().sum();
         let avg = sum / sorted.len() as f64;
@@ -325,8 +329,9 @@ impl InputLatencyTester {
         let std_dev = variance.sqrt();
         
         let p50 = sorted[sorted.len() / 2];
-        let p95 = sorted[(sorted.len() as f64 * 0.95) as usize];
-        let p99 = sorted[(sorted.len() as f64 * 0.99) as usize];
+        let last = sorted.len() - 1;
+        let p95 = sorted[((sorted.len() as f64 * 0.95) as usize).min(last)];
+        let p99 = sorted[((sorted.len() as f64 * 0.99) as usize).min(last)];
         let p999_idx = ((sorted.len() as f64 * 0.999) as usize).min(sorted.len() - 1);
         let p999 = sorted[p999_idx];
         
@@ -359,10 +364,10 @@ impl InputLatencyTester {
         // Check if we were waiting for this stimulus
         if let Some(stimulus) = self.pending_stimulus.lock().unwrap().take() {
             if stimulus.stimulus_type == event_type {
-                let latency_ticks = now - stimulus.trigger_time;
+                let latency_ticks = now.saturating_sub(stimulus.trigger_time);
                 let latency_ms = self.timer.ticks_to_ms_f64(latency_ticks);
                 *self.last_response_time.lock().unwrap() = Some(now);
-                // In real implementation, would store this sample
+                self.live_samples.lock().unwrap().push(latency_ms);
             }
         }
     }
@@ -380,7 +385,7 @@ impl InputLatencyTester {
     pub fn get_last_latency(&self) -> Option<f64> {
         let input = (*self.last_input_time.lock().unwrap())?;
         let response = (*self.last_response_time.lock().unwrap())?;
-        let latency_ticks = response - input;
+        let latency_ticks = response.checked_sub(input)?;
         Some(self.timer.ticks_to_ms_f64(latency_ticks))
     }
 }
@@ -398,7 +403,12 @@ pub fn run_click_to_photon_test(sample_count: u32) -> Result<Vec<f64>> {
     let mut tester = InputLatencyTester::new(config);
     let summary = tester.run()?;
     
-    Ok(summary.results[0].individual_samples)
+    summary
+        .results
+        .into_iter()
+        .next()
+        .map(|r| r.individual_samples)
+        .ok_or_else(|| anyhow::anyhow!("no input latency results"))
 }
 
 /// Measure system timer resolution

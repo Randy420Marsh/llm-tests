@@ -3,7 +3,8 @@
 //! Tabs: Dashboard, Memory, CPU, GPU, Input Latency, Virtualization, Results
 
 use eframe::egui;
-use egui::{Color32, RichText, Ui, Sense, Align2};
+use egui::{Color32, RichText, Ui, Sense};
+use rand::Rng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,10 +14,9 @@ use std::time::{Duration, Instant};
 use crate::cpu_benchmark::{CpuBenchmark, CpuBenchmarkConfig, WorkloadType, AffinityMode};
 use crate::gpu_benchmark::{GpuBenchmark, GpuBenchmarkConfig};
 use crate::input_latency::{InputLatencyTester, InputLatencyConfig, InputTestMode, measure_timer_resolution, TimerResolutionInfo};
-use crate::memory_benchmark::{MemoryBenchmark, MemoryBenchmarkConfig, AccessPattern, MemoryBenchmarkSummary};
+use crate::memory_benchmark::{MemoryBenchmark, MemoryBenchmarkConfig, MemoryBenchmarkSummary};
 use crate::result_logger::{ResultLogger, VerifiedResult, generate_shareable_summary};
 use crate::system_info::SystemInfo;
-use crate::timer::HighResTimer;
 use crate::virtualization::{VirtualizationDetector, VirtualizationStatus};
 
 #[derive(Default, Clone)]
@@ -29,14 +29,6 @@ enum Tab {
     Input,
     Virtualization,
     Results,
-}
-
-enum RunningTask {
-    Memory(MemoryBenchmark, MemoryBenchmarkConfig),
-    Cpu(CpuBenchmark, CpuBenchmarkConfig),
-    Gpu(GpuBenchmark, GpuBenchmarkConfig),
-    Input(InputLatencyTester, InputLatencyConfig),
-    None,
 }
 
 pub struct LatencyTesterApp {
@@ -57,6 +49,7 @@ pub struct LatencyTesterApp {
     last_gpu_result: Option<crate::gpu_benchmark::GpuBenchmarkSummary>,
     last_input_result: Option<crate::input_latency::InputLatencySummary>,
     last_logged: Option<(VerifiedResult, crate::result_logger::VerificationResult)>,
+    all_results: Option<Vec<VerifiedResult>>,
     
     // Running task (completed tasks are stored in pending)
     running: Arc<std::sync::Mutex<Option<RunningTaskState>>>,
@@ -67,7 +60,6 @@ pub struct LatencyTesterApp {
     mem_quick_size: usize,
     
     // CPU config
-    cpu_config: CpuBenchmarkConfig,
     cpu_workload: WorkloadType,
     cpu_threads: usize,
     
@@ -97,6 +89,7 @@ enum InputState {
     FalseStart, // Clicked too early
 }
 
+#[allow(dead_code)] // kept for display/diagnostics
 struct RunningTaskState {
     kind: String,
     started: Instant,
@@ -131,11 +124,11 @@ impl LatencyTesterApp {
             last_gpu_result: None,
             last_input_result: None,
             last_logged: None,
+            all_results: None,
             running: Arc::new(std::sync::Mutex::new(None)),
             task_status: String::from("Ready"),
             mem_config: MemoryBenchmarkConfig::default(),
             mem_quick_size: 64 * 1024 * 1024,
-            cpu_config: CpuBenchmarkConfig::default(),
             cpu_workload: WorkloadType::GameSim,
             cpu_threads: num_cpus::get(),
             gpu_config: GpuBenchmarkConfig::default(),
@@ -157,8 +150,9 @@ impl LatencyTesterApp {
         self.log_text = format!("[{}] {}\n{}", timestamp, msg, self.log_text);
         if self.log_text.len() > 60_000 {
             // Keep log bounded
-            let trunc = self.log_text.rfind('\n').unwrap_or(0);
-            self.log_text = self.log_text[trunc..].to_string();
+            // Newest entries come first, so drop the tail (on a line boundary)
+            let cut = self.log_text[..40_000].rfind('\n').unwrap_or(40_000);
+            self.log_text.truncate(cut + 1);
         }
     }
 
@@ -167,26 +161,13 @@ impl LatencyTesterApp {
             return;
         }
         self.info_refreshing = true;
-        let start = Instant::now();
-        
-        // Refresh in a background thread to not block GUI
-        let result = std::thread::spawn(move || {
+
+        // Collected on a worker thread so the GUI never blocks; picked up in check_completed_tasks
+        thread::spawn(|| {
             let sys = crate::system_info::collect_system_info();
             let virt = VirtualizationDetector::detect();
-            (sys, virt)
-        }).join();
-        
-        match result {
-            Ok((Ok(sys), Ok(virt))) => {
-                self.system_info = Some(sys);
-                self.virt_status = Some(virt);
-            }
-            _ => {}
-        }
-        
-        self.info_refreshing = false;
-        self.last_refresh = Instant::now();
-        let _ = start;
+            COMPLETE_SYSINFO.lock().unwrap().replace((sys, virt));
+        });
     }
 
     fn start_memory_benchmark(&mut self) {
@@ -209,15 +190,10 @@ impl LatencyTesterApp {
         thread::spawn(move || {
             let mut bench = bench;
             let result = bench.run();
-            
-            // Signal completion
+            COMPLETE_MEMORY_RESULT.lock().unwrap().replace(result);
             if let Ok(mut guard) = running.lock() {
                 *guard = None;
             }
-            
-            // We need to communicate back - use a channel-like approach via static
-            // Simplified: store in a global
-            COMPLETE_MEMORY_RESULT.lock().unwrap().replace(result);
         });
     }
 
@@ -254,12 +230,10 @@ impl LatencyTesterApp {
         thread::spawn(move || {
             let mut bench = bench;
             let result = bench.run();
-            
+            COMPLETE_CPU_RESULT.lock().unwrap().replace(result);
             if let Ok(mut guard) = running.lock() {
                 *guard = None;
             }
-            
-            COMPLETE_CPU_RESULT.lock().unwrap().replace(result);
         });
     }
 
@@ -267,16 +241,8 @@ impl LatencyTesterApp {
         if self.running.lock().unwrap().is_some() {
             return;
         }
-        
+
         let config = self.gpu_config.clone();
-        let bench = match GpuBenchmark::new(config.clone()) {
-            Ok(b) => b,
-            Err(e) => {
-                self.log(&format!("Failed to create GPU benchmark: {}", e));
-                return;
-            }
-        };
-        
         *self.running.lock().unwrap() = Some(RunningTaskState {
             kind: "gpu".to_string(),
             started: Instant::now(),
@@ -286,14 +252,12 @@ impl LatencyTesterApp {
 
         let running = self.running.clone();
         thread::spawn(move || {
-            let mut bench = bench;
-            let result = bench.run();
-            
+            // Vulkan objects are created and destroyed on the worker thread
+            let result = GpuBenchmark::new(config).and_then(|mut bench| bench.run());
+            COMPLETE_GPU_RESULT.lock().unwrap().replace(result);
             if let Ok(mut guard) = running.lock() {
                 *guard = None;
             }
-            
-            COMPLETE_GPU_RESULT.lock().unwrap().replace(result);
         });
     }
 
@@ -316,16 +280,27 @@ impl LatencyTesterApp {
         thread::spawn(move || {
             let mut tester = tester;
             let result = tester.run();
-            
+            COMPLETE_INPUT_RESULT.lock().unwrap().replace(result);
             if let Ok(mut guard) = running.lock() {
                 *guard = None;
             }
-            
-            COMPLETE_INPUT_RESULT.lock().unwrap().replace(result);
         });
     }
 
     fn check_completed_tasks(&mut self) {
+        if let Some((sys, virt)) = COMPLETE_SYSINFO.lock().unwrap().take() {
+            self.info_refreshing = false;
+            self.last_refresh = Instant::now();
+            match sys {
+                Ok(sys) => self.system_info = Some(sys),
+                Err(e) => self.log(&format!("System info error: {}", e)),
+            }
+            match virt {
+                Ok(virt) => self.virt_status = Some(virt),
+                Err(e) => self.log(&format!("Virtualization detection error: {}", e)),
+            }
+        }
+
         // Check for completed tasks
         if let Some(result) = COMPLETE_MEMORY_RESULT.lock().unwrap().take() {
             self.task_status = "Idle".to_string();
@@ -429,9 +404,16 @@ impl LatencyTesterApp {
     fn handle_input_test(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let now = self.input_start_time.elapsed().as_secs_f64();
         
-        // Handle keyboard input (space)
+        // Reserve the test area first so pointer presses can be limited to it
+        let rect = ui.available_rect_before_wrap();
+        let _response = ui.allocate_rect(rect, Sense::click());
+
+        // React on press (not release) to measure true input latency
         let space_pressed = ui.input(|i| i.key_pressed(egui::Key::Space));
-        let pointer_clicked = ui.input(|i| i.pointer.primary_clicked());
+        let pointer_clicked = ui.input(|i| {
+            i.pointer.primary_pressed()
+                && i.pointer.interact_pos().map_or(false, |p| rect.contains(p))
+        });
         
         // State machine
         match self.input_state {
@@ -439,7 +421,7 @@ impl LatencyTesterApp {
                 if space_pressed || pointer_clicked {
                     // Start: random delay 1.5-4 seconds
                     let mut rng = rand::thread_rng();
-                    let delay = rng.gen_range(1500.0..4000.0);
+                    let delay = rng.gen_range(1.5..4.0); // seconds
                     self.input_waiting_until = Some(now + delay);
                     self.input_state = InputState::Waiting;
                     self.last_click_latency = None;
@@ -462,7 +444,10 @@ impl LatencyTesterApp {
                 if space_pressed || pointer_clicked {
                     // Record click time - compute latency
                     let click_ticks = self.input_tester.timer.now_ticks();
-                    let latency_ms = self.input_tester.timer.ticks_to_ms_f64(click_ticks - self.ready_time_ticks);
+                    let latency_ms = self
+                        .input_tester
+                        .timer
+                        .ticks_to_ms_f64(click_ticks.saturating_sub(self.ready_time_ticks));
                     self.last_click_latency = Some(latency_ms);
                     self.click_samples.push(latency_ms);
                     self.input_state = InputState::Result;
@@ -472,9 +457,6 @@ impl LatencyTesterApp {
         }
         
         // Render the test area
-        let rect = ui.available_rect_before_wrap();
-        let response = ui.allocate_rect(rect, Sense::click());
-        
         let color = match self.input_state {
             InputState::Idle => Color32::from_rgb(40, 40, 40),
             InputState::Waiting => Color32::from_rgb(180, 50, 50),
@@ -486,9 +468,9 @@ impl LatencyTesterApp {
         ui.painter().rect_filled(rect, 8.0, color);
         
         let (text, text_color) = match self.input_state {
-            InputState::Idle => ("Click or press SPACE to start", Color32::WHITE),
-            InputState::Waiting => ("Wait for GREEN...", Color32::WHITE),
-            InputState::Ready => ("CLICK NOW!", Color32::WHITE),
+            InputState::Idle => ("Click or press SPACE to start".to_string(), Color32::WHITE),
+            InputState::Waiting => ("Wait for GREEN...".to_string(), Color32::WHITE),
+            InputState::Ready => ("CLICK NOW!".to_string(), Color32::WHITE),
             InputState::Result => {
                 let lat = self.last_click_latency.unwrap_or(0.0);
                 let avg = if self.click_samples.is_empty() { 0.0 } else {
@@ -498,16 +480,19 @@ impl LatencyTesterApp {
                     "Latency: {:.3} ms\nAverage ({}): {:.3} ms\n\nPress SPACE to go again",
                     lat, self.click_samples.len(), avg
                 );
-                (Box::leak(text.into_boxed_str()), Color32::WHITE)
+                (text, Color32::WHITE)
             }
-            InputState::FalseStart => ("Too early! Click / SPACE to try again", Color32::WHITE),
+            InputState::FalseStart => ("Too early! Click / SPACE to try again".to_string(), Color32::WHITE),
         };
         
         let center = rect.center();
         ui.painter()
-            .text(center, egui::Align2::CENTER, &text, egui::FontId::proportional(28.0), text_color);
-        
-        let _ = ctx;
+            .text(center, egui::Align2::CENTER_CENTER, &text, egui::FontId::proportional(28.0), text_color);
+
+        // The state machine is time driven, so keep frames coming while a round is active
+        if matches!(self.input_state, InputState::Waiting | InputState::Ready) {
+            ctx.request_repaint();
+        }
     }
 
     fn render_dashboard(&mut self, ui: &mut Ui) {
@@ -608,8 +593,8 @@ impl LatencyTesterApp {
             
             ui.horizontal(|ui| {
                 for (name, size) in size_names {
-                    if ui.selectable_value(&mut self.mem_quick_size, *size, name).clicked() {
-                        self.mem_quick_size = *size;
+                    if ui.selectable_value(&mut self.mem_quick_size, size, name).clicked() {
+                        self.mem_quick_size = size;
                     }
                 }
             });
@@ -686,8 +671,8 @@ impl LatencyTesterApp {
             ];
             
             for (name, wl) in workloads {
-                if ui.radio_value(&mut self.cpu_workload, *wl, name).changed() {
-                    self.cpu_workload = *wl;
+                if ui.radio_value(&mut self.cpu_workload, wl, name).changed() {
+                    self.cpu_workload = wl;
                 }
             }
             
@@ -734,37 +719,40 @@ impl LatencyTesterApp {
         ui.separator();
         
         ui.group(|ui| {
-            ui.label(format!("Scenes: {}", self.gpu_config.test_scenes.len()));
-            ui.label(format!("Resolutions: {:?}", self.gpu_config.resolutions));
-            ui.label(format!("Frame counts: {:?}", self.gpu_config.frame_counts));
-            
+            ui.label(format!("Workload sizes (elements): {:?}", self.gpu_config.workload_sizes));
+            ui.horizontal(|ui| {
+                ui.label("Iterations:");
+                ui.add(egui::DragValue::new(&mut self.gpu_config.iterations).range(1..=10000));
+                ui.label("Warmup:");
+                ui.add(egui::DragValue::new(&mut self.gpu_config.warmup_iterations).range(0..=1000));
+            });
+
             if ui.button("Run GPU Benchmark").clicked() {
                 self.start_gpu_benchmark();
             }
         });
-        
+
         if let Some(summary) = &self.last_gpu_result {
             ui.separator();
             ui.heading("Latest Results");
-            
-            if let Some(ref vulkan_info) = &summary.vulkan_info {
-                ui.label(format!("Vulkan device: {}", vulkan_info.device_name));
-                ui.label(format!("API: {} Driver: {}", vulkan_info.api_version, vulkan_info.driver_version));
-            }
-            
+
+            let vulkan_info = &summary.vulkan_info;
+            ui.label(format!("Vulkan device: {} ({})", vulkan_info.device_name, vulkan_info.device_type));
+            ui.label(format!("API: {} Driver: {}", vulkan_info.api_version, vulkan_info.driver_version));
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for result in summary.results.iter().take(20) {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{:?}", result.scene));
-                        ui.label(format!("{}x{}", result.resolution.0, result.resolution.1));
-                        ui.label(format!("{:.2} ms avg frame", result.avg_frame_time_ms));
-                        ui.label(format!("1% low: {:.2} ms", result.percentile_1_low_ms));
-                        ui.label(format!("0.1% low: {:.2} ms", result.percentile_01_low_ms));
+                        ui.label(format!("{} elements", result.workload_size));
+                        ui.label(format!("{:.3} ms avg", result.avg_latency_ms));
+                        ui.label(format!("p95: {:.3} ms", result.percentile_95_ms));
+                        ui.label(format!("p99: {:.3} ms", result.percentile_99_ms));
+                        ui.label(format!("{:.1} GOPS", result.throughput_geops));
                     });
                 }
             });
         } else {
-            ui.label("No GPU results yet. Requires Vulkan SDK / drivers installed.");
+            ui.label("No GPU results yet. Requires a Vulkan driver (a software driver such as lavapipe also works).");
         }
     }
 
@@ -791,7 +779,7 @@ impl LatencyTesterApp {
         let test_height = (available.y * 0.5).max(200.0);
         egui::ScrollArea::both().show(ui, |ui| {
             ui.vertical(|ui| {
-                ui.add_sized([available.x, test_height], |ui| {
+                ui.allocate_ui(egui::vec2(available.x, test_height), |ui| {
                     self.handle_input_test(ui, ctx);
                 });
                 
@@ -801,7 +789,7 @@ impl LatencyTesterApp {
                     if !self.click_samples.is_empty() {
                         let avg = self.click_samples.iter().sum::<f64>() / self.click_samples.len() as f64;
                         let mut sorted = self.click_samples.clone();
-                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        sorted.sort_by(|a, b| a.total_cmp(b));
                         let min = sorted[0];
                         let max = *sorted.last().unwrap();
                         let p95 = sorted[((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1)];
@@ -912,11 +900,13 @@ impl LatencyTesterApp {
             }
             
             if ui.button("Refresh Results").clicked() {
-                if let Some(logger) = &self.logger {
-                    if let Ok(results) = logger.load_all_results() {
+                match self.logger.as_ref().map(|l| l.load_all_results()) {
+                    Some(Ok(results)) => {
                         self.log(&format!("Loaded {} results from master log", results.len()));
                         self.all_results = Some(results);
                     }
+                    Some(Err(e)) => self.log(&format!("Failed to load results: {}", e)),
+                    None => self.log("No result logger available"),
                 }
             }
         });
@@ -933,7 +923,7 @@ impl LatencyTesterApp {
             
             if ui.button("Copy Shareable Summary").clicked() {
                 let summary = generate_shareable_summary(verified, verification);
-                ui.ctx().clipboard().set_text(summary);
+                ui.ctx().copy_text(summary);
                 self.log("Shareable summary copied to clipboard");
             }
         }
@@ -968,7 +958,7 @@ impl LatencyTesterApp {
                 .auto_shrink([false, true])
                 .max_height(150.0)
                 .show(ui, |ui| {
-                    for line in self.log_text.lines().rev().take(100) {
+                    for line in self.log_text.lines().take(100) {
                         ui.label(egui::RichText::new(line).monospace().size(11.0));
                     }
                 });
@@ -979,6 +969,9 @@ impl LatencyTesterApp {
 impl eframe::App for LatencyTesterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_completed_tasks();
+
+        // Poll for finished background work even when the user is idle
+        ctx.request_repaint_after(Duration::from_millis(200));
         
         // Refresh system info on first frame
         if self.system_info.is_none() && !self.info_refreshing {
@@ -989,7 +982,7 @@ impl eframe::App for LatencyTesterApp {
             ui.horizontal(|ui| {
                 ui.heading("⚡ Latency Tester Suite v1.0");
                 
-                if *self.running.lock().unwrap().is_some() {
+                if self.running.lock().unwrap().is_some() {
                     ui.colored_label(Color32::YELLOW, " ⏳ Running...");
                 }
                 
@@ -1010,19 +1003,12 @@ impl eframe::App for LatencyTesterApp {
             ui.heading("Tabs:");
             ui.separator();
             if ui.button("📊 Dashboard").clicked() { self.tab = Tab::Dashboard; }
-            ui.end_row();
             if ui.button("🧠 Memory").clicked() { self.tab = Tab::Memory; }
-            ui.end_row();
             if ui.button("⚙️ CPU").clicked() { self.tab = Tab::Cpu; }
-            ui.end_row();
             if ui.button("🎮 GPU (Vulkan)").clicked() { self.tab = Tab::Gpu; }
-            ui.end_row();
             if ui.button("🖱️ Input Latency").clicked() { self.tab = Tab::Input; }
-            ui.end_row();
             if ui.button("🔒 Virtualization").clicked() { self.tab = Tab::Virtualization; }
-            ui.end_row();
             if ui.button("📋 Results & Verify").clicked() { self.tab = Tab::Results; }
-            ui.end_row();
         });
         
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1067,3 +1053,9 @@ static COMPLETE_GPU_RESULT: Mutex<Option<Result<crate::gpu_benchmark::GpuBenchma
     Mutex::new(None);
 static COMPLETE_INPUT_RESULT: Mutex<Option<Result<crate::input_latency::InputLatencySummary, anyhow::Error>>> = 
     Mutex::new(None);
+static COMPLETE_SYSINFO: Mutex<
+    Option<(
+        Result<SystemInfo, anyhow::Error>,
+        Result<VirtualizationStatus, anyhow::Error>,
+    )>,
+> = Mutex::new(None);

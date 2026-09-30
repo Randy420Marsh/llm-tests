@@ -1,3 +1,4 @@
+#![allow(dead_code)] // public helper API; not every function is wired into the GUI/CLI
 //! Verification utilities for result validation and hash checking
 
 use anyhow::Result;
@@ -57,7 +58,7 @@ pub fn create_signed_package(
     output_path: &Path,
     private_key: &[u8; 32],
 ) -> Result<()> {
-    use crate::result_logger::{ResultLogger, VerifiedResult};
+    use crate::result_logger::ResultLogger;
     use std::fs::File;
     use std::io::Write;
     
@@ -87,7 +88,7 @@ pub fn create_signed_package(
     
     // Write each result
     for result in results {
-        let result_bytes = bincode::serialize(&result)?;
+        let result_bytes = serde_json::to_vec(&result)?;
         package.extend_from_slice(&(result_bytes.len() as u32).to_le_bytes());
         package.extend_from_slice(&result_bytes);
     }
@@ -185,7 +186,7 @@ pub fn verify_signed_package(
         let result_bytes = &package_data[offset..offset+result_len];
         offset += result_len;
         
-        let result: crate::result_logger::VerifiedResult = bincode::deserialize(result_bytes)?;
+        let result: crate::result_logger::VerifiedResult = serde_json::from_slice(result_bytes)?;
         results.push(result);
     }
     
@@ -243,5 +244,65 @@ mod tests {
         let hash = generate_app_hash();
         assert!(hash.is_ok());
         assert_eq!(hash.unwrap().len(), 64); // SHA256 hex = 64 chars
+    }
+
+    fn signed_results(dir: &Path, key: &[u8; 32]) -> ResultLoggerFixture {
+        use crate::result_logger::ResultLogger;
+        let logger = ResultLogger::new_with_key("1.0.0".into(), dir.to_string_lossy().into(), key).unwrap();
+        let info = crate::system_info::collect_system_info().unwrap();
+        let v = serde_json::json!({"x": 1.25});
+        logger.log_result("cpu", &info, &v, &v, Default::default()).unwrap();
+        logger.log_result("gpu", &info, &v, &v, Default::default()).unwrap();
+        ResultLoggerFixture
+    }
+    struct ResultLoggerFixture;
+
+    #[test]
+    fn test_signed_package_round_trip_and_tamper() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        signed_results(dir.path(), &key);
+        let pkg = dir.path().join("package.bin");
+        create_signed_package(dir.path(), &pkg, &key).unwrap();
+
+        let ok = verify_signed_package(&pkg, &key).unwrap();
+        assert!(ok.valid, "{}", ok.message);
+        assert_eq!(ok.results.len(), 2);
+        assert_eq!(ok.manifest.unwrap()["result_count"], 2);
+
+        // wrong key
+        assert!(!verify_signed_package(&pkg, &[8u8; 32]).unwrap().valid);
+
+        // flipped byte
+        let mut bytes = std::fs::read(&pkg).unwrap();
+        bytes[10] ^= 0xFF;
+        let bad = dir.path().join("bad.bin");
+        std::fs::write(&bad, bytes).unwrap();
+        assert!(!verify_signed_package(&bad, &key).unwrap().valid);
+
+        // truncated
+        let short = dir.path().join("short.bin");
+        std::fs::write(&short, [0u8; 8]).unwrap();
+        assert!(!verify_signed_package(&short, &key).unwrap().valid);
+    }
+
+    #[test]
+    fn test_file_hash_matches_known_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("abc");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(
+            compute_file_hash(&f).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(verify_app_integrity(&generate_app_hash().unwrap()).unwrap());
+        assert!(!verify_app_integrity("deadbeef").unwrap());
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

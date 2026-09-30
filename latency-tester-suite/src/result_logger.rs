@@ -1,19 +1,55 @@
+#![allow(dead_code)] // public helpers (verify_file, export_to_csv) are exercised by tests
 //! Result logging with cryptographic verification (salted hashes)
 //! Ensures results are tamper-proof and verifiable
 
 use anyhow::Result;
 use hmac::{Hmac, Mac};
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Sha512, Digest};
+use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write, Read};
+use std::io::{Write, Read};
 use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
-type HmacSha512 = Hmac<Sha512>;
+
+/// Serialize a JSON value with object keys sorted, giving a stable byte representation
+fn canonical_json(value: &serde_json::Value) -> Vec<u8> {
+    // Keys are sorted at every level, independent of serde_json's `preserve_order` feature
+    fn write(v: &serde_json::Value, out: &mut Vec<u8>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let sorted: std::collections::BTreeMap<_, _> = map.iter().collect();
+                out.push(b'{');
+                for (i, (k, v)) in sorted.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(serde_json::to_string(k).unwrap_or_default().as_bytes());
+                    out.push(b':');
+                    write(v, out);
+                }
+                out.push(b'}');
+            }
+            serde_json::Value::Array(a) => {
+                out.push(b'[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    write(v, out);
+                }
+                out.push(b']');
+            }
+            other => out.extend_from_slice(other.to_string().as_bytes()),
+        }
+    }
+    let mut out = Vec::new();
+    write(value, &mut out);
+    out
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifiedResult {
@@ -57,10 +93,10 @@ pub struct VerificationResult {
 }
 
 pub struct ResultLogger {
-    app_version: String,
+    pub(crate) app_version: String,
     pub app_hash: String,
-    private_key: [u8; 32],  // HMAC key (in production, use proper key management)
-    output_dir: String,
+    pub(crate) private_key: [u8; 32],  // HMAC key (in production, use proper key management)
+    pub(crate) output_dir: String,
 }
 
 impl ResultLogger {
@@ -162,8 +198,10 @@ impl ResultLogger {
 
     fn sign(&self, header: &ResultHeader, payload: &ResultPayload) -> Result<Signature> {
         // Serialize header and payload for signing
-        let header_bytes = bincode::serialize(header)?;
-        let payload_bytes = bincode::serialize(payload)?;
+        // Canonical JSON (sorted keys) so the signature survives a save/load round trip,
+        // regardless of HashMap iteration order
+        let header_bytes = canonical_json(&serde_json::to_value(header)?);
+        let payload_bytes = canonical_json(&serde_json::to_value(payload)?);
         
         // Combine with salt and nonce
         let salt = hex::decode(&header.salt)?;
@@ -205,7 +243,7 @@ impl ResultLogger {
         let mut file = File::create(&filepath)?;
         file.write_all(json.as_bytes())?;
         
-        // Also append to a master log file (binary format for efficiency)
+        // Also append to a master log file (length-prefixed JSON records)
         self.append_to_master_log(result)?;
         
         Ok(())
@@ -219,7 +257,7 @@ impl ResultLogger {
             .open(master_log)?;
         
         // Write length-prefixed binary record
-        let data = bincode::serialize(result)?;
+        let data = serde_json::to_vec(result)?;
         let len = (data.len() as u32).to_le_bytes();
         file.write_all(&len)?;
         file.write_all(&data)?;
@@ -308,10 +346,19 @@ impl ResultLogger {
             
             let len = u32::from_le_bytes(len_bytes) as usize;
             let mut data = vec![0u8; len];
-            file.read_exact(&mut data)?;
+            match file.read_exact(&mut data) {
+                Ok(_) => {}
+                // Truncated trailing record (e.g. interrupted write)
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
             
-            let result: VerifiedResult = bincode::deserialize(&data)?;
-            results.push(result);
+            // Records are length-prefixed, so an unreadable one (e.g. written by an older
+            // build in a different format) can be skipped without losing the rest
+            match serde_json::from_slice::<VerifiedResult>(&data) {
+                Ok(result) => results.push(result),
+                Err(e) => tracing::warn!("skipping unreadable record in master log: {}", e),
+            }
         }
 
         Ok(results)
@@ -581,5 +628,101 @@ mod tests {
         
         let verification = logger.verify_result(&verified);
         assert!(!verification.valid);
+    }
+
+    fn logger_and_info() -> (tempfile::TempDir, ResultLogger, crate::system_info::SystemInfo) {
+        let dir = tempdir().unwrap();
+        let logger = ResultLogger::new("1.0.0".to_string(), dir.path().to_string_lossy().to_string()).unwrap();
+        let info = crate::system_info::collect_system_info().unwrap();
+        (dir, logger, info)
+    }
+
+    #[test]
+    fn test_file_round_trip_keeps_signature_valid() {
+        let (dir, logger, info) = logger_and_info();
+        // Floats and several metadata keys: both used to break the signature after reloading
+        let results = serde_json::json!({"avg": 0.1 + 0.2, "p99": 1.0e-7, "n": [1.5, 2.25, 1234567.891011]});
+        let mut metadata = HashMap::new();
+        for k in ["a", "b", "c", "d", "e", "f"] {
+            metadata.insert(k.to_string(), k.repeat(3));
+        }
+        let signed = logger.log_result("cpu", &info, &results, &results, metadata).unwrap();
+
+        let file = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().map_or(false, |e| e == "json"))
+            .expect("result file written");
+        let verdict = logger.verify_file(&file).unwrap();
+        assert!(verdict.valid, "{}", verdict.message);
+
+        let loaded = logger.load_all_results().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].signature.hmac, signed.signature.hmac);
+        assert!(logger.verify_result(&loaded[0]).valid);
+    }
+
+    #[test]
+    fn test_wrong_key_fails_verification() {
+        let (_d, logger, info) = logger_and_info();
+        let signed = logger
+            .log_result("cpu", &info, &serde_json::json!({}), &serde_json::json!({}), HashMap::new())
+            .unwrap();
+        let other_dir = tempdir().unwrap();
+        let other = ResultLogger::new("1.0.0".to_string(), other_dir.path().to_string_lossy().to_string()).unwrap();
+        assert!(!other.verify_result(&signed).valid);
+    }
+
+    #[test]
+    fn test_key_is_persisted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let a = ResultLogger::new("1".into(), path.clone()).unwrap();
+        let b = ResultLogger::new("1".into(), path).unwrap();
+        assert_eq!(a.private_key, b.private_key);
+    }
+
+    #[test]
+    fn test_csv_export() {
+        let (dir, logger, info) = logger_and_info();
+        for t in ["memory", "cpu"] {
+            logger.log_result(t, &info, &serde_json::json!({}), &serde_json::json!({}), HashMap::new()).unwrap();
+        }
+        let results = logger.load_all_results().unwrap();
+        let out = dir.path().join("out.csv");
+        logger.export_to_csv(&results, &out).unwrap();
+        let text = std::fs::read_to_string(out).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.lines().next().unwrap().starts_with("timestamp,test_type"));
+    }
+
+    #[test]
+    fn test_shareable_summary_mentions_verification() {
+        let (_d, logger, info) = logger_and_info();
+        let signed = logger
+            .log_result("gpu", &info, &serde_json::json!({}), &serde_json::json!({}), HashMap::new())
+            .unwrap();
+        let v = logger.verify_result(&signed);
+        let text = generate_shareable_summary(&signed, &v);
+        assert!(text.contains(&signed.signature.hmac));
+    }
+
+    #[test]
+    fn test_load_skips_unreadable_and_truncated_records() {
+        let (dir, logger, info) = logger_and_info();
+        logger.log_result("cpu", &info, &serde_json::json!({}), &serde_json::json!({}), HashMap::new()).unwrap();
+        let log = dir.path().join("results_master.log");
+        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
+        let junk = b"not json";
+        f.write_all(&(junk.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(junk).unwrap();
+        logger.log_result("gpu", &info, &serde_json::json!({}), &serde_json::json!({}), HashMap::new()).unwrap();
+        // truncated final record
+        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(&1000u32.to_le_bytes()).unwrap();
+        f.write_all(b"short").unwrap();
+
+        let loaded = logger.load_all_results().unwrap();
+        assert_eq!(loaded.len(), 2);
     }
 }

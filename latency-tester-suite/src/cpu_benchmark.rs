@@ -171,26 +171,13 @@ impl CpuBenchmark {
         })
     }
 
-    /// Best-effort physical core count via CPUID leaf 1
-    /// (EBX 16:23 = logical siblings, EDX bit 28 = SMT/HT enabled).
+    /// Physical core count (falls back to the logical count when unknown)
     fn detect_physical_cores(logical: usize) -> usize {
-        #[cfg(target_arch = "x86_64")]
-        {
-            use raw_cpuid::CpuId;
-            let cpuid = CpuId::new();
-            if let Ok((_, ebx, _ecx, edx)) = cpuid.get_cpuid_leaf(1) {
-                let siblings = ((ebx >> 16) & 0xFF) as usize;
-                let smt = ((edx >> 28) & 1) == 1;
-                if siblings > 0 {
-                    return if smt {
-                        siblings.div_ceil(2)
-                    } else {
-                        siblings.min(logical).max(1)
-                    };
-                }
-            }
-        }
-        logical
+        sysinfo::System::new()
+            .physical_core_count()
+            .filter(|&n| n > 0)
+            .unwrap_or(logical)
+            .min(logical)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -245,9 +232,9 @@ impl CpuBenchmark {
         let system_info = crate::system_info::collect_system_info()?;
         let mut results = Vec::new();
 
-        for &workload in &self.config.workload_types {
-            for &thread_count in &self.config.thread_counts {
-                for &affinity_mode in &self.config.affinity_modes {
+        for workload in self.config.workload_types.clone() {
+            for thread_count in self.config.thread_counts.clone() {
+                for affinity_mode in self.config.affinity_modes.clone() {
                     // Skip invalid combinations
                     if !self.is_valid_combination(thread_count, affinity_mode) {
                         continue;
@@ -427,7 +414,8 @@ impl CpuBenchmark {
 
                 let mut ops = 0u64;
                 while timer.now_ticks() < target_end {
-                    ops = ops.wrapping_add(Self::execute_workload(workload, ops));
+                    std::hint::black_box(Self::execute_workload(workload, ops));
+                    ops += 1;
                 }
                 ops
             });
@@ -449,7 +437,7 @@ impl CpuBenchmark {
         Ok((total_ops, elapsed_ns, freq))
     }
 
-    fn get_core_for_thread(&self, thread_idx: usize, thread_count: usize, core_mask: u64, affinity_mode: AffinityMode) -> usize {
+    fn get_core_for_thread(&self, thread_idx: usize, _thread_count: usize, core_mask: u64, affinity_mode: AffinityMode) -> usize {
         match affinity_mode {
             AffinityMode::SingleCore => {
                 // Round-robin through available cores
@@ -465,8 +453,19 @@ impl CpuBenchmark {
     }
 
     fn get_current_frequency(&self) -> u64 {
-        use sysinfo::{System};
-        let mut sys = System::new();
+        // Linux: average "cpu MHz" from /proc/cpuinfo is the most reliable source
+        #[cfg(target_os = "linux")]
+        if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+            let mhz: Vec<f64> = info
+                .lines()
+                .filter(|l| l.starts_with("cpu MHz"))
+                .filter_map(|l| l.split(':').nth(1)?.trim().parse().ok())
+                .collect();
+            if !mhz.is_empty() {
+                return (mhz.iter().sum::<f64>() / mhz.len() as f64) as u64;
+            }
+        }
+        let mut sys = sysinfo::System::new();
         sys.refresh_cpu();
         sys.global_cpu_info().frequency()
     }
@@ -477,17 +476,17 @@ impl CpuBenchmark {
         match workload {
             WorkloadType::IntegerAdd => {
                 for _ in 0..1000 {
-                    x = x.wrapping_add(0x123456789ABCDEF);
+                    x = std::hint::black_box(x).wrapping_add(0x123456789ABCDEF);
                 }
             }
             WorkloadType::IntegerMul => {
                 for _ in 0..1000 {
-                    x = x.wrapping_mul(0x123456789ABCDEF);
+                    x = std::hint::black_box(x).wrapping_mul(0x123456789ABCDEF);
                 }
             }
             WorkloadType::IntegerDiv => {
                 for _ in 0..1000 {
-                    x = x.wrapping_div(0x123456789ABCDEF | 1);
+                    x = std::hint::black_box(x).wrapping_div(0x123456789ABCDEF | 1);
                 }
             }
             WorkloadType::FloatAdd => {
@@ -544,18 +543,26 @@ impl CpuBenchmark {
                 x = v[0] as u64;
             }
             WorkloadType::MemoryCopy => {
-                let mut buf = [0u8; 64];
-                for _ in 0..1000 {
-                    buf.copy_from_slice(&buf);
+                let mut src = [0u8; 64];
+                let mut dst = [0u8; 64];
+                src[0] = x as u8;
+                for i in 0..1000 {
+                    dst.copy_from_slice(std::hint::black_box(&src));
+                    src[i % 64] = dst[(i + 1) % 64].wrapping_add(1);
                 }
-                x = buf[0] as u64;
+                x = x.wrapping_add(dst[0] as u64 + 1);
             }
             WorkloadType::MemoryLatency => {
-                let mut ptr = &x as *const u64;
-                for _ in 0..1000 {
-                    x = unsafe { *ptr };
-                    ptr = &x as *const u64;
+                // Dependent loads through a small cyclic table (L1-resident)
+                let mut table = [0u16; 1024];
+                for (i, t) in table.iter_mut().enumerate() {
+                    *t = ((i * 5 + 1) % 1024) as u16;
                 }
+                let mut idx = (x % 1024) as usize;
+                for _ in 0..1000 {
+                    idx = std::hint::black_box(table[idx]) as usize;
+                }
+                x = x.wrapping_add(idx as u64 + 1);
             }
             WorkloadType::BranchPrediction => {
                 for i in 0..1000 {
@@ -588,15 +595,13 @@ impl CpuBenchmark {
                         0 => x = x.wrapping_add(0x123456789ABCDEF),
                         1 => x = x.wrapping_mul(0x123456789ABCDEF),
                         2 => {
-                            let mut f = x as f64;
-                            f = f.mul_add(1.23456789, 9.87654321);
+                            let f = (x as f64).mul_add(1.23456789, 9.87654321);
                             x = f as u64;
                         }
                         3 => x ^= x.rotate_left(13),
                         4 => x = x.wrapping_div(0x123456789ABCDEF | 1),
                         _ => {
-                            let mut ptr = &x as *const u64;
-                            x = unsafe { *ptr };
+                            x = std::hint::black_box(x);
                         }
                     }
                 }
@@ -638,33 +643,46 @@ impl CpuBenchmark {
     }
 }
 
-/// Returns `(p_thread_count, e_thread_count)` for Intel hybrid CPUs.
+/// Parse a Linux cpulist such as "0-7,16,18-19" into a count of CPUs
+#[cfg(target_os = "linux")]
+fn parse_cpulist_len(list: &str) -> usize {
+    list.trim()
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(|part| match part.split_once('-') {
+            Some((lo, hi)) => match (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
+                (Ok(lo), Ok(hi)) if hi >= lo => hi - lo + 1,
+                _ => 0,
+            },
+            None => usize::from(part.trim().parse::<usize>().is_ok()),
+        })
+        .sum()
+}
+
+/// Returns `(p_thread_count, e_thread_count)` for hybrid CPUs.
 ///
-/// Uses CPUID leaf 7 (ECX bit 15 = HYBRID flag) and leaf 0x1B (EAX & 0xFF
-/// = logical P-core thread count, Intel convention: P threads come first).
-/// Non-hybrid or unknown CPUs report `(logical, 0)`.
+/// On Linux this reads the kernel's hybrid PMU lists (`/sys/devices/cpu_core`
+/// and `/sys/devices/cpu_atom`). Elsewhere, or on non-hybrid CPUs, it reports
+/// `(logical, 0)`. Intel convention is assumed: P threads have the lowest IDs.
 pub fn hybrid_thread_counts() -> (usize, usize) {
     let logical = num_cpus::get();
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_os = "linux")]
     {
-        use raw_cpuid::CpuId;
-        let cpuid = CpuId::new();
-        let hybrid = matches!(
-            cpuid.get_cpuid_leaf(7),
-            Ok((_, _, ecx, _)) if ecx & (1 << 15) != 0
-        );
-        if hybrid {
-            if let Ok((eax, _, _, _)) = cpuid.get_cpuid_leaf(0x1B) {
-                let p_threads = (eax & 0xFF) as usize;
-                if p_threads > 0 && p_threads <= logical {
-                    return (p_threads, logical - p_threads);
-                }
+        let read = |p: &str| std::fs::read_to_string(p).ok();
+        if let (Some(core), Some(atom)) = (
+            read("/sys/devices/cpu_core/cpus"),
+            read("/sys/devices/cpu_atom/cpus"),
+        ) {
+            let (p, e) = (parse_cpulist_len(&core), parse_cpulist_len(&atom));
+            if p > 0 && e > 0 && p + e <= logical {
+                return (p, e);
             }
         }
     }
     (logical, 0)
 }
 
+#[allow(dead_code)]
 /// Quick CPU test for GUI
 pub fn quick_cpu_test(workload: WorkloadType, thread_count: usize, duration_sec: u64) -> Result<f64> {
     let config = CpuBenchmarkConfig {
@@ -679,7 +697,11 @@ pub fn quick_cpu_test(workload: WorkloadType, thread_count: usize, duration_sec:
     let mut bench = CpuBenchmark::new(config)?;
     let summary = bench.run()?;
     
-    Ok(summary.results[0].operations_per_second)
+    summary
+        .results
+        .first()
+        .map(|r| r.operations_per_second)
+        .ok_or_else(|| anyhow::anyhow!("no valid CPU benchmark combination for {} threads", thread_count))
 }
 
 #[cfg(test)]
@@ -691,6 +713,45 @@ mod tests {
         let topology = CpuBenchmark::detect_topology().unwrap();
         assert!(topology.total_logical > 0);
         assert!(topology.total_physical > 0);
+    }
+
+    #[test]
+    fn test_short_run_produces_ops() {
+        let mut bench = CpuBenchmark::new(CpuBenchmarkConfig {
+            workload_types: vec![WorkloadType::IntegerAdd, WorkloadType::MemoryCopy, WorkloadType::MemoryLatency],
+            thread_counts: vec![1, 2],
+            affinity_modes: vec![AffinityMode::AllCores],
+            duration_seconds: 1,
+            warmup_seconds: 0,
+            iterations: 1,
+        })
+        .unwrap();
+        let summary = bench.run().unwrap();
+        assert_eq!(summary.results.len(), 3 * 2);
+        for r in &summary.results {
+            assert!(r.operations_per_second > 0.0 && r.latency_ns > 0.0, "{:?}", r.workload);
+        }
+    }
+
+    #[test]
+    fn test_every_workload_executes() {
+        for wl in [
+            WorkloadType::IntegerAdd, WorkloadType::IntegerMul, WorkloadType::IntegerDiv,
+            WorkloadType::FloatAdd, WorkloadType::FloatMul, WorkloadType::FloatDiv,
+            WorkloadType::FloatFma, WorkloadType::VectorAdd, WorkloadType::VectorMul,
+            WorkloadType::VectorFma, WorkloadType::MemoryCopy, WorkloadType::MemoryLatency,
+            WorkloadType::BranchPrediction, WorkloadType::CryptoAes, WorkloadType::CryptoSha,
+            WorkloadType::MixedWorkload, WorkloadType::CompilationSim, WorkloadType::GameSim,
+        ] {
+            CpuBenchmark::execute_workload(wl, 7);
+        }
+    }
+
+    #[test]
+    fn test_invalid_combinations_are_skipped() {
+        let bench = CpuBenchmark::new(CpuBenchmarkConfig::default()).unwrap();
+        assert!(!bench.is_valid_combination(usize::MAX, AffinityMode::AllCores));
+        assert!(!bench.is_valid_combination(2, AffinityMode::SingleCore));
     }
 
     #[test]

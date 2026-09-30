@@ -283,7 +283,6 @@ impl VirtualizationDetector {
         let mut hvci_enabled = false;
         let mut wsl_enabled = false;
         let mut wsl_version = None;
-        let mut core_isolation_enabled = false;
         let mut memory_integrity_enabled = false;
         let mut virtual_machine_platform_enabled = false;
         let mut windows_hypervisor_platform_enabled = false;
@@ -377,7 +376,7 @@ impl VirtualizationDetector {
         }
 
         // Core Isolation
-        core_isolation_enabled = vbs_enabled || hvci_enabled;
+        let core_isolation_enabled = vbs_enabled || hvci_enabled;
 
         Ok(WindowsVirtualization {
             hyper_v_enabled,
@@ -530,7 +529,7 @@ impl VirtualizationDetector {
             }
             
             if lnx.systemd_detect_virt != "none" {
-                recommendations.push(&format!("Linux: Running inside a VM ({}). Results may not reflect bare-metal performance.", lnx.systemd_detect_virt));
+                recommendations.push(format!("Linux: Running inside a VM ({}). Results may not reflect bare-metal performance.", lnx.systemd_detect_virt));
             }
         }
 
