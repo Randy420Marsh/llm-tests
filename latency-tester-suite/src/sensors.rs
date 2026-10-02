@@ -119,6 +119,10 @@ const MAX_PROCS: usize = 8;
 pub struct Snapshot {
     /// Milliseconds since the sampler started
     pub t_ms: u64,
+    /// Milliseconds since the previous snapshot. CPU load and the other programs' CPU share are
+    /// rates over `(t_ms - span_ms, t_ms]`, not readings at `t_ms` (0 = unknown)
+    #[serde(default)]
+    pub span_ms: u64,
     pub cpu_package_c: Option<f32>,
     /// (core number as the sensor reports it, temperature)
     pub core_temps_c: Vec<(usize, f32)>,
@@ -259,6 +263,45 @@ impl Telemetry {
             _ => Some(c),
         })
     }
+}
+
+/// Fewest share of a window that sample intervals must cover before a rate is reported for it
+const MIN_RATE_COVERAGE: f64 = 0.5;
+
+/// (CPU load %, other programs' CPU %) over `[from_ms, to_ms]`. Only samples whose interval
+/// `(t_ms - span_ms, t_ms]` lies at least half inside the window count, weighted by the overlap; None
+/// when they cover less than half the window (a test shorter than about one sampling interval)
+pub fn rates_over(samples: &[Snapshot], from_ms: u64, to_ms: u64) -> (Option<f32>, Option<f32>) {
+    let len = to_ms.saturating_sub(from_ms) as f64;
+    if len <= 0.0 {
+        return (None, None);
+    }
+    let (mut u, mut uw, mut o, mut ow) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for s in samples {
+        if s.span_ms == 0 {
+            continue;
+        }
+        let a = s.t_ms.saturating_sub(s.span_ms).max(from_ms);
+        let b = s.t_ms.min(to_ms);
+        if b <= a {
+            continue;
+        }
+        let w = (b - a) as f64;
+        // a sample whose interval lies mostly outside the window describes another test
+        if w < s.span_ms as f64 * 0.5 {
+            continue;
+        }
+        if let Some(x) = avg(s.core_usage_pct.iter().copied()) {
+            u += x as f64 * w;
+            uw += w;
+        }
+        if s.procs_sampled {
+            o += s.procs.iter().map(|p| p.cpu_pct as f64).sum::<f64>() * w;
+            ow += w;
+        }
+    }
+    let rate = |sum: f64, w: f64| (w >= len * MIN_RATE_COVERAGE).then(|| (sum / w) as f32);
+    (rate(u, uw), rate(o, ow))
 }
 
 /// Reduce samples to one [`Telemetry`]
@@ -1128,6 +1171,7 @@ impl Sampler {
         let (samples, notes, stop, start) = (s.samples.clone(), s.notes.clone(), s.stop.clone(), s.start);
         std::thread::spawn(move || {
             let mut collector = Collector::new();
+            let mut prev_t: Option<u64> = None;
             while !stop.load(Ordering::Relaxed) {
                 // stay on the app's reserved core, away from the core being measured
                 crate::app_core::apply_helper();
@@ -1135,6 +1179,8 @@ impl Sampler {
                 let began = Instant::now();
                 let mut snap = collector.collect();
                 snap.t_ms = start.elapsed().as_millis() as u64;
+                snap.span_ms = prev_t.map_or(0, |p| snap.t_ms.saturating_sub(p));
+                prev_t = Some(snap.t_ms);
                 if let Ok(mut n) = notes.lock() {
                     if *n != collector.notes {
                         *n = collector.notes.clone();
@@ -1167,14 +1213,24 @@ impl Sampler {
 
     /// Summary of the samples in `[from_ms, to_ms]`; if none fall inside (a very short test) the
     /// closest earlier sample is used, else the next one.
+    ///
+    /// CPU load and the other programs' CPU share are rates over the interval before each sample, so
+    /// they are weighted by how much of that interval lies inside the test, and left empty when less
+    /// than half the test is covered. Taking them from samples merely *timestamped* inside the test
+    /// put the previous test's load on this test's row, and a short test copied a stale value.
     pub fn window(&self, from_ms: u64, to_ms: u64) -> Telemetry {
         let v = self.samples.lock().unwrap();
         let inside: Vec<Snapshot> = v.iter().filter(|s| s.t_ms >= from_ms && s.t_ms <= to_ms).cloned().collect();
-        if !inside.is_empty() {
-            return summarize(&inside);
-        }
-        let nearest = v.iter().rev().find(|s| s.t_ms <= to_ms).or_else(|| v.iter().find(|s| s.t_ms > to_ms));
-        nearest.map(|s| summarize(std::slice::from_ref(s))).unwrap_or_default()
+        let mut t = if !inside.is_empty() {
+            summarize(&inside)
+        } else {
+            let nearest = v.iter().rev().find(|s| s.t_ms <= to_ms).or_else(|| v.iter().find(|s| s.t_ms > to_ms));
+            nearest.map(|s| summarize(std::slice::from_ref(s))).unwrap_or_default()
+        };
+        let (usage, others) = rates_over(&v, from_ms, to_ms);
+        t.cpu_usage_avg_pct = usage;
+        t.others_cpu_avg_pct = others;
+        t
     }
 
     /// Record that a test of `kind` ("memory", "cpu", "gpu", "input") ran in `[from_ms, to_ms]` and
@@ -1863,5 +1919,28 @@ mod tests {
         assert_eq!(s.window(now + 10_000, now + 10_001).samples, 1);
         assert!(!s.timeline().is_empty());
         assert!(!s.notes().is_empty());
+    }
+
+    /// A 500 ms sampler and two back-to-back 1 s tests: 1 thread (4 %) then 24 threads (100 %).
+    /// The sample at 1100 ms describes 600..1100 ms, mostly the first test.
+    #[test]
+    fn load_is_not_shifted_onto_the_next_test() {
+        let load_at = |t: u64| if t <= 1000 { 4.0 } else { 100.0 };
+        let samples: Vec<Snapshot> = (1..=6)
+            .map(|i| {
+                let t = 100 + i * 500;
+                // the rate a real counter would report: average over the last 500 ms
+                let mean = (t - 500..t).map(load_at).sum::<f32>() / 500.0;
+                Snapshot { t_ms: t, span_ms: 500, core_usage_pct: vec![mean], ..Default::default() }
+            })
+            .collect();
+        let (first, _) = rates_over(&samples, 0, 1000);
+        let (second, _) = rates_over(&samples, 1000, 2000);
+        // old behaviour: the samples stamped 1100 and 1600 ms counted for the second test → (23.2 + 100) / 2
+        assert!(first.unwrap() < 30.0, "first test {:?}", first);
+        assert!(second.unwrap() > 80.0, "second test {:?}", second);
+        // a 5 ms test inside one 500 ms interval cannot be resolved: no value rather than its neighbours'
+        assert_eq!(rates_over(&samples, 1300, 1305).0, None);
+        assert_eq!(rates_over(&samples, 5000, 5005).0, None, "nothing covers it");
     }
 }

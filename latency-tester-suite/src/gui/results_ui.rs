@@ -84,13 +84,14 @@ const TELEMETRY_METRICS: [Metric; 16] = [
     ("others_gpu", "Other programs: GPU (avg)", "%"),
 ];
 
-const MEMORY_METRICS: [Metric; 6] = [
+const MEMORY_METRICS: [Metric; 7] = [
     ("ns_per_access", "Latency / access", "ns"),
     ("bandwidth", "Bandwidth", "GB/s"),
     ("avg_run", "Avg run", "ms"),
     ("p99_run", "p99 run", "ms"),
     ("min_run", "Best run", "ms"),
     ("runs", "Runs", ""),
+    ("measured", "Measured time", "ms"),
 ];
 const CPU_METRICS: [Metric; 7] = [
     ("mcalls", "Throughput", "M calls/s"),
@@ -185,6 +186,9 @@ pub(super) fn memory_rows(results: &[MemoryBenchmarkResult]) -> Vec<Row> {
             v.insert("p99_run", r.percentile_99_ns / 1e6);
             v.insert("min_run", r.min_latency_ns / 1e6);
             v.insert("runs", r.iterations as f64);
+            if r.measured_ms > 0.0 {
+                v.insert("measured", r.measured_ms);
+            }
             telemetry_values(&r.telemetry, &mut v);
             let cores = if r.cores.is_empty() || r.cores.starts_with("All cores") { String::new() } else { format!(" · {}", r.cores) };
             Row {
@@ -1465,6 +1469,7 @@ mod tests {
             percentile_999_ns: 0.0,
             ns_per_access: 12.5,
             cores: "P-cores 0-7".into(),
+            measured_ms: 0.0,
             telemetry: Telemetry {
                 samples: 1,
                 gpu_temp_max_c: Some(41.0),
