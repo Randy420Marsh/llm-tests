@@ -147,11 +147,11 @@ const KINDS = {
   memory: {
     title: 'Memory', logX: true, xLabel: 'buffer size', xFmt: v => humanSize(2 ** v),
     // run times are kept in ns; the column picks ns / µs / ms from its values (see autoTimeUnits)
-    metrics: [['ns_per_access','Latency / access','time'],['bandwidth','Bandwidth','GB/s'],['avg_run','Avg run','time'],['p99_run','p99 run','time'],['min_run','Best run','time'],['runs','Runs',''],['passes','Passes per run','']].concat(TELEMETRY),
+    metrics: [['ns_per_access','Latency / access','time'],['bandwidth','Bandwidth','GB/s'],['avg_run','Avg run','time'],['p99_run','p99 run','time'],['min_run','Best run','time'],['runs','Runs',''],['passes','Passes per run',''],['measured','Measured time','time']].concat(TELEMETRY),
     rows(sec) { return (sec.results || []).map(r => ({
       series: `${patternLabel(r.pattern)} · ${r.thread_count}T` + (r.cores && !String(r.cores).startsWith('All cores') ? ` · ${r.cores}` : ''),
       x: Math.log2(r.size), xLabel: humanSize(r.size),
-      values: Object.assign({ ns_per_access: r.ns_per_access, bandwidth: r.bandwidth_gb_s, avg_run: r.latency_ns, p99_run: r.percentile_99_ns, min_run: r.min_latency_ns, runs: r.iterations, passes: r.passes_per_run ?? 1 }, telemetryValues(r.telemetry)),
+      values: Object.assign({ ns_per_access: r.ns_per_access, bandwidth: r.bandwidth_gb_s, avg_run: r.latency_ns, p99_run: r.percentile_99_ns, min_run: r.min_latency_ns, runs: r.iterations, passes: r.passes_per_run ?? 1 }, r.measured_ms ? { measured: r.measured_ms * 1e6 } : {}, telemetryValues(r.telemetry)),
     })); },
   },
   cpu: {

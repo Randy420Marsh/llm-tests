@@ -262,6 +262,10 @@ pub struct MemoryBenchmarkResult {
     /// Core selection this result was measured with
     #[serde(default)]
     pub cores: String,
+    /// Wall time of the measured runs only (no warmup / preparation), ms. Telemetry covers this span;
+    /// CPU load is only reported when it is at least `cpu_times::MIN_WINDOW_MS`.
+    #[serde(default)]
+    pub measured_ms: f64,
     /// Temperatures, clocks, RAM and GPU/VRAM readings taken while this test ran
     #[serde(default)]
     pub telemetry: Telemetry,
@@ -677,7 +681,6 @@ impl MemoryBenchmark {
             !budget.is_zero() && n_done >= MIN_ITERATIONS && test_start.elapsed() > budget
         };
         let cores = self.active_label.clone();
-        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
         let planned = self.config.iterations.max(1);
         self.update_progress(|p| {
             p.size = size;
@@ -718,10 +721,15 @@ impl MemoryBenchmark {
             passes = passes.saturating_mul(want).min(MAX_PASSES_PER_RUN);
         }
 
-        // Actual benchmark
+        // Actual benchmark. Telemetry covers only this loop: warmup and preparation run on one
+        // thread (building a 1 GB chase table takes seconds), so including them made every
+        // multi-threaded row of a big buffer look like ~1 busy core.
         let iterations = planned;
         let mut latencies = Vec::with_capacity(iterations as usize);
         let mut total_bytes = 0u64;
+        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
+        let cpu_start = crate::cpu_times::CpuTimes::now();
+        let measured_start = std::time::Instant::now();
 
         for i in 0..iterations {
             cancel::check(&self.cancel)?;
@@ -738,6 +746,9 @@ impl MemoryBenchmark {
             latencies.push(latency_ns);
             total_bytes += bytes;
         }
+        let cpu_end = crate::cpu_times::CpuTimes::now();
+        let measured_ms = measured_start.elapsed().as_secs_f64() * 1000.0;
+        let sensor_end = self.sensors.as_ref().map(|s| s.now_ms());
 
         // Calculate statistics
         latencies.sort_by(|a, b| a.total_cmp(b));
@@ -787,15 +798,22 @@ impl MemoryBenchmark {
                     0.0
                 }
             },
-            telemetry: match (&self.sensors, sensor_start) {
-                (Some(s), Some(t0)) => s.record(
-                    "memory",
-                    format!("Memory · {} KB · {} · {} thread(s) · {}", size / 1024, pattern.label(), thread_count, cores),
-                    t0,
-                    s.now_ms(),
-                ),
+            telemetry: match (&self.sensors, sensor_start, sensor_end) {
+                (Some(s), Some(t0), Some(t1)) => {
+                    let mut t = s.record(
+                        "memory",
+                        format!("Memory · {} KB · {} · {} thread(s) · {}", size / 1024, pattern.label(), thread_count, cores),
+                        t0,
+                        t1,
+                    );
+                    // CPU load of exactly the timed loop (None when it was too short to measure),
+                    // instead of whatever the last sensor snapshot happened to cover
+                    t.cpu_usage_avg_pct = crate::cpu_times::load_over(cpu_start, cpu_end, measured_ms);
+                    t
+                }
                 _ => Telemetry::default(),
             },
+            measured_ms,
             cores,
         })
     }
@@ -1566,6 +1584,48 @@ mod tests {
         let labels: Vec<_> = s.results.iter().map(|r| r.cores.as_str()).collect();
         assert_eq!(labels, vec!["Core 0", "Core 1"]);
         assert!(s.results.iter().all(|r| r.thread_count == 1));
+    }
+
+    /// Alternates 1 thread and every logical CPU on a big buffer and prints the CPU load each row got.
+    /// The all-thread row must show the higher load: before the fix the load lagged one row behind
+    /// (the 1-thread row inherited the previous all-thread test's load) and warmup/preparation diluted it.
+    /// cargo test --release telemetry_load_follows_thread_count -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn telemetry_load_follows_thread_count() {
+        let n = num_cpus::get();
+        let sampler = crate::sensors::Sampler::start(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let s = MemoryBenchmark::new(MemoryBenchmarkConfig {
+            sizes: vec![256 << 20],
+            iterations: 10,
+            warmup_iterations: 1,
+            patterns: vec![AccessPattern::StreamTriad, AccessPattern::SequentialRead, AccessPattern::StreamCopy],
+            thread_counts: vec![1, n],
+            time_budget_ms: 0,
+            ..MemoryBenchmarkConfig::default()
+        })
+        .with_sensors(sampler)
+        .run()
+        .unwrap();
+        for r in &s.results {
+            println!(
+                "{:<16} {:>3}T  measured {:>7.1} ms  load {:>6}  (expected ≈ {:.0} % + background)",
+                r.pattern.label(),
+                r.thread_count,
+                r.measured_ms,
+                r.telemetry.cpu_usage_avg_pct.map_or("n/a".into(), |l| format!("{:.1} %", l)),
+                r.thread_count as f64 / n as f64 * 100.0
+            );
+        }
+        for pair in s.results.chunks(2) {
+            let (one, all) = (&pair[0], &pair[1]);
+            assert!(one.measured_ms >= crate::cpu_times::MIN_WINDOW_MS, "test too short to measure load");
+            let (l1, ln) = (one.telemetry.cpu_usage_avg_pct.unwrap(), all.telemetry.cpu_usage_avg_pct.unwrap());
+            if n > 1 {
+                assert!(ln > l1 + 25.0, "{}: 1T {} % vs {}T {} %", one.pattern.label(), l1, n, ln);
+            }
+        }
     }
 
     #[test]

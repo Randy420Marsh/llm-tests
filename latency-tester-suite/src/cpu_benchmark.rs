@@ -378,18 +378,21 @@ impl CpuBenchmark {
             let cores: Vec<usize> = (0..64).filter(|&i| (core_mask >> i) & 1 == 1).collect();
             crate::app_core::keep_off(&cores);
         }
-        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
         let mut iteration_results = Vec::new();
         let mut total_ops = 0u64;
         let mut total_time_ns = 0u64;
 
+        // Warmup, outside the telemetry window (it would otherwise blend into this test's load,
+        // clocks and temperatures)
+        if self.config.warmup_seconds > 0 {
+            cancel::check(&self.cancel)?;
+            progress::update(&self.progress, |p| p.detail = format!("warming up ({} s)", self.config.warmup_seconds));
+            self.run_workload_internal(workload, thread_count, core_mask, affinity_mode, self.config.warmup_seconds)?;
+        }
+        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
+
         for iter in 0..self.config.iterations {
             cancel::check(&self.cancel)?;
-            // Warmup
-            if iter == 0 && self.config.warmup_seconds > 0 {
-                progress::update(&self.progress, |p| p.detail = format!("warming up ({} s)", self.config.warmup_seconds));
-                self.run_workload_internal(workload, thread_count, core_mask, affinity_mode, self.config.warmup_seconds)?;
-            }
             
             // Actual measurement
             progress::update(&self.progress, |p| p.detail = format!("measuring run {}/{} ({} s each)", iter + 1, self.config.iterations, self.config.duration_seconds));

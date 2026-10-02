@@ -24,6 +24,7 @@ mod session;
 mod report;
 mod server;
 mod sensors;
+mod cpu_times;
 mod progress;
 mod run_all;
 mod app_core;

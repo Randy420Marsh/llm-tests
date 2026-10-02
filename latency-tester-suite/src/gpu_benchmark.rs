@@ -611,12 +611,12 @@ impl GpuBenchmark {
 
     fn run_compute_workload(&self, size: u64) -> Result<GpuBenchmarkResult> {
         let res = self.create_resources(size, false)?;
-        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
-
         for _ in 0..self.config.warmup_iterations {
             cancel::check(&self.cancel)?;
             self.submit_and_wait(&res)?;
         }
+        // telemetry covers the timed dispatches only, not buffer setup and warmup
+        let sensor_start = self.sensors.as_ref().map(|s| s.now_ms());
 
         let iterations = self.config.iterations.max(1) as usize;
         let min_run = std::time::Duration::from_millis(self.config.min_sample_ms);

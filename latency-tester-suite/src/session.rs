@@ -394,6 +394,7 @@ mod tests {
             percentile_999_ns: 1.2e6,
             ns_per_access: 20.0,
             cores: "Core 3".into(),
+            measured_ms: 0.0,
             telemetry: Telemetry { samples: 2, cpu_temp_max_c: Some(61.0), ..Default::default() },
         }
     }
